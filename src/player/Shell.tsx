@@ -1194,12 +1194,12 @@ export default function Shell() {
           )}
           {!tool && !(facetField && !facet) && (
             <>
-              <div className="px-5 py-3 border-b border-[#2a2723] flex gap-3 items-center">
+              <div className="px-5 py-3 border-b border-[#2a2723] flex flex-wrap gap-x-3 gap-y-2 items-center">
                 {view === 'recent' && <span className="shrink-0 text-xs text-[#e23b2f]">最近播放，新的在上</span>}
                 {view === 'playlist' && <span className="shrink-0 text-xs text-[#8a847a]">{smartList ? '智慧歌單，開頁籤時重算，不能拖曳' : query.trim() ? '篩選時不能排序' : '拖曳列可調整順序'}</span>}
                 {view === 'queue' && <span className="shrink-0 text-xs text-[#8a847a]">拖曳列可調整佇列。下一首先播佇列</span>}
                 {view === 'all' && searchNote && <span className="shrink-0 text-xs text-[#e23b2f]">{searchNote}</span>}
-                <input id="filter" className="field" placeholder="篩選歌名、歌手、專輯，或搜尋曲庫" value={query} onChange={async (e) => {
+                <input id="filter" className="field flex-[1_1_180px] min-w-0" placeholder="篩選歌名、歌手、專輯，或搜尋曲庫" value={query} onChange={async (e) => {
                   const v = e.target.value;
                   setQuery(v);
                   if (view === 'all' && v.trim()) {
@@ -1353,7 +1353,7 @@ export default function Shell() {
           <button className="round" aria-label="下一首" onClick={() => step(1)}><SkipForward size={16} /></button>
           <div className="flex-1 flex items-center gap-3 min-w-0">
             <span className="num text-xs text-[#8a847a] w-12 shrink-0">{radioTitle ? '直播' : fmt(position)}</span>
-            <input aria-label="播放位置" type="range" min={0} max={Math.max(duration, 1)} value={Math.min(position, duration || 1)} disabled={!!radioTitle} style={{ ['--pct' as string]: `${duration > 0 ? Math.min(100, (position / duration) * 100) : 0}%` }} onChange={(e) => { const ms = Number(e.target.value); setPosition(ms); positionRef.current = ms; playerSeek(ms); }} className="line flex-1" />
+            <input aria-label="播放位置" type="range" min={0} max={Math.max(duration, 1)} value={Math.min(position, duration || 1)} disabled={!!radioTitle} style={{ ['--pct' as string]: `${duration > 0 ? Math.min(100, (position / duration) * 100) : 0}%` }} onChange={(e) => { const ms = Number(e.target.value); setPosition(ms); positionRef.current = ms; playerSeek(ms); }} className="line flex-1 min-w-0 w-0" />
             <span className="num text-xs text-[#8a847a] w-12 shrink-0">{radioTitle ? '' : fmt(duration)}</span>
           </div>
           <div className="flex items-center gap-1.5 shrink-0">
@@ -1369,7 +1369,13 @@ export default function Shell() {
             <input aria-label="音量" aria-valuemin={0} aria-valuemax={100} aria-valuenow={volumePct} aria-valuetext={muted || volume === 0 ? '靜音' : `${volumePct}%`} type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} className="line w-28" style={{ ['--pct' as string]: `${volumePct}%` }} onChange={(e) => setSliderVolume(Number(e.target.value))} />
             <span className="num text-[11px] w-9 shrink-0 text-right text-[#8a847a]">{muted || volume === 0 ? '靜音' : `${volumePct}%`}</span>
           </div>
-          <select className="field text-[11px] shrink-0" style={{ width: 260 }} value={outputDevice} onChange={(e) => { void playerSetOutput(e.target.value).catch((err) => setEngineError(String(err))); setOutputDevice(e.target.value); }} disabled={outputDevices.length === 0}>
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
+        <div className="flex-[1_1_320px] min-w-0 text-[12px] leading-5 text-[#c8c2b8] break-all" title={active?.path || radioTitle || ''}>
+          {radioTitle ? `直播　${radioTitle}` : (active ? `${techLine(active)}　${active.path}` : '尚未選擇檔案')}
+        </div>
+        <div className="flex items-center gap-2 min-w-0 ml-auto">
+          <select className="field text-[11px] min-w-[140px]" style={{ width: 260, flex: '0 1 260px' }} value={outputDevice} onChange={(e) => { void playerSetOutput(e.target.value).catch((err) => setEngineError(String(err))); setOutputDevice(e.target.value); }} disabled={outputDevices.length === 0}>
             {outputDevices.map((d) => (<option key={d} value={d}>{d}</option>))}
           </select>
           <button type="button" className="round w-auto px-3 text-xs shrink-0" onClick={() => { playerOutputDevices().then((ds) => { setOutputDevices(ds); if (ds.length && !outputDevice) setOutputDevice(ds[0]); }).catch(() => {}); }}>重整裝置</button>
@@ -1395,8 +1401,6 @@ export default function Shell() {
             if (!stopAfterCurrent) setSleepSeconds(0);
           }} title="這首播完不再播下一首">{stopAfterCurrent ? '結束後不播下一首 ✔' : '結束後不播下一首'}</button>
         </div>
-        <div className="mt-1 text-[12px] leading-5 text-[#c8c2b8] break-all" title={active?.path || radioTitle || ''}>
-          {radioTitle ? `直播　${radioTitle}` : (active ? `${techLine(active)}　${active.path}` : '尚未選擇檔案')}
         </div>
       </footer>
       {menu && (() => {

@@ -36,7 +36,34 @@ export function TrackTable({
   onReorder?: (from: number, to: number) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
+  const box = useRef<HTMLDivElement>(null);
   const [over, setOver] = useState<number | null>(null);
+  const [width, setWidth] = useState(1000);
+
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    setWidth(el.getBoundingClientRect().width);
+    const ro = new ResizeObserver(([entry]) => setWidth(entry.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Narrow window: drop low-value columns instead of crushing the title to a few px.
+  const showDate = width >= 760;
+  const showPlays = width >= 600;
+  const showTrack = width >= 600;
+  const showAlbum = width >= 460;
+  const grid = [
+    '42px',
+    showTrack && '36px',
+    'minmax(0,1.4fr)',
+    'minmax(0,0.8fr)',
+    showAlbum && 'minmax(0,0.8fr)',
+    '64px',
+    showPlays && '48px',
+    showDate && '104px',
+  ].filter(Boolean).join(' ');
   const virtualizer = useVirtualizer({
     count: songs.length,
     getScrollElement: () => scroller.current,
@@ -57,16 +84,16 @@ export function TrackTable({
   );
 
   return (
-    <div className="flex flex-col min-h-0 h-full">
-      <div className="grid grid-cols-[42px_36px_minmax(0,1.4fr)_minmax(0,0.8fr)_minmax(0,0.8fr)_64px_48px_104px] pl-5 pr-6 h-8 items-center border-b border-[#2a2723]">
+    <div ref={box} className="flex flex-col min-h-0 h-full">
+      <div className="grid pl-5 pr-6 h-8 items-center border-b border-[#2a2723]" style={{ gridTemplateColumns: grid }}>
         <span className="text-[11px] text-[#8a847a]">No</span>
-        <span className="text-[11px] text-[#8a847a]">軌</span>
+        {showTrack && <span className="text-[11px] text-[#8a847a]">軌</span>}
         {head('title', '歌名')}
         {head('artist', '歌手')}
-        {head('album', '專輯')}
+        {showAlbum && head('album', '專輯')}
         {head('duration_ms', '時間', 'right')}
-        {head('play_count', '次數', 'right')}
-        {head('file_mtime', '日期', 'right')}
+        {showPlays && head('play_count', '次數', 'right')}
+        {showDate && head('file_mtime', '日期', 'right')}
       </div>
       <div
         ref={scroller}
@@ -105,22 +132,22 @@ export function TrackTable({
                 onClick={(e) => onSelect(song, e)}
                 onDoubleClick={() => onPlay(song)}
                 onContextMenu={(e) => { e.preventDefault(); onContext(song, e.clientX, e.clientY); }}
-                className={`grid grid-cols-[42px_36px_minmax(0,1.4fr)_minmax(0,0.8fr)_minmax(0,0.8fr)_64px_48px_104px] pl-5 pr-6 items-center text-sm border-b border-[#221f1c] cursor-default ${on ? 'bg-[#2a221c]' : ''} ${sel && !on ? 'bg-[#1a1816]' : ''} ${song.missing ? 'text-[#8a847a]' : ''} ${over === row.index ? 'border-t border-t-[#e23b2f]' : ''}`}
-                style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: row.size, transform: `translateY(${row.start}px)` }}
+                className={`grid pl-5 pr-6 items-center text-sm border-b border-[#221f1c] cursor-default ${on ? 'bg-[#2a221c]' : ''} ${sel && !on ? 'bg-[#1a1816]' : ''} ${song.missing ? 'text-[#8a847a]' : ''} ${over === row.index ? 'border-t border-t-[#e23b2f]' : ''}`}
+                style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: row.size, transform: `translateY(${row.start}px)`, gridTemplateColumns: grid }}
               >
                 <span className={`catalog-live num text-[13px] ${on ? 'text-[#e23b2f]' : 'text-[#8a847a]'} ${on && playing ? 'is-on' : ''}`}>
                   {on && <span className="ink-pass" aria-hidden="true">{String(row.index + 1).padStart(2, '0')}</span>}
                   {String(row.index + 1).padStart(2, '0')}
                 </span>
-                <span className="num text-[12px] text-[#8a847a]">{song.track_number && song.track_number > 0 ? song.track_number : '—'}</span>
+                {showTrack && <span className="num text-[12px] text-[#8a847a]">{song.track_number && song.track_number > 0 ? song.track_number : '—'}</span>}
                 <span className={`truncate pr-3 min-w-0 ${song.missing ? 'line-through text-[#8a847a]' : on ? 'text-[#f4f0e8]' : ''}`}>
                   {song.title || '未命名'}{song.missing ? '　缺檔' : ''}
                 </span>
                 <span className="truncate pr-2 text-[#c8c2b8]">{song.artist || '未知歌手'}</span>
-                <span className="truncate pr-2 text-[#8a847a]">{song.album || '未知專輯'}</span>
+                {showAlbum && <span className="truncate pr-2 text-[#8a847a]">{song.album || '未知專輯'}</span>}
                 <span className="num text-right text-[#8a847a]">{fmt(song.duration_ms)}</span>
-                <span className="num text-right text-[#8a847a]">{song.play_count}</span>
-                <span className="num text-right text-[#8a847a] pr-1">{fmtDate(song.file_mtime)}</span>
+                {showPlays && <span className="num text-right text-[#8a847a]">{song.play_count}</span>}
+                {showDate && <span className="num text-right text-[#8a847a] pr-1">{fmtDate(song.file_mtime)}</span>}
               </div>
             );
           })}
