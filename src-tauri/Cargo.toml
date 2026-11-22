@@ -1,0 +1,39 @@
+[package]
+name = "sonicledger"
+version = "0.1.0"
+edition = "2021"
+description = "本地音樂播放器 — 可攜式、無雲端、以 Tauri v2 + Rust + SQLite 實作"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+thiserror = "1"
+
+# 資料庫：單一檔案型 SQLite，bundled 讓目標機器無需安裝 SQLite 開發庫
+rusqlite = { version = "0.33", features = ["bundled"] }
+
+# 音樂庫掃描
+walkdir = "2.4"
+rayon = "1.10"
+lofty = "0.9"
+image = { version = "0.25", features = ["jpeg", "png", "bmp"] }
+pinyin = { version = "0.11", features = ["plain"] }
+
+# 音訊播放：rodio 輸出 + symphonia 解碼
+rodio = "0.19"
+souvlaki = "0.7"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+tempfile = "3"

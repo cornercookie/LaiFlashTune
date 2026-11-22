@@ -1,0 +1,375 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use uuid::Uuid;
+
+/// 音樂歌曲主表（對應資料庫 songs 表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Song {
+    pub id: i64,
+    pub path: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
+    pub duration_ms: i64,
+    pub file_mtime: i64,
+    pub file_size: Option<i64>,
+    pub cover_path: Option<String>,
+    pub title_pinyin: Option<String>,
+    pub artist_pinyin: Option<String>,
+    pub title_pinyin_initial: Option<String>,
+    pub artist_pinyin_initial: Option<String>,
+    pub added_at: Option<String>,
+    pub play_count: i64,
+    pub last_played_at: Option<String>,
+    pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
+    pub format: Option<String>,
+    pub bitrate: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub channels: Option<i32>,
+    pub missing: i32,
+}
+
+/// 新增/更新歌曲的輸入（掃描時使用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewSong {
+    pub path: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub genre: Option<String>,
+    pub year: Option<i32>,
+    pub duration_ms: i64,
+    pub file_mtime: i64,
+    pub file_size: Option<i64>,
+    pub cover_path: Option<String>,
+    pub title_pinyin: Option<String>,
+    pub artist_pinyin: Option<String>,
+    pub title_pinyin_initial: Option<String>,
+    pub artist_pinyin_initial: Option<String>,
+    pub track_number: Option<i32>,
+    pub disc_number: Option<i32>,
+    pub format: Option<String>,
+    pub bitrate: Option<i32>,
+    pub sample_rate: Option<i32>,
+    pub channels: Option<i32>,
+}
+
+/// 歌單
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    pub sort_order: i32,
+    pub created_at: Option<String>,
+    pub is_smart: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewPlaylist {
+    pub name: String,
+    pub sort_order: i32,
+    pub is_smart: Option<i32>,
+}
+
+/// 歌單項目（歌曲在歌單中的位置）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistItem {
+    pub id: i64,
+    pub playlist_id: i64,
+    pub song_id: i64,
+    pub position: i32,
+    pub added_at: Option<String>,
+    #[serde(flatten)]
+    pub song: Option<Song>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewPlaylistItem {
+    pub playlist_id: i64,
+    pub song_id: i64,
+    pub position: i32,
+}
+
+/// 搜尋結果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub songs: Vec<Song>,
+    pub total: i64,
+}
+
+/// 掃描進度事件（透過 Tauri event 傳給前端）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanProgress {
+    pub scanned: i64,
+    pub total: i64,
+    pub current_file: String,
+    pub stage: String, // "scanning" | "finished" | "error"
+}
+
+/// 播放佇列項目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueItem {
+    pub id: Uuid,
+    pub song_id: i64,
+    pub song: Song,
+}
+
+/// 設定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    pub music_folders: Vec<String>,
+    pub theme: String, // "dark" | "light"
+    pub lyrics_offset_ms: i32,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            music_folders: Vec::new(),
+            theme: "dark".to_string(),
+            lyrics_offset_ms: 0,
+        }
+    }
+}
+
+/// 播放中歌曲資訊（傳給前端顯示）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NowPlaying {
+    pub song: Option<Song>,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub is_playing: bool,
+    pub volume: f32,
+    pub mode: PlayMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum PlayMode {
+    Sequence,
+    Single,
+    All,
+    Random,
+}
+
+impl Default for PlayMode {
+    fn default() -> Self {
+        PlayMode::Sequence
+    }
+}
+
+/// 歌詞行
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LyricLine {
+    pub time_ms: i64,
+    pub text: String,
+}
+
+/// 歌詞資訊
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lyrics {
+    pub song_id: i64,
+    pub source: Option<String>,
+    pub lines: Vec<LyricLine>,
+    pub offset_ms: i32,
+}
+
+/// 資料庫狀態（單一連線，由 Tauri manage 掛載）
+pub struct DbState {
+    pub conn: std::sync::Mutex<rusqlite::Connection>,
+}
+
+/// 音訊執行緒回報的即時狀態。player_position 固定回 0，前端改讀這個。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineSnapshot {
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub is_playing: bool,
+    pub volume: f32,
+    pub song_id: i64,
+    pub ended: bool,
+    pub kind: String,
+    pub stream_title: String,
+    pub error: String,
+    pub eq_bands: Vec<f32>,
+    pub preamp_db: f32,
+    pub normalize: bool,
+    pub crossfade_ms: i64,
+    pub applied_gain: f32,
+    pub band_hz: Vec<i32>,
+    pub mode: PlayMode,
+}
+
+impl Default for EngineSnapshot {
+    fn default() -> Self {
+        Self {
+            position_ms: 0,
+            duration_ms: 0,
+            is_playing: false,
+            volume: 0.7,
+            song_id: 0,
+            ended: false,
+            kind: "idle".into(),
+            stream_title: String::new(),
+            error: String::new(),
+            eq_bands: vec![0.0; 10],
+            preamp_db: 0.0,
+            normalize: false,
+            crossfade_ms: 0,
+            applied_gain: 1.0,
+            band_hz: vec![32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+            mode: PlayMode::Sequence,
+        }
+    }
+}
+
+/// 播放器狀態（由 Tauri manage 掛載）
+pub struct PlayerState {
+    pub tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<PlayerCommand>>>,
+    pub status: std::sync::Arc<std::sync::Mutex<EngineSnapshot>>,
+}
+
+/// 播放控制命令（音訊執行緒透過 mpsc 接收，避免在 UI 執行緒解碼）
+#[derive(Debug, Clone)]
+pub enum PlayerCommand {
+    Load { path: String, song_id: i64 },
+    /// 載入並停在指定位置，不開始播放。重新開啟時接進度用。
+    Prepare { path: String, song_id: i64, position_ms: i64 },
+    Play,
+    Pause,
+    Toggle,
+    Stop,
+    Next,
+    Prev,
+    Preload { path: String, song_id: i64 },
+    Seek { position_ms: i64 },
+    SetVolume { volume: f32 },
+    SetMode { mode: PlayMode },
+    SetEq { bands: Vec<f32> },
+    SetPreamp { db: f32 },
+    SetOutput { name: String },
+    SetNormalize { enabled: bool },
+    SetCrossfade { ms: i64 },
+    PlayUrl { url: String },
+}
+
+/// 歌詞解析結果
+#[derive(Debug, Clone)]
+pub struct ParsedLyrics {
+    pub source: String,
+    pub lines: Vec<LyricLine>,
+    pub offset_ms: i32,
+}
+
+/// 音樂資料夾設定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MusicFolder {
+    pub id: i64,
+    pub path: String,
+    pub added_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewMusicFolder {
+    pub path: String,
+}
+
+/// 歌單排序更新請求
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistOrderUpdate {
+    pub playlist_id: i64,
+    pub item_ids: Vec<i64>, // playlist_items id，依新順序排列
+}
+
+/// 播放歷史紀錄
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayHistory {
+    pub id: i64,
+    pub song_id: i64,
+    pub played_at: Option<String>,
+    #[serde(flatten)]
+    pub song: Option<Song>,
+}
+
+/// 智慧歌單過濾條件
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartPlaylistRule {
+    pub field: String,    // "play_count" | "added_at" | ...
+    pub operator: String, // ">" | "<" | "=" | "like"
+    pub value: String,
+}
+
+/// 右鍵開啟時暫存的音檔路徑，前端取走後就清空。
+#[derive(Debug, Default)]
+pub struct OpenedFile {
+    pub path: std::sync::Mutex<Option<String>>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryFacet {
+    pub key: String,
+    pub count: i64,
+}
+
+/// 標籤寫入
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagEdit {
+    pub song_id: i64,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub genre: String,
+    pub year: Option<i32>,
+    #[serde(default)]
+    pub track_number: Option<i32>,
+    #[serde(default)]
+    pub disc_number: Option<i32>,
+}
+
+/// 同一批只改歌手、專輯、曲風、年份。歌名與音軌號不在這裡。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagBatch {
+    pub song_ids: Vec<i64>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    #[serde(default)]
+    pub genre: Option<String>,
+    #[serde(default)]
+    pub year: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagBatchResult {
+    pub updated: i64,
+    pub failed: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadioStation {
+    pub id: i64,
+    pub name: String,
+    pub url: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DropPaths {
+    pub files: Vec<String>,
+    pub dirs: Vec<String>,
+}
+
+/// 轉檔請求。format 只接受 mp3 / flac / wav / ogg。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvertRequest {
+    pub song_id: i64,
+    pub format: String,
+    pub output_dir: String,
+    #[serde(default)]
+    pub bitrate_kbps: Option<i32>,
+}
