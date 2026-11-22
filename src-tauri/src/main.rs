@@ -4,6 +4,7 @@ mod db;
 mod models;
 mod commands;
 mod scanner;
+mod audio_decode;
 mod player;
 mod extras;
 mod open_with;

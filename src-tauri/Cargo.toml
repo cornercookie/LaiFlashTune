@@ -30,6 +30,8 @@ pinyin = { version = "0.11", features = ["plain"] }
 
 # 音訊播放：rodio 輸出 + symphonia 解碼
 rodio = "0.19"
+# 直接用 symphonia 解碼：rodio 0.19 開 MP4 會 panic（ReadSeekSource 不回報 byte_len）
+symphonia = { version = "0.5", default-features = false, features = ["aac", "alac", "isomp4", "mp3", "flac", "wav", "pcm", "aiff", "ogg", "vorbis"] }
 souvlaki = "0.7"
 
 [build-dependencies]

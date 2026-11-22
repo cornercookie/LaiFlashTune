@@ -1,8 +1,9 @@
 use crate::models::{EngineSnapshot, PlayerCommand, PlayMode};
+use crate::audio_decode::SymStream;
 use crate::open_with::{log_line, log_load_error};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -54,8 +55,19 @@ impl Biquad {
     }
 }
 
+/// 超過這個長度（或長度不明）就不整首解進記憶體，改從檔案逐封包串流。
+/// 48kHz 立體聲 f32 一小時約 1.4 GB，整首解碼會讓長錄音開不起來。
+const STREAM_OVER_MS: i64 = 15 * 60 * 1000;
+
+#[derive(Clone)]
+enum TrackData {
+    Memory(Arc<Vec<f32>>),
+    Stream(PathBuf),
+}
+
+#[derive(Clone)]
 struct PcmTrack {
-    samples: Vec<f32>,
+    data: TrackData,
     sample_rate: u32,
     channels: u16,
     duration_ms: i64,
@@ -65,35 +77,50 @@ struct PcmTrack {
 
 impl PcmTrack {
     fn clone_track(&self) -> Self {
-        Self {
-            samples: self.samples.clone(),
-            sample_rate: self.sample_rate,
-            channels: self.channels,
-            duration_ms: self.duration_ms,
-            song_id: self.song_id,
-            norm_gain: self.norm_gain,
+        self.clone()
+    }
+
+    fn memory(&self) -> Option<&[f32]> {
+        match &self.data {
+            TrackData::Memory(v) => Some(v.as_slice()),
+            TrackData::Stream(_) => None,
         }
     }
 }
 
-struct EqSource {
-    samples: Vec<f32>,
+struct MemSource {
+    samples: Arc<Vec<f32>>,
     pos: usize,
+}
+
+impl Iterator for MemSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let s = *self.samples.get(self.pos)?;
+        self.pos += 1;
+        Some(s)
+    }
+}
+
+struct EqSource<S: Iterator<Item = f32>> {
+    inner: S,
+    idx: usize,
     channels: u16,
     sample_rate: u32,
     filters: Vec<Vec<Biquad>>,
     gain: f32,
+    total: Option<Duration>,
 }
 
-impl Iterator for EqSource {
+impl<S: Iterator<Item = f32>> Iterator for EqSource<S> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
-        if self.pos >= self.samples.len() || self.channels == 0 {
+        if self.channels == 0 {
             return None;
         }
-        let ch = self.pos % self.channels as usize;
-        let mut s = self.samples[self.pos] * self.gain;
-        self.pos += 1;
+        let mut s = self.inner.next()? * self.gain;
+        let ch = self.idx % self.channels as usize;
+        self.idx = self.idx.wrapping_add(1);
         if let Some(chain) = self.filters.get_mut(ch) {
             for f in chain.iter_mut() {
                 s = f.process(s);
@@ -103,14 +130,11 @@ impl Iterator for EqSource {
     }
 }
 
-impl Source for EqSource {
+impl<S: Iterator<Item = f32> + Send> Source for EqSource<S> {
     fn current_frame_len(&self) -> Option<usize> { None }
     fn channels(&self) -> u16 { self.channels }
     fn sample_rate(&self) -> u32 { self.sample_rate }
-    fn total_duration(&self) -> Option<Duration> {
-        let frames = self.samples.len() / self.channels.max(1) as usize;
-        Some(Duration::from_secs_f64(frames as f64 / self.sample_rate.max(1) as f64))
-    }
+    fn total_duration(&self) -> Option<Duration> { self.total }
 }
 
 struct AudioEngine {
@@ -136,20 +160,70 @@ struct AudioEngine {
     radio_stop: Option<Arc<AtomicBool>>,
 }
 
-fn decode_to_pcm(path: &Path, song_id: i64) -> Result<PcmTrack, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
-    let decoder = Decoder::new(BufReader::new(file)).map_err(|e| format!("解碼失敗: {e}"))?;
-    let sample_rate = decoder.sample_rate().max(1);
-    let channels = decoder.channels().max(1);
-    let samples_i16: Vec<i16> = decoder.collect();
-    if samples_i16.is_empty() {
+fn is_mp4_family(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        Some("m4a" | "mp4" | "m4b" | "aac" | "alac")
+    )
+}
+
+fn lofty_duration_ms(path: &Path) -> Option<i64> {
+    use lofty::AudioFile;
+    let ms = lofty::read_from_path(path).ok()?.properties().duration().as_millis() as i64;
+    (ms > 0).then_some(ms)
+}
+
+fn memory_track(samples: Vec<f32>, sample_rate: u32, channels: u16, song_id: i64) -> Result<PcmTrack, String> {
+    if samples.is_empty() {
         return Err("未解碼到任何音訊樣本".into());
     }
-    let samples: Vec<f32> = samples_i16.into_iter().map(|s| s as f32 / i16::MAX as f32).collect();
     let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
     let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
     let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
-    Ok(PcmTrack { samples, sample_rate, channels, duration_ms, song_id, norm_gain })
+    Ok(PcmTrack { data: TrackData::Memory(Arc::new(samples)), sample_rate, channels, duration_ms, song_id, norm_gain })
+}
+
+fn decode_to_pcm(path: &Path, song_id: i64) -> Result<PcmTrack, String> {
+    match SymStream::open(path, 0) {
+        Ok(stream) => {
+            let sample_rate = stream.sample_rate().max(1);
+            let channels = stream.channels().max(1);
+            let duration_ms = stream.duration_ms().filter(|d| *d > 0).or_else(|| lofty_duration_ms(path));
+            if duration_ms.map(|d| d > STREAM_OVER_MS).unwrap_or(true) {
+                // 長檔案：只記路徑，播放時從檔案邊解邊放。無法先掃峰值，所以不套音量標準化。
+                return Ok(PcmTrack {
+                    data: TrackData::Stream(path.to_path_buf()),
+                    sample_rate,
+                    channels,
+                    duration_ms: duration_ms.unwrap_or(0),
+                    song_id,
+                    norm_gain: 1.0,
+                });
+            }
+            let cap = duration_ms.map(|d| (d as usize / 1000 + 1) * sample_rate as usize * channels as usize).unwrap_or(0);
+            let mut samples = Vec::with_capacity(cap);
+            samples.extend(stream);
+            memory_track(samples, sample_rate, channels, song_id)
+        }
+        Err(e) => {
+            // rodio 0.19 碰到 MP4 會在 Decoder::new 裡 panic（byte_len 為 None），不能退回去。
+            if is_mp4_family(path) {
+                return Err(format!("解碼失敗: {e}"));
+            }
+            let file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Decoder::new(BufReader::new(file)).map(|d| {
+                    let rate = d.sample_rate().max(1);
+                    let ch = d.channels().max(1);
+                    let samples: Vec<f32> = d.map(|s| s as f32 / i16::MAX as f32).collect();
+                    (samples, rate, ch)
+                })
+            }))
+            .map_err(|_| format!("解碼失敗: {e}"))?
+            .map_err(|e2| format!("解碼失敗: {e}; {e2}"))?;
+            memory_track(decoded.0, decoded.1, decoded.2, song_id)
+        }
+    }
 }
 
 fn sample_index(pcm: &PcmTrack, ms: i64) -> usize {
@@ -167,42 +241,54 @@ fn preamp_linear(db: f32) -> f32 {
     10f32.powf(db.clamp(-12.0, 12.0) / 20.0)
 }
 
-fn append_pcm(sink: &Sink, pcm: &PcmTrack, start_ms: i64, eq: &[f32; 10], normalize: bool, preamp_db: f32) {
-    let start = sample_index(pcm, start_ms).min(pcm.samples.len());
-    let slice = pcm.samples[start..].to_vec();
-    if slice.is_empty() {
-        return;
-    }
+fn append_pcm(sink: &Sink, pcm: &PcmTrack, start_ms: i64, eq: &[f32; 10], normalize: bool, preamp_db: f32) -> Result<(), String> {
     let gain = (if normalize { pcm.norm_gain } else { 1.0 }) * preamp_linear(preamp_db);
-    sink.append(EqSource {
-        samples: slice,
-        pos: 0,
-        channels: pcm.channels,
-        sample_rate: pcm.sample_rate,
-        filters: make_filters(pcm.sample_rate, pcm.channels, eq),
-        gain,
-    });
+    match &pcm.data {
+        TrackData::Memory(samples) => {
+            let start = sample_index(pcm, start_ms).min(samples.len());
+            if start >= samples.len() {
+                return Ok(());
+            }
+            let frames = (samples.len() - start) / pcm.channels.max(1) as usize;
+            sink.append(EqSource {
+                inner: MemSource { samples: samples.clone(), pos: start },
+                idx: 0,
+                channels: pcm.channels,
+                sample_rate: pcm.sample_rate,
+                filters: make_filters(pcm.sample_rate, pcm.channels, eq),
+                gain,
+                total: Some(Duration::from_secs_f64(frames as f64 / pcm.sample_rate.max(1) as f64)),
+            });
+        }
+        TrackData::Stream(path) => {
+            let src = SymStream::open(path, start_ms)?;
+            let (rate, ch) = (src.sample_rate(), src.channels());
+            let total = (pcm.duration_ms > 0).then(|| Duration::from_millis((pcm.duration_ms - start_ms).max(0) as u64));
+            sink.append(EqSource { inner: src, idx: 0, channels: ch, sample_rate: rate, filters: make_filters(rate, ch, eq), gain, total });
+        }
+    }
+    Ok(())
 }
 
-fn mix_crossfade(current: &PcmTrack, from_ms: i64, next: &PcmTrack, fade_ms: i64) -> PcmTrack {
+fn mix_crossfade(current: &PcmTrack, cur: &[f32], from_ms: i64, next: &PcmTrack, nxt: &[f32], fade_ms: i64) -> PcmTrack {
     let ch = current.channels.max(1) as usize;
-    let a0 = sample_index(current, from_ms).min(current.samples.len());
+    let a0 = sample_index(current, from_ms).min(cur.len());
     let fade_frames = ((fade_ms.max(1) as f64 / 1000.0) * current.sample_rate as f64) as usize;
     let fade_samples = fade_frames * ch;
-    let a = &current.samples[a0..];
-    let n = fade_samples.min(a.len()).min(next.samples.len());
-    let mut out = Vec::with_capacity(n + next.samples.len().saturating_sub(n));
+    let a = &cur[a0..];
+    let n = fade_samples.min(a.len()).min(nxt.len());
+    let mut out = Vec::with_capacity(n + nxt.len().saturating_sub(n));
     for i in 0..n {
         let t = if n <= 1 { 1.0 } else { i as f32 / (n - 1) as f32 };
-        let b = if next.channels as usize == ch { next.samples[i] } else { next.samples[i % next.samples.len()] };
+        let b = if next.channels as usize == ch { nxt[i] } else { nxt[i % nxt.len()] };
         out.push(a[i] * (1.0 - t) + b * t);
     }
-    if next.samples.len() > n {
-        out.extend_from_slice(&next.samples[n..]);
+    if nxt.len() > n {
+        out.extend_from_slice(&nxt[n..]);
     }
     let duration_ms = (out.len() as f64 / (next.sample_rate.max(1) as f64 * ch as f64) * 1000.0) as i64;
     PcmTrack {
-        samples: out,
+        data: TrackData::Memory(Arc::new(out)),
         sample_rate: next.sample_rate,
         channels: ch as u16,
         duration_ms,
@@ -323,7 +409,9 @@ impl AudioEngine {
         if kind == "file" {
             if let Some(pcm) = track {
                 self.seek_origin_ms = pos.max(0);
-                append_pcm(&self.sink, &pcm, self.seek_origin_ms, &self.eq, self.normalize, self.preamp_db);
+                if let Err(e) = append_pcm(&self.sink, &pcm, self.seek_origin_ms, &self.eq, self.normalize, self.preamp_db) {
+                    self.error = e;
+                }
                 if play {
                     self.sink.play();
                     self.is_playing = true;
@@ -344,7 +432,11 @@ impl AudioEngine {
         self.sink.stop();
         self.sink.clear();
         self.seek_origin_ms = ms.max(0);
-        append_pcm(&self.sink, &pcm, self.seek_origin_ms, &self.eq, self.normalize, self.preamp_db);
+        if let Err(e) = append_pcm(&self.sink, &pcm, self.seek_origin_ms, &self.eq, self.normalize, self.preamp_db) {
+            self.error = e;
+            self.is_playing = false;
+            return;
+        }
         if play {
             self.sink.play();
             self.is_playing = true;
@@ -381,7 +473,11 @@ impl AudioEngine {
             position_ms.clamp(0, pcm.duration_ms.saturating_sub(1))
         };
         self.seek_origin_ms = ms;
-        append_pcm(&self.sink, &pcm, ms, &self.eq, self.normalize, self.preamp_db);
+        if let Err(e) = append_pcm(&self.sink, &pcm, ms, &self.eq, self.normalize, self.preamp_db) {
+            self.current = None;
+            self.kind = "idle".into();
+            return Err(e);
+        }
         if play {
             self.sink.play();
             self.is_playing = true;
@@ -503,12 +599,17 @@ impl AudioEngine {
         if remain > self.crossfade_ms || remain < 150 {
             return;
         }
-        let Some(next) = self.preloaded.take() else { return };
-        let mixed = mix_crossfade(current, pos, &next, remain);
+        // 串流中的長檔案沒有整首樣本可混，交給 on_empty 照常換曲。
+        let (Some(cur), Some(nxt)) = (current.memory(), self.preloaded.as_ref().and_then(|p| p.memory())) else { return };
+        let Some(next) = self.preloaded.as_ref() else { return };
+        let mixed = mix_crossfade(current, cur, pos, next, nxt, remain);
+        self.preloaded = None;
         self.sink.stop();
         self.sink.clear();
         self.seek_origin_ms = 0;
-        append_pcm(&self.sink, &mixed, 0, &self.eq, self.normalize, self.preamp_db);
+        if let Err(e) = append_pcm(&self.sink, &mixed, 0, &self.eq, self.normalize, self.preamp_db) {
+            self.error = e;
+        }
         self.sink.play();
         self.is_playing = true;
         self.current = Some(mixed);
