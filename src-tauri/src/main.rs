@@ -70,6 +70,20 @@ fn main() {
             transport::install(app.handle());
             Ok(())
         })
+        .on_window_event(|window, event| {
+            // JS 監聽 close-requested 後，Tauri 會先 prevent_close，只能靠 destroy() 收尾。
+            // destroy 權限一旦漏掉，叉叉和系統匣「結束」都會沒反應。這裡在關閉請求後
+            // 最多再等 3 秒，視窗還在就強制結束，避免程序關不掉。
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if app.get_webview_window("main").is_some() {
+                        app.exit(0);
+                    }
+                });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             // 播放器
             player_load,

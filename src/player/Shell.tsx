@@ -496,12 +496,21 @@ export default function Shell() {
           ]);
           if (miniRef.current) {
             const { LogicalSize } = await import('@tauri-apps/api/dpi');
-            await win.setAlwaysOnTop(false);
-            await win.setMinSize(new LogicalSize(900, 600));
-            await win.setSize(new LogicalSize(1200, 800));
+            await Promise.race([
+              (async () => {
+                await win.setAlwaysOnTop(false);
+                await win.setMinSize(new LogicalSize(900, 600));
+                await win.setSize(new LogicalSize(1200, 800));
+              })(),
+              new Promise((resolve) => window.setTimeout(resolve, 800)),
+            ]);
           }
         } catch { /* 寫不進去也要能關 */ }
-        if (!gone) await win.destroy();
+        if (!gone) {
+          try {
+            await win.destroy();
+          } catch { /* 權限被拒時，Rust 的關閉後備仍會結束程序 */ }
+        }
       }).then((fn) => {
         if (gone) fn();
         else unlisten = fn;
