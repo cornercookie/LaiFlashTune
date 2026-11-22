@@ -1,6 +1,6 @@
 [package]
 name = "sonicledger"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "本地音樂播放器 — 可攜式、無雲端、以 Tauri v2 + Rust + SQLite 實作"
 
