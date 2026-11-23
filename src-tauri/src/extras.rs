@@ -1,10 +1,13 @@
 use crate::db::{db_lock, get_song};
 use crate::models::{ConvertRequest, DbState, LibraryFacet, Song, TagEdit};
+use crate::open_with::sanitize_log;
+use crate::open_with::validate_local_path;
 use crate::scanner::compute_pinyin;
+use crate::tools::{locate, ffmpeg_available as tools_ffmpeg_available};
 use lofty::ItemKey;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const SONG_COLS: &str = "id, path, title, artist, album, album_artist, genre, year, duration_ms, \
     file_mtime, file_size, cover_path, title_pinyin, artist_pinyin, title_pinyin_initial, \
@@ -154,7 +157,7 @@ pub fn read_tags(state: &DbState, song_id: i64) -> Result<TagEdit, String> {
     })
 }
 
-/// 寫入標籤到檔案，並更新資料庫與 FTS。失敗就不假裝已存。
+/// 寫入標籤到檔案，並更新資料庫（搜尋索引由觸發器跟著更新）。失敗就不假裝已存。
 pub fn write_tags(state: &DbState, edit: &TagEdit) -> Result<(), String> {
     let conn = db_lock(state);
     let song = get_song(&conn, edit.song_id).map_err(|e| e.to_string())?.ok_or("找不到歌曲")?;
@@ -189,23 +192,13 @@ pub fn write_tags(state: &DbState, edit: &TagEdit) -> Result<(), String> {
             positive(edit.track_number), positive(edit.disc_number)
         ],
     ).map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM songs_fts_content WHERE id = ?1", [edit.song_id]).ok();
-    conn.execute(
-        "INSERT INTO songs_fts_content (id, title, artist, album, title_pinyin, artist_pinyin) VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![edit.song_id, edit.title, edit.artist, edit.album, title_py, artist_py],
-    ).map_err(|e| e.to_string())?;
+    // 搜尋索引由 songs 上的觸發器同步（db.rs ensure_search_index），這裡不另外寫。
     Ok(())
-}
-
-pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg").arg("-version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 /// 用本機 ffmpeg 轉檔。沒有 ffmpeg 或沒有輸出檔就回錯誤，不回假路徑。
 pub fn convert_audio(state: &DbState, req: &ConvertRequest) -> Result<String, String> {
-    if !ffmpeg_available() {
-        return Err("這台電腦找不到 ffmpeg，無法轉檔".into());
-    }
+    let ffmpeg_path = locate("ffmpeg.exe").map(|(p, _, _)| p).ok_or("這台電腦找不到 ffmpeg，無法轉檔")?;
     let ext = match req.format.as_str() {
         "mp3" | "flac" | "wav" | "ogg" => req.format.as_str(),
         _ => return Err("只支援 mp3、flac、wav、ogg".into()),
@@ -224,8 +217,10 @@ pub fn convert_audio(state: &DbState, req: &ConvertRequest) -> Result<String, St
     let output = dir.join(format!("{safe}.{ext}"));
     let kbps = req.bitrate_kbps.unwrap_or(320).clamp(64, 320);
     let rate = format!("{kbps}k");
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = Command::new(&ffmpeg_path);
     cmd.arg("-y").arg("-i").arg(&song.path).arg("-vn");
+    // SE11：本機轉檔只允許 file/pipe 協議
+    cmd.args(["-protocol_whitelist", "file,pipe"]);
     match ext {
         "mp3" => { cmd.args(["-c:a", "libmp3lame", "-b:a", &rate]); }
         "flac" => { cmd.args(["-c:a", "flac"]); }
@@ -234,11 +229,20 @@ pub fn convert_audio(state: &DbState, req: &ConvertRequest) -> Result<String, St
         _ => {}
     }
     cmd.arg(&output);
-    let out = cmd.output().map_err(|e| format!("無法執行 ffmpeg: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let tail: String = err.chars().rev().take(280).collect::<String>().chars().rev().collect();
-        return Err(format!("轉檔失敗: {tail}"));
+    
+    // SE3-1: 使用獨立 stderr 讀取執行緒與持久化 Sanitizer，避免 ffmpeg 因 stderr 緩衝區滿而阻塞
+    let mut child = cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn()
+        .map_err(|e| format!("無法執行 ffmpeg: {e}"))?;
+
+    let stderr = child.stderr.take().ok_or("ffmpeg 無 stderr")?;
+    let stderr_thread = crate::open_with::spawn_stderr_sanitizer(Some(stderr), None);
+
+    let status = child.wait().map_err(|e| format!("ffmpeg 等待失敗: {e}"))?;
+    let _ = stderr_thread.join();
+    
+    if !status.success() {
+        // stderr 已在執行緒中清洗並記錄，這裡只回傳通用錯誤
+        return Err("轉檔失敗（詳細錯誤請見 open-with.log）".into());
     }
     if !output.exists() {
         return Err("ffmpeg 結束了，但沒有產生檔案".into());
@@ -280,6 +284,10 @@ pub fn classify_drop(paths: &[String]) -> crate::models::DropPaths {
     let mut dirs = Vec::new();
     for path in paths {
         let p = Path::new(path);
+        // SE1：拖放入口必須先驗證本機路徑
+        if validate_local_path(p).is_err() {
+            continue;
+        }
         if p.is_dir() {
             dirs.push(path.clone());
         } else if p.is_file() {
@@ -363,4 +371,69 @@ pub fn write_tags_batch(state: &DbState, batch: &crate::models::TagBatch) -> Res
         }
     }
     Ok(crate::models::TagBatchResult { updated, failed })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lofty::Tag;
+
+    /// 產生 0.1 秒的靜音 WAV，並先放一個空標籤（write_tags 只改既有的主要標籤）。
+    fn tagged_wav(dir: &std::path::Path) -> String {
+        let path = dir.join("t.wav");
+        let (rate, ch, n) = (8000u32, 1u16, 800u32);
+        let data_len = n * 2;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data_len).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&ch.to_le_bytes());
+        b.extend_from_slice(&rate.to_le_bytes());
+        b.extend_from_slice(&(rate * 2).to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data_len.to_le_bytes());
+        b.extend(std::iter::repeat(0u8).take(data_len as usize));
+        std::fs::write(&path, b).unwrap();
+        let mut f = lofty::read_from_path(&path).unwrap();
+        let kind = f.primary_tag_type();
+        let mut tag = Tag::new(kind);
+        tag.insert_text(ItemKey::Comment, "fixture".into()); // 空標籤不會被存檔
+        f.insert_tag(tag);
+        f.save_to_path(&path).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn write_tags_succeeds_and_search_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = tagged_wav(dir.path());
+        let conn = crate::db::open_connection(&dir.path().join("t.db")).unwrap();
+        crate::db::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO songs (path, title, artist, duration_ms, file_mtime) VALUES (?1, '舊歌名', '舊歌手', 100, 1)",
+            [&wav],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        let state = DbState { conn: std::sync::Mutex::new(conn) };
+        let edit = TagEdit {
+            song_id: id, title: "新歌名測試".into(), artist: "新歌手".into(), album: "專輯".into(),
+            genre: "Rock".into(), year: Some(2020), track_number: Some(3), disc_number: None,
+        };
+        write_tags(&state, &edit).expect("tag write must report success after the file and row are updated");
+        let conn = state.conn.lock().unwrap();
+        assert_eq!(crate::db::search_songs(&conn, "新歌名測試", 10).unwrap().total, 1);
+        assert_eq!(crate::db::search_songs(&conn, "舊歌名", 10).unwrap().total, 0);
+        drop(conn);
+
+        let batch = crate::models::TagBatch { song_ids: vec![id], artist: Some("批次歌手".into()), album: None, genre: None, year: None };
+        let r = write_tags_batch(&state, &batch).unwrap();
+        assert_eq!((r.updated, r.failed.len()), (1, 0), "batch must not list a written song as failed: {:?}", r.failed);
+        let conn = state.conn.lock().unwrap();
+        assert_eq!(crate::db::search_songs(&conn, "批次歌手", 10).unwrap().total, 1);
+    }
 }

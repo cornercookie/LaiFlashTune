@@ -24,9 +24,13 @@ export async function invokeCmd<T = any>(cmd: string, args: Record<string, any> 
 }
 
 /* ---------- 播放器 ---------- */
-export const playerLoad = (path: string, songId: number) => invokeCmd('player_load', { path, songId });
-export const playerPrepare = (path: string, songId: number, positionMs: number) =>
-  invokeCmd('player_prepare', { path, songId, positionMs });
+export const playerLoad = (path: string, songId: number, token: number) => invokeCmd('player_load', { path, songId, token });
+export const playerPrepare = (path: string, songId: number, positionMs: number, token: number) =>
+  invokeCmd('player_prepare', { path, songId, positionMs, token });
+export const playerSetNext = (path: string, songId: number, token: number) =>
+  invokeCmd('player_set_next', { path, songId, token });
+export const playerClearNext = () => invokeCmd('player_clear_next');
+// 相容模式（不帶 token，由 Rust 端補 0），新流程請改用 playerSetNext
 export const playerPreload = (path: string, songId: number) => invokeCmd('player_preload', { path, songId });
 export const playerPlay = () => invokeCmd('player_play');
 export const playerPause = () => invokeCmd('player_pause');
@@ -86,9 +90,16 @@ export const appPaths = () => invokeCmd<{ db: string; covers: string; config: st
 export const playerStatus = () => invokeCmd<import('../types').EngineSnapshot>('player_status');
 export const playerSetEq = (bands: number[]) => invokeCmd('player_set_eq', { bands });
 export const playerSetPreamp = (db: number) => invokeCmd('player_set_preamp', { db });
+export const playerSetEqEnabled = (enabled: boolean) => invokeCmd('player_set_eq_enabled', { enabled });
+/** fx 是巢狀結構，欄位已是 camelCase（Rust 端 FxParams rename_all）。 */
+export const playerSetFx = (fx: import('../player/fx').Fx) => invokeCmd('player_set_fx', { fx });
+export const eqResponse = (bands: number[], preamp: number, enabled: boolean, sampleRate?: number) =>
+  invokeCmd<Array<[number, number]>>('eq_response_cmd', { bands, preamp, enabled, sampleRate });
 export const playerSetNormalize = (enabled: boolean) => invokeCmd('player_set_normalize', { enabled });
 export const playerSetCrossfade = (ms: number) => invokeCmd('player_set_crossfade', { ms });
 export const playerPlayUrl = (url: string) => invokeCmd('player_play_url', { url });
+export const playerSetDefaultPlayer = (enable: boolean) =>
+  invokeCmd('player_set_default_player', { enable });
 export const playerOutputDevices = () => invokeCmd<string[]>('player_output_devices');
 export const playerSetOutput = (name: string) => invokeCmd('player_set_output', { name });
 export const libraryFacets = (field: string) => invokeCmd<import('../types').LibraryFacet[]>('library_facets_cmd', { field });

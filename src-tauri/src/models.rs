@@ -110,6 +110,15 @@ pub struct ScanProgress {
     pub total: i64,
     pub current_file: String,
     pub stage: String, // "scanning" | "finished" | "error"
+    /// 逐檔掃描失敗清單（SP5）
+    pub errors: Vec<ScanError>,
+}
+
+/// 掃描單一檔案失敗的原因（SP5 錯誤清單）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanError {
+    pub path: String,
+    pub reason: String,
 }
 
 /// 播放佇列項目
@@ -186,6 +195,7 @@ pub struct DbState {
 
 /// 音訊執行緒回報的即時狀態。player_position 固定回 0，前端改讀這個。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EngineSnapshot {
     pub position_ms: i64,
     pub duration_ms: i64,
@@ -197,12 +207,24 @@ pub struct EngineSnapshot {
     pub stream_title: String,
     pub error: String,
     pub eq_bands: Vec<f32>,
+    pub eq_enabled: bool,
+    pub fx: crate::dsp::FxParams,
     pub preamp_db: f32,
     pub normalize: bool,
     pub crossfade_ms: i64,
     pub applied_gain: f32,
     pub band_hz: Vec<i32>,
     pub mode: PlayMode,
+    /// 播放序號（每次自然切換或手動載入遞增）
+    pub play_seq: u64,
+    /// 當前軌 token
+    pub now_token: u64,
+    /// 下一首 token（已排入待播槽）
+    pub next_token: u64,
+    /// 播放狀態機
+    pub playback_state: String, // "Playing" | "WaitingForNext" | "Paused" | "Finished"
+    /// 下一首清除 epoch（引擎自行清除時遞增）
+    pub next_clear_epoch: u64,
 }
 
 impl Default for EngineSnapshot {
@@ -217,13 +239,20 @@ impl Default for EngineSnapshot {
             kind: "idle".into(),
             stream_title: String::new(),
             error: String::new(),
-            eq_bands: vec![0.0; 10],
+            eq_bands: vec![0.0; crate::eq::BANDS],
+            eq_enabled: true,
+            fx: crate::dsp::FxParams::default(),
             preamp_db: 0.0,
             normalize: false,
             crossfade_ms: 0,
             applied_gain: 1.0,
-            band_hz: vec![32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+            band_hz: crate::eq::EQ_HZ.iter().map(|h| *h as i32).collect(),
             mode: PlayMode::Sequence,
+            play_seq: 0,
+            now_token: 0,
+            next_token: 0,
+            playback_state: "Finished".into(),
+            next_clear_epoch: 0,
         }
     }
 }
@@ -237,21 +266,26 @@ pub struct PlayerState {
 /// 播放控制命令（音訊執行緒透過 mpsc 接收，避免在 UI 執行緒解碼）
 #[derive(Debug, Clone)]
 pub enum PlayerCommand {
-    Load { path: String, song_id: i64 },
+    Load { path: String, song_id: i64, token: u64 },
     /// 載入並停在指定位置，不開始播放。重新開啟時接進度用。
-    Prepare { path: String, song_id: i64, position_ms: i64 },
+    Prepare { path: String, song_id: i64, position_ms: i64, token: u64 },
     Play,
     Pause,
     Toggle,
     Stop,
     Next,
     Prev,
-    Preload { path: String, song_id: i64 },
+    /// 設定下一首（立即回傳，背景準備）
+    SetNext { path: String, song_id: i64, token: u64 },
+    /// 清除下一首
+    ClearNext,
     Seek { position_ms: i64 },
     SetVolume { volume: f32 },
     SetMode { mode: PlayMode },
     SetEq { bands: Vec<f32> },
     SetPreamp { db: f32 },
+    SetEqEnabled { enabled: bool },
+    SetFx { fx: crate::dsp::FxParams },
     SetOutput { name: String },
     SetNormalize { enabled: bool },
     SetCrossfade { ms: i64 },

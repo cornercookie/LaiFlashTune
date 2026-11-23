@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-clear-smart-rules-cmd"
+description = "Enables the clear_smart_rules_cmd command without any pre-configured scope."
+commands.allow = ["clear_smart_rules_cmd"]
+
+[[permission]]
+identifier = "deny-clear-smart-rules-cmd"
+description = "Denies the clear_smart_rules_cmd command without any pre-configured scope."
+commands.deny = ["clear_smart_rules_cmd"]

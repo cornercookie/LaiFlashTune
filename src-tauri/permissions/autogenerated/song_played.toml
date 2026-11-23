@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-song-played"
+description = "Enables the song_played command without any pre-configured scope."
+commands.allow = ["song_played"]
+
+[[permission]]
+identifier = "deny-song-played"
+description = "Denies the song_played command without any pre-configured scope."
+commands.deny = ["song_played"]

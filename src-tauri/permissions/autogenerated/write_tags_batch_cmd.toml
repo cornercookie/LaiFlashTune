@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-write-tags-batch-cmd"
+description = "Enables the write_tags_batch_cmd command without any pre-configured scope."
+commands.allow = ["write_tags_batch_cmd"]
+
+[[permission]]
+identifier = "deny-write-tags-batch-cmd"
+description = "Denies the write_tags_batch_cmd command without any pre-configured scope."
+commands.deny = ["write_tags_batch_cmd"]

@@ -57,6 +57,15 @@
     border-radius: 2px;
     background: #2a2723;
   }
+  /* 等化器直推桿：原生 range 轉直向，上方為正。寬 18px 才拖得到。 */
+  input[type="range"].eq-v {
+    writing-mode: vertical-lr;
+    direction: rtl;
+    width: 18px;
+    height: 150px;
+    margin: 0;
+    cursor: pointer;
+  }
   input[type="range"].line::-moz-range-thumb {
     width: 12px;
     height: 12px;

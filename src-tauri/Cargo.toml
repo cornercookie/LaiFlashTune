@@ -28,11 +28,20 @@ lofty = "0.9"
 image = { version = "0.25", features = ["jpeg", "png", "bmp"] }
 pinyin = { version = "0.11", features = ["plain"] }
 
+# 並發通道
+crossbeam-channel = "0.5"
+
+# Windows API
+winapi = { version = "0.3", features = ["fileapi", "handleapi", "winbase", "winnt", "minwinbase", "processenv", "libloaderapi", "errhandlingapi", "synchapi", "processthreadsapi"] }
+
 # 音訊播放：rodio 輸出 + symphonia 解碼
 rodio = "0.19"
 # 直接用 symphonia 解碼：rodio 0.19 開 MP4 會 panic（ReadSeekSource 不回報 byte_len）
 symphonia = { version = "0.5", default-features = false, features = ["aac", "alac", "isomp4", "mp3", "flac", "wav", "pcm", "aiff", "ogg", "vorbis"] }
 souvlaki = "0.7"
+# 重取樣器：用於 TrackResampler (原生→48kHz) 與 DeviceConverter (48kHz→裝置)
+# rubato 0.16.x：SincFixedIn process(&[channel_frames], None) API
+rubato = "0.16"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

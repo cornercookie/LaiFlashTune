@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-player-preload"
+description = "Enables the player_preload command without any pre-configured scope."
+commands.allow = ["player_preload"]
+
+[[permission]]
+identifier = "deny-player-preload"
+description = "Denies the player_preload command without any pre-configured scope."
+commands.deny = ["player_preload"]

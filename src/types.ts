@@ -99,7 +99,14 @@ export interface ScanProgress {
   scanned: number;
   total: number;
   current_file: string;
-  stage: string;
+  stage: string; // "scanning" | "finished" | "error"
+  /// 逐檔掃描失敗清單（SP5）
+  errors: ScanError[];
+}
+
+export interface ScanError {
+  path: string;
+  reason: string;
 }
 
 export interface EngineSnapshot {
@@ -113,11 +120,19 @@ export interface EngineSnapshot {
   stream_title: string;
   error: string;
   eq_bands: number[];
+  eq_enabled: boolean;
+  fx: import('./player/fx').Fx;
+  preamp_db: number;
   normalize: boolean;
   crossfade_ms: number;
   applied_gain: number;
   band_hz: number[];
   mode: PlayMode;
+  play_seq: number;
+  now_token: number;
+  next_token: number;
+  next_clear_epoch: number;
+  playback_state: string;
 }
 
 export interface LibraryFacet {

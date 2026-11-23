@@ -1,10 +1,14 @@
 import type { PlayMode } from '../types';
+import { EQ_LIMIT, clampDb, flatBands, migrateBands } from './eq.ts';
+import { FX_DEFAULT, parseFx, type Fx } from './fx.ts';
 
 export type Session = {
   volume: number;
   muted: boolean;
   mode: PlayMode;
   eq: number[];
+  eqEnabled: boolean;
+  fx: Fx;
   preamp: number;
   normalize: boolean;
   crossfade: number;
@@ -20,7 +24,9 @@ export function emptySession(): Session {
     volume: 0.7,
     muted: false,
     mode: 'Sequence',
-    eq: Array(10).fill(0),
+    eq: flatBands(),
+    eqEnabled: true,
+    fx: { ...FX_DEFAULT },
     preamp: 0,
     normalize: false,
     crossfade: 0,
@@ -48,12 +54,10 @@ export function parseSession(raw: string | null | undefined): Session {
   const row = value as Record<string, unknown>;
   const volume = typeof row.volume === 'number' && Number.isFinite(row.volume) ? clamp(row.volume, 0, 1) : base.volume;
   const mode = MODES.includes(row.mode as PlayMode) ? (row.mode as PlayMode) : base.mode;
-  const eq = Array.from({ length: 10 }, (_, i) => {
-    const n = Array.isArray(row.eq) ? Number(row.eq[i]) : 0;
-    return Number.isFinite(n) ? clamp(n, -12, 12) : 0;
-  });
+  // 舊版存 10 段，換算成 18 段，不要把使用者的曲線歸零。
+  const eq = migrateBands(row.eq) ?? flatBands();
   const preamp = typeof row.preamp === 'number' && Number.isFinite(row.preamp)
-    ? clamp(row.preamp, -12, 12) : 0;
+    ? clampDb(clamp(row.preamp, -EQ_LIMIT, EQ_LIMIT)) : 0;
   const crossfade = typeof row.crossfade === 'number' && Number.isFinite(row.crossfade)
     ? Math.round(clamp(row.crossfade, 0, 12000))
     : 0;
@@ -67,6 +71,8 @@ export function parseSession(raw: string | null | undefined): Session {
     muted: row.muted === true || volume === 0,
     mode,
     eq,
+    eqEnabled: row.eqEnabled !== false,
+    fx: parseFx(row.fx),
     preamp,
     normalize: row.normalize === true,
     crossfade,

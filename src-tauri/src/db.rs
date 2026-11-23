@@ -85,10 +85,6 @@ pub fn init_db(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS songs_fts (
             id INTEGER PRIMARY KEY AUTOINCREMENT
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS songs_fts_content USING fts5(
-            title, artist, album, title_pinyin, artist_pinyin,
-            content='songs', content_rowid='id', tokenize='trigram'
-        );
 
         CREATE TABLE IF NOT EXISTS playlists (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -183,6 +179,61 @@ pub fn init_db(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     }
 
     ensure_song_columns(conn)?;
+    ensure_search_index(conn)?;
+    Ok(())
+}
+
+/// 搜尋索引：獨立的 FTS5（自己存一份文字），rowid = songs.id，由觸發器跟 songs 同步。
+/// 舊版用 content='songs' 外部內容表，卻用不存在的 `id` 欄寫入與 JOIN，索引永遠是空的、查詢直接報錯。
+/// 拼音另存一份去掉空白的版本，打「qili」也找得到「qi li xiang」。
+const FTS_DDL: &str = "CREATE VIRTUAL TABLE IF NOT EXISTS songs_fts_content USING fts5(
+    title, artist, album, title_pinyin, artist_pinyin, pinyin_compact, initials,
+    tokenize='trigram'
+)";
+
+const FTS_ROW: &str = "coalesce(title,''), coalesce(artist,''), coalesce(album,''),
+    coalesce(title_pinyin,''), coalesce(artist_pinyin,''),
+    replace(coalesce(title_pinyin,'') || ' ' || coalesce(artist_pinyin,''), ' ', ''),
+    coalesce(title_pinyin_initial,'') || ' ' || coalesce(artist_pinyin_initial,'')";
+
+fn ensure_search_index(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let sql: Option<String> = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'songs_fts_content'", [], |r| r.get(0))
+        .ok();
+    let outdated = sql.as_deref().map(|s| s.contains("content='songs'") || !s.contains("initials")).unwrap_or(false);
+    if outdated {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS songs_fts_ai; DROP TRIGGER IF EXISTS songs_fts_au; DROP TRIGGER IF EXISTS songs_fts_ad;
+             DROP TABLE IF EXISTS songs_fts_content;",
+        )?;
+    }
+    conn.execute_batch(FTS_DDL)?;
+    let row_new = FTS_ROW.replace("title", "new.title").replace("artist", "new.artist").replace("album", "new.album");
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER IF NOT EXISTS songs_fts_ai AFTER INSERT ON songs BEGIN
+             INSERT INTO songs_fts_content(rowid, title, artist, album, title_pinyin, artist_pinyin, pinyin_compact, initials)
+             VALUES (new.id, {row_new});
+         END;
+         CREATE TRIGGER IF NOT EXISTS songs_fts_ad AFTER DELETE ON songs BEGIN
+             DELETE FROM songs_fts_content WHERE rowid = old.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS songs_fts_au AFTER UPDATE OF title, artist, album, title_pinyin, artist_pinyin,
+             title_pinyin_initial, artist_pinyin_initial ON songs BEGIN
+             DELETE FROM songs_fts_content WHERE rowid = old.id;
+             INSERT INTO songs_fts_content(rowid, title, artist, album, title_pinyin, artist_pinyin, pinyin_compact, initials)
+             VALUES (new.id, {row_new});
+         END;"
+    ))?;
+    // 索引筆數對不上（舊版從沒寫進去過，或升級剛重建）就整個重灌一次。
+    let songs: i64 = conn.query_row("SELECT COUNT(*) FROM songs", [], |r| r.get(0))?;
+    let indexed: i64 = conn.query_row("SELECT COUNT(*) FROM songs_fts_content", [], |r| r.get(0))?;
+    if songs != indexed {
+        conn.execute_batch(&format!(
+            "DELETE FROM songs_fts_content;
+             INSERT INTO songs_fts_content(rowid, title, artist, album, title_pinyin, artist_pinyin, pinyin_compact, initials)
+             SELECT id, {FTS_ROW} FROM songs;"
+        ))?;
+    }
     Ok(())
 }
 
@@ -265,8 +316,6 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
     )?;
     if changed > 0 {
         let id: i64 = conn.query_row("SELECT id FROM songs WHERE path = ?1", [&song.path], |r| r.get(0))?;
-        // 同步更新 FTS 內容（content='songs' 外部內容表，需手動維護或依賴觸發）
-        _ = upsert_fts(conn, id, &song);
         return Ok(id);
     }
 
@@ -303,38 +352,13 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
             song.channels,
         ],
     )?;
-    let id = conn.last_insert_rowid();
-    _ = upsert_fts(conn, id, &song);
-    Ok(id)
-}
-
-/// 將單筆歌曲寫入 FTS5 外部內容表（songs_fts_content）。content='songs' 模式下，
-/// FTS 本身不儲存資料，需在此維護索引列，查詢時再 JOIN songs 取完整欄位。
-fn upsert_fts(conn: &rusqlite::Connection, rowid: i64, song: &NewSong) -> rusqlite::Result<()> {
-    let _ = conn.execute(
-        "DELETE FROM songs_fts_content WHERE id = ?1",
-        [rowid],
-    );
-    conn.execute(
-        "INSERT INTO songs_fts_content (id, title, artist, album, title_pinyin, artist_pinyin)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        rusqlite::params![
-            rowid,
-            song.title.as_deref().unwrap_or(""),
-            song.artist.as_deref().unwrap_or(""),
-            song.album.as_deref().unwrap_or(""),
-            song.title_pinyin.as_deref().unwrap_or(""),
-            song.artist_pinyin.as_deref().unwrap_or(""),
-        ],
-    )?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 /// 從資料庫刪除歌曲（連同 FTS 與歌詞）
 pub fn delete_song(conn: &rusqlite::Connection, path: &str) -> rusqlite::Result<()> {
     let id: Option<i64> = conn.query_row("SELECT id FROM songs WHERE path = ?1", [path], |r| r.get(0)).ok();
     if let Some(id) = id {
-        let _ = conn.execute("DELETE FROM songs_fts_content WHERE id = ?1", [id]);
         let _ = conn.execute("DELETE FROM lyrics WHERE song_id = ?1", [id]);
         let _ = conn.execute("DELETE FROM play_history WHERE song_id = ?1", [id]);
         let _ = conn.execute("DELETE FROM playlist_items WHERE song_id = ?1", [id]);
@@ -405,43 +429,56 @@ pub fn search_songs(
     query: &str,
     limit: i64,
 ) -> rusqlite::Result<SearchResult> {
-    // FTS5 MATCH 語法：關鍵字* 表示前綴比對；多個詞以空格分隔代表 AND。
-    let match_query = if query.is_empty() {
-        String::new()
-    } else {
-        query.split_whitespace()
-            .map(|w| format!("{}*", w))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-
-    let (total, songs) = if match_query.is_empty() {
+    let terms: Vec<&str> = query.split_whitespace().collect();
+    if terms.is_empty() {
         let total: i64 = conn.query_row("SELECT COUNT(*) FROM songs", [], |r| r.get(0))?;
         let songs = list_songs(conn, limit, 0, "added_at", "desc")?;
-        (total, songs)
-    } else {
-        let sql = format!(
-            "SELECT COUNT(*) FROM songs_fts_content f WHERE songs_fts_content MATCH ?1"
-        );
-        let total: i64 = conn.query_row(&sql, [&match_query], |r| r.get(0))?;
-
-        let sql = format!(
-            "SELECT s.id, s.path, s.title, s.artist, s.album, s.album_artist, s.genre, s.year,
-             s.duration_ms, s.file_mtime, s.file_size, s.cover_path, s.title_pinyin, s.artist_pinyin,
-             s.title_pinyin_initial, s.artist_pinyin_initial, s.added_at, s.play_count, s.last_played_at,
-             s.track_number, s.disc_number, s.format, s.bitrate, s.sample_rate, s.channels, s.missing
-             FROM songs_fts_content f
-             JOIN songs s ON s.id = f.id
-             WHERE songs_fts_content MATCH ?1
-             ORDER BY s.play_count DESC, s.added_at DESC
-             LIMIT ?2 OFFSET 0"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![&match_query, limit], |row| song_from_row(row))?;
-        let songs = rows.filter_map(Result::ok).collect();
-        (total, songs)
-    };
-
+        return Ok(SearchResult { songs, total });
+    }
+    // trigram 斷詞：3 字以上走 MATCH（任意位置子字串、不分大小寫）；
+    // 1–2 字（「七里」「周」）trigram 索引用不上，改用 LIKE 掃索引表，結果一樣、只是慢一點。
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+    let long: Vec<String> = terms
+        .iter()
+        .filter(|t| t.chars().count() >= 3)
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if !long.is_empty() {
+        params.push(long.join(" "));
+        clauses.push(format!("songs_fts_content MATCH ?{}", params.len()));
+    }
+    for t in terms.iter().filter(|t| t.chars().count() < 3) {
+        let esc = t.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        params.push(format!("%{esc}%"));
+        let n = params.len();
+        clauses.push(format!(
+            "(f.title LIKE ?{n} ESCAPE '\\' OR f.artist LIKE ?{n} ESCAPE '\\' OR f.album LIKE ?{n} ESCAPE '\\' \
+             OR f.pinyin_compact LIKE ?{n} ESCAPE '\\' OR f.initials LIKE ?{n} ESCAPE '\\')"
+        ));
+    }
+    let where_sql = clauses.join(" AND ");
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM songs_fts_content f WHERE {where_sql}"),
+        rusqlite::params_from_iter(params.iter()),
+        |r| r.get(0),
+    )?;
+    params.push(limit.to_string());
+    let sql = format!(
+        "SELECT s.id, s.path, s.title, s.artist, s.album, s.album_artist, s.genre, s.year,
+         s.duration_ms, s.file_mtime, s.file_size, s.cover_path, s.title_pinyin, s.artist_pinyin,
+         s.title_pinyin_initial, s.artist_pinyin_initial, s.added_at, s.play_count, s.last_played_at,
+         s.track_number, s.disc_number, s.format, s.bitrate, s.sample_rate, s.channels, s.missing
+         FROM songs_fts_content f
+         JOIN songs s ON s.id = f.rowid
+         WHERE {where_sql}
+         ORDER BY s.play_count DESC, s.added_at DESC
+         LIMIT CAST(?{} AS INTEGER)",
+        params.len()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| song_from_row(row))?;
+    let songs = rows.filter_map(Result::ok).collect();
     Ok(SearchResult { songs, total })
 }
 
@@ -882,6 +919,37 @@ mod tests {
         assert_eq!(result.songs[0].title.as_deref(), Some("七里香"));
 
         let result = search_songs(&conn, "七里", 50).unwrap();
-        assert_eq!(result.songs.len(), 1);
+        assert_eq!(result.songs.len(), 1, "two-char Chinese falls back to LIKE");
+        assert_eq!(search_songs(&conn, "周", 50).unwrap().songs.len(), 1);
+        assert_eq!(search_songs(&conn, "qili", 50).unwrap().songs.len(), 1, "pinyin without spaces");
+        assert_eq!(search_songs(&conn, "周杰倫 七里香", 50).unwrap().total, 1, "terms are AND");
+        assert_eq!(search_songs(&conn, "周杰倫 晴天", 50).unwrap().total, 0);
+        assert_eq!(search_songs(&conn, "50%_\"x", 50).unwrap().total, 0, "special chars do not break SQL");
+
+        // 標籤改名後索引跟著換（觸發器），刪除後不再出現。
+        conn.execute("UPDATE songs SET title = '晴天' WHERE path = ?1", [&song.path]).unwrap();
+        assert_eq!(search_songs(&conn, "晴天", 50).unwrap().total, 1);
+        assert_eq!(search_songs(&conn, "七里香 周杰倫", 50).unwrap().total, 1, "album still 七里香");
+        delete_song(&conn, &song.path).unwrap();
+        assert_eq!(search_songs(&conn, "晴天", 50).unwrap().total, 0);
+    }
+
+    #[test]
+    fn old_external_content_index_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open_connection(&dir.path().join("old.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE songs (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL, title TEXT, artist TEXT,
+               album TEXT, album_artist TEXT, genre TEXT, year INTEGER, duration_ms INTEGER NOT NULL, file_mtime INTEGER NOT NULL,
+               file_size INTEGER, cover_path TEXT, title_pinyin TEXT, artist_pinyin TEXT, title_pinyin_initial TEXT,
+               artist_pinyin_initial TEXT, added_at TEXT, play_count INTEGER DEFAULT 0, last_played_at TEXT);
+             CREATE VIRTUAL TABLE songs_fts_content USING fts5(title, artist, album, title_pinyin, artist_pinyin,
+               content='songs', content_rowid='id', tokenize='trigram');
+             INSERT INTO songs (path, title, artist, duration_ms, file_mtime) VALUES ('/a.mp3', '稻香', '周杰倫', 1, 1);",
+        ).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(search_songs(&conn, "稻香", 50).unwrap().total, 1, "existing library becomes searchable after upgrade");
+        init_db(&conn).unwrap();
+        assert_eq!(search_songs(&conn, "周杰倫", 50).unwrap().total, 1, "second launch does not duplicate rows");
     }
 }

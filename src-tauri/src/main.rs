@@ -5,10 +5,15 @@ mod models;
 mod commands;
 mod scanner;
 mod audio_decode;
+mod dsp;
+mod eq;
 mod player;
 mod extras;
 mod open_with;
 mod transport;
+mod tools;
+mod next_track;
+mod playback_pipeline;
 
 use crate::commands::{
     add_music_folder_cmd, add_song_to_playlist_cmd, app_paths, create_playlist_cmd,
@@ -21,21 +26,28 @@ use crate::commands::{
 use crate::commands::{
     player_load, player_play, player_preload, player_prepare, player_next, player_pause, player_position,
     player_prev, player_seek, player_set_mode,            player_set_volume, player_stop, player_toggle,
-            player_status, player_set_eq, player_set_preamp, player_output_devices, player_set_output, player_set_normalize, player_set_crossfade, player_play_url,
+            player_status, player_set_eq, player_set_preamp, player_set_eq_enabled, player_set_fx, eq_response_cmd, player_output_devices, player_set_output, player_set_normalize, player_set_crossfade, player_play_url,
+            player_set_next, player_clear_next,
     library_facets_cmd, songs_by_field_cmd, list_recent_cmd,
     read_tags_cmd, write_tags_cmd, write_tags_batch_cmd, ffmpeg_available_cmd, convert_audio_cmd, reveal_in_explorer_cmd, browse_folder_cmd, take_opened_file_cmd, song_by_path_cmd, smtc_update_cmd,
     pick_m3u_cmd, pick_m3u_save_cmd, import_m3u_cmd, export_m3u_cmd,
     list_radio_cmd, save_radio_cmd, rename_radio_cmd, delete_radio_cmd, classify_drop_cmd,
+    player_set_default_player,
 };
 use crate::db::{db_path, init_db};
 use crate::models::{DbState, OpenedFile, PlayerState};
-use crate::open_with::{audio_arg, log_deliver, log_forward_result, log_line, log_load_error, register_windows_association, forward_to_running, start_listener};
+use crate::open_with::{audio_arg, log_deliver, log_forward_result, log_line, log_load_error, forward_to_running, start_listener};
 use crate::player::start_player_thread;
+use crate::tools::{ffmpeg_available as tools_ffmpeg_available};
 use tauri::{Builder, Manager};
+
+include!(concat!(env!("OUT_DIR"), "/commands_manifest.rs"));
 
 fn main() {
     log_line("=== main start ===");
-    open_with::register_windows_association();
+    log_line(&format!("Tauri 允許命令數: {}", ALLOWED_COMMAND_COUNT));
+    // S7: 預設不寫入 HKCU 檔案關聯。僅在使用者於設定頁面明確點選「設為預設播放器」時註冊。
+    // open_with::register_windows_association();
     let opened = open_with::audio_arg();
     log_line(&format!("audio_arg -> {:?}", opened));
     if let Some(path) = &opened {
@@ -86,84 +98,90 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // 播放器
-            player_load,
-            player_prepare,
-            player_preload,
-            player_play,
-            player_pause,
-            player_toggle,
-            player_stop,
-            player_next,
-            player_prev,
-            player_seek,
-            player_set_volume,
-            player_set_mode,
-            player_position,
-            player_status,
-            player_set_eq,
-            player_set_preamp,
-            player_output_devices,
-            player_set_output,
-            player_set_normalize,
-            player_set_crossfade,
-            player_play_url,
-            library_facets_cmd,
-            songs_by_field_cmd,
-            list_recent_cmd,
-            read_tags_cmd,
-            write_tags_cmd,
-            write_tags_batch_cmd,
-            ffmpeg_available_cmd,
-            convert_audio_cmd,
-            list_radio_cmd,
-            save_radio_cmd,
-            rename_radio_cmd,
-            delete_radio_cmd,
-            classify_drop_cmd,
-            reveal_in_explorer_cmd,
-            browse_folder_cmd,
-            take_opened_file_cmd,
-            song_by_path_cmd,
-            smtc_update_cmd,
-            pick_m3u_cmd,
-            pick_m3u_save_cmd,
-            import_m3u_cmd,
-            export_m3u_cmd,
-            // 音樂庫與掃描
-            scan_folders,
-            get_songs,
-            search_songs_cmd,
-            get_song_cmd,
-            song_played,
-            record_history,
-            // 歌單
-            create_playlist_cmd,
-            list_playlists_cmd,
-            update_playlist_cmd,
-            delete_playlist_cmd,
-            add_song_to_playlist_cmd,
-            list_playlist_items_cmd,
-            remove_from_playlist_cmd,
-            update_playlist_order_cmd,
-            add_smart_rule_cmd,
-            list_smart_rules_cmd,
-            clear_smart_rules_cmd,
-            smart_playlist_songs_cmd,
-            // 歌詞
-            save_lyrics_cmd,
-            get_lyrics_cmd,
-            set_lyrics_offset_cmd,
-            // 資料夾與設定
-            add_music_folder_cmd,
-            list_music_folders_cmd,
-            remove_music_folder_cmd,
-            load_config_cmd,
-            save_config_cmd,
-            get_config_cmd,
-            // 路徑
-            app_paths,
-        ])
+                    // 播放器
+                    player_load,
+                    player_prepare,
+                    player_preload,
+                    player_set_next,
+                    player_clear_next,
+                    player_play,
+                    player_pause,
+                    player_toggle,
+                    player_stop,
+                    player_next,
+                    player_prev,
+                    player_seek,
+                    player_set_volume,
+                    player_set_mode,
+                    player_position,
+                    player_status,
+                    player_set_eq,
+                    player_set_preamp,
+                    player_set_eq_enabled,
+                    player_set_fx,
+                    eq_response_cmd,
+                    player_output_devices,
+                    player_set_output,
+                    player_set_normalize,
+                    player_set_crossfade,
+                    player_play_url,
+                    library_facets_cmd,
+                    songs_by_field_cmd,
+                    list_recent_cmd,
+                    read_tags_cmd,
+                    write_tags_cmd,
+                    write_tags_batch_cmd,
+                    ffmpeg_available_cmd,
+                    convert_audio_cmd,
+                    list_radio_cmd,
+                    save_radio_cmd,
+                    rename_radio_cmd,
+                    delete_radio_cmd,
+                    classify_drop_cmd,
+                    player_set_default_player,
+                    reveal_in_explorer_cmd,
+                    browse_folder_cmd,
+                    take_opened_file_cmd,
+                    song_by_path_cmd,
+                    smtc_update_cmd,
+                    pick_m3u_cmd,
+                    pick_m3u_save_cmd,
+                    import_m3u_cmd,
+                    export_m3u_cmd,
+                    // 音樂庫與掃描
+                    scan_folders,
+                    get_songs,
+                    search_songs_cmd,
+                    get_song_cmd,
+                    song_played,
+                    record_history,
+                    // 歌單
+                    create_playlist_cmd,
+                    list_playlists_cmd,
+                    update_playlist_cmd,
+                    delete_playlist_cmd,
+                    add_song_to_playlist_cmd,
+                    list_playlist_items_cmd,
+                    remove_from_playlist_cmd,
+                    update_playlist_order_cmd,
+                    add_smart_rule_cmd,
+                    list_smart_rules_cmd,
+                    clear_smart_rules_cmd,
+                    smart_playlist_songs_cmd,
+                    // 歌詞
+                    save_lyrics_cmd,
+                    get_lyrics_cmd,
+                    set_lyrics_offset_cmd,
+                    // 資料夾與設定
+                    add_music_folder_cmd,
+                    list_music_folders_cmd,
+                    remove_music_folder_cmd,
+                    load_config_cmd,
+                    save_config_cmd,
+                    get_config_cmd,
+                    // 路徑
+                    app_paths,
+                ])
         .run(tauri::generate_context!())
         .expect("錯誤：無法啟動 Tauri 應用程式");
 }

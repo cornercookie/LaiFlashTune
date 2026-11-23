@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-recent-cmd"
+description = "Enables the list_recent_cmd command without any pre-configured scope."
+commands.allow = ["list_recent_cmd"]
+
+[[permission]]
+identifier = "deny-list-recent-cmd"
+description = "Denies the list_recent_cmd command without any pre-configured scope."
+commands.deny = ["list_recent_cmd"]

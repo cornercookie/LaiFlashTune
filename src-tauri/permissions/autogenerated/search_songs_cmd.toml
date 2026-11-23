@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-search-songs-cmd"
+description = "Enables the search_songs_cmd command without any pre-configured scope."
+commands.allow = ["search_songs_cmd"]
+
+[[permission]]
+identifier = "deny-search-songs-cmd"
+description = "Denies the search_songs_cmd command without any pre-configured scope."
+commands.deny = ["search_songs_cmd"]

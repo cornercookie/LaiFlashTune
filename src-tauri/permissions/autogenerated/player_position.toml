@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-player-position"
+description = "Enables the player_position command without any pre-configured scope."
+commands.allow = ["player_position"]
+
+[[permission]]
+identifier = "deny-player-position"
+description = "Denies the player_position command without any pre-configured scope."
+commands.deny = ["player_position"]

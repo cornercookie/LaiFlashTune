@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-smart-playlist-songs-cmd"
+description = "Enables the smart_playlist_songs_cmd command without any pre-configured scope."
+commands.allow = ["smart_playlist_songs_cmd"]
+
+[[permission]]
+identifier = "deny-smart-playlist-songs-cmd"
+description = "Denies the smart_playlist_songs_cmd command without any pre-configured scope."
+commands.deny = ["smart_playlist_songs_cmd"]

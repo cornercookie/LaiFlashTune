@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-music-folders-cmd"
+description = "Enables the list_music_folders_cmd command without any pre-configured scope."
+commands.allow = ["list_music_folders_cmd"]
+
+[[permission]]
+identifier = "deny-list-music-folders-cmd"
+description = "Denies the list_music_folders_cmd command without any pre-configured scope."
+commands.deny = ["list_music_folders_cmd"]

@@ -1,22 +1,25 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Pause, Play, SkipBack, SkipForward, Volume2, VolumeX, Repeat, Repeat1, Shuffle } from 'lucide-react';
-import type { LyricLine, PlayMode, Playlist, Song } from '../types';
+import type { LyricLine, PlayMode, Playlist, Song, EngineSnapshot } from '../types';
 import {
   addSongToPlaylist, createPlaylist, deletePlaylist, getConfig, getLyrics, getSong, getSongs, libraryFacets,
   listPlaylistItems, listPlaylists, listRecent, onScanProgress, playerLoad, playerPause, updatePlaylist, updatePlaylistOrder,
-  playerPlay, playerPrepare, playerPreload, playerSeek, playerSetCrossfade, playerSetEq, playerSetMode, playerSetNormalize, playerSetPreamp, playerSetVolume, playerStatus,
-  recordHistory, removeFromPlaylist, revealInExplorer, saveConfig, saveLyrics, scanFolders, searchSongs, setLyricsOffset, songPlayed, songsByField,
+  playerPlay, playerPrepare, playerSetNext, playerClearNext, playerSeek, playerSetCrossfade, playerSetEq, playerSetMode, playerSetNormalize, playerSetPreamp, playerSetEqEnabled, playerSetFx, playerSetVolume, playerStatus,
+  removeFromPlaylist, revealInExplorer, saveConfig, saveLyrics, scanFolders, searchSongs, setLyricsOffset, songPlayed, songsByField,
   listMusicFolders, browseFolder, addMusicFolder, takeOpenedFile, songByPath, onOpenFile,
   pickM3u, pickM3uSave, importM3u, exportM3u, smtcUpdate,
-  playerOutputDevices, playerSetOutput,
+  playerOutputDevices, playerSetOutput, playerSetDefaultPlayer,
   writeTagsBatch,  listRadio, saveRadio, renameRadio, deleteRadio,
   classifyDrop,
   addSmartRule, listSmartRules, smartPlaylistSongs,
 } from '../lib/api';
 import { TrackTable, type SortKey } from './TrackTable';
-import { ConvertView, EqPane, RadioView, SettingsView, TagView } from './Tools';
+import { ConvertView, EqPanel, RadioView, SettingsView, TagView } from './Tools';
+import { SEED_VERSION, flatBands, mergeSeeds, parsePresets, type EqPreset, type PresetBind } from './eq';
+import { FX_DEFAULT, parseAuto, pickAutoPreset, sceneFx, type AutoEq, type Fx, type Scene } from './fx';
 import { sessionRestoreActions } from './openWithRestore';
 import { emptySession, parseSession, type Session } from './session';
+import { decideNext, PLAY_MODE, type DecideNextInput, type DecideNextOutput } from './nextTrack';
 
 type View = 'all' | 'artists' | 'albums' | 'genres' | 'folders' | 'playlist' | 'queue' | 'recent' | 'radio' | 'tags' | 'convert' | 'settings';
 
@@ -108,7 +111,6 @@ export default function Shell() {
   const [lyricOffset, setLyricOffset] = useState(0);
   const [lyricDraft, setLyricDraft] = useState('');
   const [m3uMissing, setM3uMissing] = useState<string[]>([]);
-  const [right, setRight] = useState<'lyrics' | 'eq'>('lyrics');
   const [tabs, setTabs] = useState<OpenTab[]>([ALL_TAB]);
   const [lyricsOpen, setLyricsOpen] = useState(true);
   const [queueName, setQueueName] = useState('');
@@ -117,12 +119,17 @@ export default function Shell() {
   const [smartKind, setSmartKind] = useState('played');
   const [smartGenre, setSmartGenre] = useState('');
   const [mini, setMini] = useState(false);
-  const [eq, setEq] = useState<number[]>(Array(10).fill(0));
+  const [eq, setEq] = useState<number[]>(flatBands());
+  const [eqEnabled, setEqEnabled] = useState(true);
+  const [eqOpen, setEqOpen] = useState(false);
+  const [fx, setFx] = useState<Fx>({ ...FX_DEFAULT });
+  const [autoEq, setAutoEq] = useState<AutoEq>({ enabled: false, fallback: '' });
+  const [autoNote, setAutoNote] = useState('');
   const [preamp, setPreamp] = useState(0);
   const [normalize, setNormalize] = useState(false);
   const [crossfade, setCrossfade] = useState(0);
   const [gain, setGain] = useState(1);
-  const [eqPresets, setEqPresets] = useState<Array<{ name: string; bands: number[] }>>([]);
+  const [eqPresets, setEqPresets] = useState<EqPreset[]>([]);
   const [presetDraft, setPresetDraft] = useState('');
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
@@ -130,6 +137,7 @@ export default function Shell() {
   const [plMenu, setPlMenu] = useState<{ x: number; y: number; id: number; name: string } | null>(null);
   const [newName, setNewName] = useState('');
   const [scan, setScan] = useState('');
+  const [scanErrors, setScanErrors] = useState<{ path: string; reason: string }[]>([]);
   const [engineError, setEngineError] = useState('');
   const [radioTitle, setRadioTitle] = useState('');
   const [batchDraft, setBatchDraft] = useState<{ artist: string; album: string; genre: string; year: string }>({ artist: '', album: '', genre: '', year: '' });
@@ -138,15 +146,26 @@ export default function Shell() {
   const sleepRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [outputDevice, setOutputDevice] = useState('');
+  const [defaultPlayer, setDefaultPlayer] = useState(false);
   const [offset, setOffset] = useState(0);
   const [hasMore, setHasMore] = useState(true);
   const activeRef = useRef<number | null>(null);
   const orderRef = useRef<Song[]>([]);
   const modeRef = useRef<PlayMode>('Sequence');
+  // types.PlayMode（大寫）↔ nextTrack PlayMode（小寫）的轉換，decideNext 輸入用小寫
+  const MODE_TO_NEXT: Record<PlayMode, import('./nextTrack').PlayMode> = {
+    Sequence: 'sequence',
+    Single: 'single',
+    All: 'all',
+    Random: 'random',
+  };
   const endedRef = useRef(false);
   const volRef = useRef(0.7);
   const mutedRef = useRef(false);
-  const eqRef = useRef<number[]>(Array(10).fill(0));
+  const eqRef = useRef<number[]>(flatBands());
+  const eqOnRef = useRef(true);
+  const fxRef = useRef<Fx>({ ...FX_DEFAULT });
+  const autoSongRef = useRef<number | null>(null);
   const preampRef = useRef(0);
   const normRef = useRef(false);
   const fadeRef = useRef(0);
@@ -166,11 +185,23 @@ export default function Shell() {
   const playSongRef = useRef<(song: Song, list?: Song[]) => Promise<void>>(async () => {});
   const openPlaylistRef = useRef<(id: number, name?: string) => Promise<void>>(async () => {});
 
+  // SP3：新流程的狀態
+  const nextRequestedRef = useRef<{ songId: number; token: number; fromQueue: boolean } | null>(null);
+  const requestedTokenRef = useRef<number | null>(null);      // 上一次送出 set_next 的 token（不論引擎是否準備好）
+  const nextClearEpochRef = useRef(0);                         // 引擎自行清除下一首的 epoch
+  const tokenSongRef = useRef<Map<number, { songId: number; fromQueue: boolean }>>(new Map());
+  const failedRef = useRef<Set<number>>(new Set());            // 這階段解碼/播放失敗的歌曲 id
+  const consecutiveFailuresRef = useRef(0);
+  const stopEnqueueingRef = useRef(false);
+  const playSeqRef = useRef<number | null>(null);              // 上一次處理過的 play_seq（避免重複副作用）
+
   const snapshot = (): Session => ({
     volume: volRef.current,
     muted: mutedRef.current,
     mode: modeRef.current,
     eq: eqRef.current.slice(),
+    eqEnabled: eqOnRef.current,
+    fx: { ...fxRef.current },
     preamp: preampRef.current,
     normalize: normRef.current,
     crossfade: fadeRef.current,
@@ -355,21 +386,19 @@ export default function Shell() {
           if (lyricsFlag === '0') setLyricsOpen(false);
         } catch { /* 沒有存過頁籤就維持全部歌曲 */ }
         try {
+          // 舊版 10 段預設換算成 18 段保留；種子只補沒有同名的，使用者覆寫或刪掉的不動。
           const raw = await getConfig('eq_presets');
-          const presets = JSON.parse(raw || '[]') as Array<{ name: string; bands: number[] }>;
-          const valid = Array.isArray(presets) ? presets.filter((p) => p.name && Array.isArray(p.bands) && p.bands.length === 10) : [];
-          if (valid.length) {
-            setEqPresets(valid);
-          } else {
-            const seeds = [
-              { name: '平直', bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
-              { name: '人聲', bands: [0, 0, 1, 2, 2, 1, 0, 0, 0, 0] },
-              { name: '重低音', bands: [4, 3, 2, 1, 0, 0, 0, 0, 0, 0] },
-            ];
-            setEqPresets(seeds);
-            await saveConfig('eq_presets', JSON.stringify(seeds)).catch(() => {});
+          const seeded = await getConfig('eq_presets_seed').catch(() => null);
+          const parsed = parsePresets(raw);
+          const merged = mergeSeeds(parsed, seeded ?? null);
+          setEqPresets(merged.presets);
+          const migrated = !!raw && JSON.stringify(parsed) !== raw;
+          if (merged.changed || migrated) {
+            await saveConfig('eq_presets', JSON.stringify(merged.presets)).catch(() => {});
+            await saveConfig('eq_presets_seed', SEED_VERSION).catch(() => {});
           }
-        } catch { /* 沒有存過等化器預設就維持空，先不種子 */ }
+          setAutoEq(parseAuto(await getConfig('eq_auto').catch(() => null)));
+        } catch { /* 讀不到預設就維持空清單，不擋開啟 */ }
         const folders = await listMusicFolders();
         const first = await getSongs(1, 0, 'title', 'asc');
         if (folders.length > 0 && first.length === 0) {
@@ -388,6 +417,8 @@ export default function Shell() {
         mutedRef.current = saved.muted;
         modeRef.current = saved.mode;
         eqRef.current = saved.eq;
+        eqOnRef.current = saved.eqEnabled;
+        fxRef.current = saved.fx;
         preampRef.current = saved.preamp;
         normRef.current = saved.normalize;
         fadeRef.current = saved.crossfade;
@@ -396,6 +427,8 @@ export default function Shell() {
         setMuted(saved.muted);
         setMode(saved.mode);
         setEq(saved.eq);
+        setEqEnabled(saved.eqEnabled);
+        setFx(saved.fx);
         setPreamp(saved.preamp);
         setNormalize(saved.normalize);
         setCrossfade(saved.crossfade);
@@ -403,6 +436,8 @@ export default function Shell() {
         await playerSetVolume(restore.silenceForMute ? 0 : (saved.volume || 0.7));
         await playerSetMode(saved.mode);
         await playerSetEq(saved.eq);
+        await playerSetEqEnabled(saved.eqEnabled);
+        await playerSetFx(saved.fx);
         await playerSetPreamp(saved.preamp);
         await playerSetNormalize(saved.normalize);
         await playerSetCrossfade(saved.crossfade);
@@ -433,7 +468,7 @@ export default function Shell() {
               setLyricOffset(lyric?.offset_ms ?? 0);
             }
             if (token === resumeToken.current) {
-              await playerPrepare(song.path, song.id, saved.positionMs);
+              await playerPrepare(song.path, song.id, saved.positionMs, resumeToken.current);
             }
           }
         }
@@ -442,13 +477,18 @@ export default function Shell() {
         setEngineError(e instanceof Error ? e.message : String(e));
       }
     })();
-    const un = onScanProgress((p) => setScan(`${p.stage} ${p.scanned}/${p.total} ${p.current_file}`));
+    const un = onScanProgress((p) => {
+      setScan(`${p.stage} ${p.scanned}/${p.total} ${p.current_file}`);
+      setScanErrors(p.errors);
+    });
     return () => { un.then((fn) => fn()); };
   }, []);
 
   useEffect(() => {
     if (!hydratedRef.current) return;
     eqRef.current = eq;
+    eqOnRef.current = eqEnabled;
+    fxRef.current = fx;
     preampRef.current = preamp;
     normRef.current = normalize;
     fadeRef.current = crossfade;
@@ -458,7 +498,7 @@ export default function Shell() {
     modeRef.current = mode;
     const timer = window.setTimeout(() => { void flushNowRef.current().catch((e) => setEngineError(String(e))); }, 400);
     return () => window.clearTimeout(timer);
-  }, [volume, muted, mode, eq, preamp, normalize, crossfade, queue]);
+  }, [volume, muted, mode, eq, eqEnabled, fx, preamp, normalize, crossfade, queue]);
 
   useEffect(() => {
     if (sleepRef.current) { clearInterval(sleepRef.current); sleepRef.current = null; }
@@ -522,15 +562,6 @@ export default function Shell() {
     };
   }, []);
 
-  const nextOf = (song: Song, list: Song[]) => {
-    const i = list.findIndex((s) => s.id === song.id);
-    if (modeRef.current === 'Single') return song;
-    if (modeRef.current === 'Random') return list[Math.floor(Math.random() * list.length)] ?? null;
-    const n = list[i + 1];
-    if (n) return n;
-    return modeRef.current === 'All' ? list[0] ?? null : null;
-  };
-
   const playSong = async (song: Song, list = shown) => {
     if (song.missing) {
       setEngineError(`缺檔，無法播放：${song.path}`);
@@ -546,23 +577,22 @@ export default function Shell() {
     setEngineError('');
     setRadioTitle('');
     endedRef.current = false;
+    // SP3：不提前記歷史/消耗佇列；副作用改在新 play_seq 出現時統一處理
+    const token = resumeToken.current;
+    const songId = song.id > 0 ? song.id : 0;
+    requestedTokenRef.current = token;
+    tokenSongRef.current.set(token, { songId, fromQueue: false });
     try {
-      await playerLoad(song.path, song.id);
+      await playerLoad(song.path, songId, token); // C1：帶 token
       await playerPlay().catch(() => {}); // 保險：確保啟動音訊
       await playerSetVolume(volRef.current || 0.7);
-      if (song.id > 0) recordHistory(song.id).catch((e) => setEngineError(String(e)));
-      const lyric = await getLyrics(song.id);
-      setLines(lyric?.lines ?? []);
-      setLyricOffset(lyric?.offset_ms ?? 0);
-      const nxt = nextOf(song, list);
-      const keepGoing = modeRef.current === 'All' || modeRef.current === 'Random';
-      if (keepGoing && nxt && nxt.id !== song.id) await playerPreload(nxt.path, nxt.id);
       positionRef.current = 0;
       void flushNowRef.current();
     } catch (e) {
       setEngineError(e instanceof Error ? e.message : String(e));
       setPlaying(false);
     }
+    playSeqRef.current = null; // 重新播放，下一次 play_seq 變動才做副作用
   };
   playSongRef.current = playSong;
 
@@ -589,7 +619,7 @@ export default function Shell() {
         setPlaying(true);
         setRadioTitle('');
         setEngineError('');
-        await playerLoad(path, 0);
+        await playerLoad(path, 0, resumeToken.current);
         await playerPlay().catch(() => {});
         await playerSetVolume(volRef.current || 0.7);
       } catch (e) {
@@ -661,6 +691,47 @@ export default function Shell() {
   }, []);
 
   useEffect(() => {
+    const enqueueNext = async (current: Song, status: EngineSnapshot) => {
+      const input: DecideNextInput = {
+        reason: status.playback_state === 'Finished' ? 'ended' : 'user',
+        playlist: orderRef.current.map((s) => String(s.id)),
+        queue: queueRef.current.map((s) => String(s.id)),
+        mode: MODE_TO_NEXT[modeRef.current],
+        playAfterEnd: stopAfterCurrent,
+        currentSong: String(current.id),
+        randomPreselected: null,
+        failed: new Set([...failedRef.current].map(String)),
+      };
+      const result = decideNext(input);
+      consecutiveFailuresRef.current = result.consecutiveFailures;
+      stopEnqueueingRef.current = result.stopEnqueueing;
+      for (const id of result.removedFromQueue) {
+        const nid = Number(id);
+        queueRef.current = queueRef.current.filter((s) => s.id !== nid);
+      }
+      setQueue(queueRef.current);
+
+      if (result.song == null || stopEnqueueingRef.current) {
+        await playerClearNext().catch(() => {});
+        requestedTokenRef.current = 0;
+        nextClearEpochRef.current = status.next_clear_epoch;
+        nextRequestedRef.current = null;
+        return;
+      }
+
+      const songId = Number(result.song);
+      const fromQueue = Boolean(result.fromQueue);
+      const nextSong =
+        orderRef.current.find((x) => x.id === songId) ?? queueRef.current.find((x) => x.id === songId);
+      if (!nextSong) return;
+
+      const nextToken = (requestedTokenRef.current ?? 0) + 1;
+      requestedTokenRef.current = nextToken;
+      tokenSongRef.current.set(nextToken, { songId, fromQueue });
+      await playerSetNext(nextSong.path, songId, nextToken).catch(() => {});
+      nextRequestedRef.current = { songId, token: nextToken, fromQueue };
+    };
+
     const t = setInterval(async () => {
       try {
         const s = await playerStatus();
@@ -676,25 +747,71 @@ export default function Shell() {
         if (s.kind !== 'radio' && s.is_playing && hydratedRef.current && Date.now() - lastFlushRef.current >= 5000) {
           void flushNowRef.current().catch(() => {});
         }
-        if (s.song_id && s.song_id !== activeRef.current && s.kind !== 'radio') {
-          const found = orderRef.current.find((x) => x.id === s.song_id);
+
+        // SP3：以 play_seq 變動為唯一副作用觸發點（歷史、佇列消耗、下一首一次到位）；不再輪詢 ended 重載
+        if (
+          s.kind !== 'radio' &&
+          s.song_id &&
+          s.song_id !== activeRef.current &&
+          s.play_seq != null &&
+          s.play_seq !== playSeqRef.current
+        ) {
+          playSeqRef.current = s.play_seq;
+          const found =
+            orderRef.current.find((x) => x.id === s.song_id) ??
+            queueRef.current.find((x) => x.id === s.song_id) ??
+            songs.find((x) => x.id === s.song_id);
           if (found) {
             activeRef.current = s.song_id;
             setActiveId(s.song_id);
-            endedRef.current = true;
+            setOrder([found, ...orderRef.current.filter((x) => x.id !== s.song_id)]);
+            setDuration(found.duration_ms || 0);
+            // 記播放（只一次）；歌詞若已過期則丟棄
+            await songPlayed(s.song_id).catch(() => {});
             const lyric = await getLyrics(s.song_id);
             setLines(lyric?.lines ?? []);
             setLyricOffset(lyric?.offset_ms ?? 0);
-            const nxt = nextOf(found, orderRef.current);
-            const keepGoing = modeRef.current === 'All' || modeRef.current === 'Random';
-            if (keepGoing && nxt && nxt.id !== found.id) playerPreload(nxt.path, nxt.id).catch(() => {});
-            void flushNowRef.current().catch(() => {});
+            // 佇列來的歌：此時才消耗佇列
+            if (nextRequestedRef.current?.songId === s.song_id) {
+              const head = queueRef.current[0];
+              if (head && head.id === s.song_id) {
+                queueRef.current = queueRef.current.slice(1);
+                setQueue(queueRef.current);
+              }
+              nextRequestedRef.current = null;
+            }
+            await enqueueNext(found, s);
+
+            // SP3：引擎自行清除了下一首（seek/換裝置/player_load）會遞增 next_clear_epoch。
+            // 若前端仍有「已要求的 token」且尚未成歌，就重新送出一次 set_next；
+            // 比對對象是「已要求的 token」，不是快照的 next_token（可能還在準備中）。
+            if (
+              s.next_clear_epoch !== nextClearEpochRef.current &&
+              requestedTokenRef.current !== null
+            ) {
+              const pending = nextRequestedRef.current;
+              if (pending) {
+                const nextSong =
+                  orderRef.current.find((x) => x.id === pending.songId) ??
+                  queueRef.current.find((x) => x.id === pending.songId);
+                if (nextSong) {
+                  const nextToken = (requestedTokenRef.current ?? 0) + 1;
+                  requestedTokenRef.current = nextToken;
+                  tokenSongRef.current.set(nextToken, {
+                    songId: pending.songId,
+                    fromQueue: pending.fromQueue,
+                  });
+                  await playerSetNext(nextSong.path, pending.songId, nextToken).catch(() => {});
+                  nextRequestedRef.current = {
+                    songId: pending.songId,
+                    token: nextToken,
+                    fromQueue: pending.fromQueue,
+                  };
+                }
+              }
+              nextClearEpochRef.current = s.next_clear_epoch;
+            }
           }
-        }
-        if (s.ended && !endedRef.current) {
-          endedRef.current = true;
-          if (activeRef.current) songPlayed(activeRef.current).catch(() => {});
-          stepRef.current(1, 'ended');
         }
         if (!s.ended) endedRef.current = false;
       } catch { /* 視窗還沒接上後端時不刷錯誤 */ }
@@ -752,29 +869,91 @@ export default function Shell() {
   const applyPreset = async (name: string) => {
     const preset = eqPresets.find((p) => p.name === name);
     if (!preset) return;
+    setSelectedPreset(name);
     setEq(preset.bands);
     eqRef.current = preset.bands.slice();
     await playerSetEq(preset.bands).catch((e) => setEngineError(String(e)));
+    if (typeof preset.preamp === 'number') {
+      setPreamp(preset.preamp);
+      preampRef.current = preset.preamp;
+      await playerSetPreamp(preset.preamp).catch((e) => setEngineError(String(e)));
+    }
     void flushNowRef.current().catch(() => {});
   };
 
-  const savePreset = async () => {
+  // 參考播放器「依曲目自動調整等化器預設」：每首歌只在換到它時套一次，之後使用者手動改不會被蓋回去。
+  useEffect(() => {
+    if (!autoEq.enabled || !activeId || autoSongRef.current === activeId) return;
+    autoSongRef.current = activeId;
+    const pick = pickAutoPreset(active, eqPresets, autoEq);
+    if (!pick) { setAutoNote('沒有符合的預設，維持目前曲線'); return; }
+    setAutoNote(`自動套用「${pick.preset.name}」：${pick.reason}`);
+    if (selectedPreset !== pick.preset.name) void applyPreset(pick.preset.name);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, autoEq, eqPresets, active]);
+
+  const savePreset = async (bind?: PresetBind) => {
     const name = presetDraft.trim();
     if (!name) {
       setEngineError('預設名稱不能是空的');
       return;
     }
     const next = eqPresets.filter((p) => p.name !== name);
-    next.push({ name, bands: eq.slice() });
+    next.push(bind ? { name, bands: eq.slice(), preamp, bind } : { name, bands: eq.slice(), preamp });
     setEqPresets(next);
     setPresetDraft('');
+    setSelectedPreset(name);
     await saveConfig('eq_presets', JSON.stringify(next)).catch((e) => setEngineError(String(e)));
   };
 
   const deletePreset = async (name: string) => {
     const next = eqPresets.filter((p) => p.name !== name);
     setEqPresets(next);
+    setSelectedPreset(null);
     await saveConfig('eq_presets', JSON.stringify(next)).catch((e) => setEngineError(String(e)));
+  };
+
+  // 等化器每個變更直接打到音訊執行緒；後端即時換係數，不重開音源。失敗顯示在狀態列。
+  const changeBands = (bands: number[]) => {
+    setEq(bands);
+    setSelectedPreset(null);
+    playerSetEq(bands).catch((e) => setEngineError(String(e)));
+  };
+  const changePreamp = (db: number) => {
+    setPreamp(db);
+    playerSetPreamp(db).catch((e) => setEngineError(String(e)));
+  };
+  const changeEqEnabled = (on: boolean) => {
+    setEqEnabled(on);
+    playerSetEqEnabled(on).catch((e) => setEngineError(String(e)));
+  };
+  const changeNormalize = (on: boolean) => {
+    setNormalize(on);
+    playerSetNormalize(on).catch((e) => setEngineError(String(e)));
+  };
+  const changeCrossfade = (ms: number) => {
+    setCrossfade(ms);
+    playerSetCrossfade(ms).catch((e) => setEngineError(String(e)));
+  };
+  const closeEq = useCallback(() => setEqOpen(false), []);
+  const changeFx = (next: Fx) => {
+    setFx(next);
+    fxRef.current = next;
+    playerSetFx(next).catch((e) => setEngineError(String(e)));
+  };
+  // 情境建議：等化器、前級、音效一起換；音效從預設值開始覆寫，不殘留上一個情境。
+  const applyScene = (scene: Scene) => {
+    setSelectedPreset(null);
+    changeBands(scene.bands.slice());
+    changePreamp(scene.preamp);
+    if (!eqEnabled) changeEqEnabled(true);
+    changeFx(sceneFx(scene));
+    setScan(`已套用情境「${scene.name}」`);
+  };
+  const changeAuto = (next: AutoEq) => {
+    setAutoEq(next);
+    if (next.enabled && !autoEq.enabled) autoSongRef.current = null;
+    saveConfig('eq_auto', JSON.stringify(next)).catch((e) => setEngineError(String(e)));
   };
 
   const cycleMode = () => {
@@ -908,7 +1087,7 @@ export default function Shell() {
         setPlaying(true);
         setRadioTitle('');
         setEngineError('');
-        await playerLoad(first, 0);
+        await playerLoad(first, 0, resumeToken.current);
         await playerSetVolume(mutedRef.current ? 0 : volRef.current);
       }
       for (let i = 1; i < filePaths.length; i++) {
@@ -1074,6 +1253,16 @@ export default function Shell() {
         </div>
       )}
       {scan && <div className="px-5 py-1 text-xs text-[#8a847a] border-b border-[#2a2723]">{scan}</div>}
+      {scanErrors.length > 0 && (
+        <div className="px-5 py-2 text-xs text-[#e23b2f] border-b border-[#2a2723] max-h-24 overflow-y-auto">
+          <div className="mb-1 font-bold text-[#e23b2f]">掃描失敗：</div>
+          {scanErrors.map((e, i) => (
+            <div key={i} className="break-all text-[#f4f0e8]">
+              {e.path} — {e.reason}
+            </div>
+          ))}
+        </div>
+      )}
       <div className="flex flex-1 min-h-0">
         <nav className="w-[208px] shrink-0 border-r border-[#2a2723] py-3 px-2 text-sm overflow-y-auto overflow-x-hidden">
           {([
@@ -1166,7 +1355,7 @@ export default function Shell() {
               {id === 'radio' ? '電台' : id === 'tags' ? '標籤' : id === 'convert' ? '轉檔' : '資料夾設定'}
             </button>
           ))}
-          <button className={`flex items-center w-full min-h-9 px-3 text-left leading-5 rounded-sm ${lyricsOpen && right === 'eq' ? 'text-[#e23b2f]' : 'text-[#8a847a]'}`} onClick={() => { setLyricsOpen(true); setRight(lyricsOpen && right === 'eq' ? 'lyrics' : 'eq'); }}>等化器</button>
+          <button className={`flex items-center w-full min-h-9 px-3 text-left leading-5 rounded-sm ${eqOpen ? 'text-[#e23b2f]' : 'text-[#8a847a]'}`} aria-pressed={eqOpen} onClick={() => setEqOpen((v) => !v)}>等化器{eqEnabled ? '' : '（關）'}</button>
         </nav>
         <main className="flex-1 min-w-0 flex flex-col">
           {!tool && (
@@ -1290,9 +1479,7 @@ export default function Shell() {
         </main>
         {lyricsOpen && (
         <aside className="w-[260px] shrink-0 border-l border-[#2a2723] overflow-y-auto overflow-x-hidden">
-          {right === 'eq' ? (
-            <EqPane bands={eq} preamp={preamp} normalize={normalize} crossfade={crossfade} gain={gain} presets={eqPresets} selectedPreset={selectedPreset} presetDraft={presetDraft} onBands={(bands) => { setEq(bands); setSelectedPreset(null); }} onPreamp={(v) => { setPreamp(v); }} onNormalize={(v) => { setNormalize(v); }} onCrossfade={(ms) => { setCrossfade(ms); }} onApplyPreset={applyPreset} onSavePreset={savePreset} onDeletePreset={deletePreset} onSelectPreset={setSelectedPreset} onPresetNameChange={setPresetDraft} />
-          ) : (
+          {(
             <div className="px-5 py-4">
               <div className="text-[12px] tracking-widest text-[#e23b2f]">{catalog(activeId)}</div>
               <h2 className="text-[16px] leading-snug font-bold mt-2 mb-2 break-words">{playingName}</h2>
@@ -1379,16 +1566,16 @@ export default function Shell() {
             {outputDevices.map((d) => (<option key={d} value={d}>{d}</option>))}
           </select>
           <button type="button" className="round w-auto px-3 text-xs shrink-0" onClick={() => { playerOutputDevices().then((ds) => { setOutputDevices(ds); if (ds.length && !outputDevice) setOutputDevice(ds[0]); }).catch(() => {}); }}>重整裝置</button>
+          <button type="button" className="round w-auto px-3 text-xs shrink-0" onClick={() => { void playerSetDefaultPlayer(!defaultPlayer).then(() => setDefaultPlayer(!defaultPlayer)).catch((err) => setEngineError(String(err))); }}>{defaultPlayer ? '取消預設播放器' : '設為預設播放器'}</button>
           <button type="button" className="round w-auto px-3 text-xs shrink-0" onClick={() => {
-            if (!lyricsOpen || right === 'eq') {
+            if (!lyricsOpen) {
               setLyricsOpen(true);
-              setRight('lyrics');
               saveConfig('lyrics_open', '1').catch(() => {});
             } else {
               setLyricsOpen(false);
               saveConfig('lyrics_open', '0').catch(() => {});
             }
-          }}>{lyricsOpen && right !== 'eq' ? '收歌詞' : '歌詞'}</button>
+          }}>{lyricsOpen ? '收歌詞' : '歌詞'}</button>
           <button type="button" className={`round w-auto px-3 text-xs shrink-0 ${sleepSeconds > 0 ? 'text-[#e23b2f]' : ''}`} onClick={() => {
             const m = window.prompt('睡眠計時：幾分鐘後暫停（輸入 0 取消）', sleepSeconds > 0 ? String(Math.round(sleepSeconds / 60)) : '');
             const n = Number(m);
@@ -1512,6 +1699,18 @@ export default function Shell() {
             }
           }}>刪除歌單「{plMenu.name}」{confirmDelete ? '：再按一次才刪' : ''}</button>
         </div>
+      )}
+      {eqOpen && !mini && (
+        <EqPanel
+          bands={eq} preamp={preamp} enabled={eqEnabled} normalize={normalize} crossfade={crossfade} gain={gain}
+          presets={eqPresets} selectedPreset={selectedPreset} presetDraft={presetDraft}
+          onBands={changeBands} onPreamp={changePreamp} onEnabled={changeEqEnabled}
+          onNormalize={changeNormalize} onCrossfade={changeCrossfade}
+          onApplyPreset={applyPreset} onSavePreset={savePreset} onDeletePreset={deletePreset}
+          onPresetNameChange={setPresetDraft} onClose={closeEq}
+          fx={fx} onFx={changeFx} onScene={applyScene} isRadio={!!radioTitle}
+          song={active} auto={autoEq} onAuto={changeAuto} autoNote={autoNote}
+        />
       )}
     </div>
   );

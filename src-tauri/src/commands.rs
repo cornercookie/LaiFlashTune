@@ -11,7 +11,7 @@ use crate::models::{
     NewSong, PlayHistory, Playlist, PlaylistItem, PlaylistOrderUpdate, PlayerCommand, PlayerState,
     PlayMode, SearchResult, Song, SmartPlaylistRule,
 };
-use crate::open_with::log_line;
+use crate::open_with::{log_line, sanitize_log};
 use crate::player::start_player_thread;
 use crate::scanner::scan_music_folders;
 use serde::{Deserialize, Serialize};
@@ -22,31 +22,51 @@ use tauri::{AppHandle, Emitter, State};
 // 播放器控制命令（音訊執行緒透過 mpsc 接收，UI 執行緒只發指令）
 // ============================================================================
 
-/// 載入並播放一首歌曲（path、song_id）。
+/// 載入並播放一首歌曲（path、song_id、token）。
 #[tauri::command]
 pub fn player_load(
     state: State<'_, PlayerState>,
     path: String,
     song_id: i64,
+    token: u64,
 ) -> Result<(), String> {
-    crate::open_with::log_line(&format!("CMD player_load path={path} song_id={song_id}"));
+    crate::open_with::log_line(&format!("CMD player_load path={path} song_id={song_id} token={token}"));
     let tx = state.tx.lock().map_err(|e| e.to_string())?;
     let tx = tx.as_ref().ok_or("播放器尚未初始化")?;
-    tx.send(PlayerCommand::Load { path, song_id })
+    tx.send(PlayerCommand::Load { path, song_id, token })
         .map_err(|e| e.to_string())
 }
 
-/// 預載下一首（用於無縫切歌，gapless）。
+/// 設定下一首（立即回傳，背景準備）。
+#[tauri::command]
+pub fn player_set_next(
+    state: State<'_, PlayerState>,
+    path: String,
+    song_id: i64,
+    token: u64,
+) -> Result<(), String> {
+    crate::open_with::log_line(&format!("CMD player_set_next path={path} song_id={song_id} token={token}"));
+    send_cmd(state, PlayerCommand::SetNext { path, song_id, token })
+}
+
+/// 清除下一首。
+#[tauri::command]
+pub fn player_clear_next(
+    state: State<'_, PlayerState>,
+) -> Result<(), String> {
+    crate::open_with::log_line("CMD player_clear_next");
+    send_cmd(state, PlayerCommand::ClearNext)
+}
+
+/// 預載下一首（用於無縫切歌，gapless）。保留相容性，內部轉為 SetNext。
 #[tauri::command]
 pub fn player_preload(
     state: State<'_, PlayerState>,
     path: String,
     song_id: i64,
 ) -> Result<(), String> {
-    let tx = state.tx.lock().map_err(|e| e.to_string())?;
-    let tx = tx.as_ref().ok_or("播放器尚未初始化")?;
-    tx.send(PlayerCommand::Preload { path, song_id })
-        .map_err(|e| e.to_string())
+    let token = 0; // 相容模式不帶 token
+    send_cmd(state, PlayerCommand::SetNext { path, song_id, token })
 }
 
 #[tauri::command]
@@ -125,9 +145,10 @@ pub fn player_prepare(
     path: String,
     song_id: i64,
     position_ms: i64,
+    token: u64,
 ) -> Result<(), String> {
-    crate::open_with::log_line(&format!("CMD player_prepare path={path} song_id={song_id} position_ms={position_ms}"));
-    send_cmd(state, PlayerCommand::Prepare { path, song_id, position_ms })
+    crate::open_with::log_line(&format!("CMD player_prepare path={path} song_id={song_id} position_ms={position_ms} token={token}"));
+    send_cmd(state, PlayerCommand::Prepare { path, song_id, position_ms, token })
 }
 
 // ============================================================================
@@ -432,16 +453,39 @@ pub fn player_status(state: State<'_, PlayerState>) -> Result<crate::models::Eng
     Ok(status.clone())
 }
 
-/// 設定 10 段等化器增益（dB，-12 到 12）。只作用於本地檔案。
+/// 設定 18 段等化器增益（dB，-15 到 15）。本地檔與電台都會套用，即時生效不重開音源。
 #[tauri::command]
 pub fn player_set_eq(state: State<'_, PlayerState>, bands: Vec<f32>) -> Result<(), String> {
     send_cmd(state, PlayerCommand::SetEq { bands })
 }
 
-/// 前級增益（dB，-12 到 12）。乘在等化器之前。只作用於本地檔案。
+/// 前級增益（dB，-15 到 15）。乘在等化器之前；等化器關閉時一併略過。
 #[tauri::command]
 pub fn player_set_preamp(state: State<'_, PlayerState>, db: f32) -> Result<(), String> {
     send_cmd(state, PlayerCommand::SetPreamp { db })
+}
+
+/// 等化器總開關。關閉時各段與前級都不作用，推桿位置保留。
+#[tauri::command]
+pub fn player_set_eq_enabled(state: State<'_, PlayerState>, enabled: bool) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetEqEnabled { enabled })
+}
+
+/// 音效（速度、節奏、音高、低音、高音增強、人聲消除、合唱、鑲邊、回音、殘響）。即時生效。
+/// 欄位用 camelCase（FxParams 有 rename_all）。速度/節奏/音高不作用於電台。
+#[tauri::command]
+pub fn player_set_fx(state: State<'_, PlayerState>, fx: crate::dsp::FxParams) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetFx { fx })
+}
+
+/// 依音訊執行緒相同的濾波器設計算出頻率響應曲線，畫面用來畫曲線。回傳 [Hz, dB]。
+#[tauri::command]
+pub fn eq_response_cmd(bands: Vec<f32>, preamp: f32, enabled: bool, sample_rate: Option<u32>) -> Vec<[f32; 2]> {
+    let mut params = crate::eq::EqParams { enabled, preamp_db: preamp.clamp(-15.0, 15.0), ..Default::default() };
+    for (i, g) in bands.into_iter().take(crate::eq::BANDS).enumerate() {
+        params.bands[i] = if g.is_finite() { g.clamp(-15.0, 15.0) } else { 0.0 };
+    }
+    crate::eq::response_curve(&params, sample_rate.unwrap_or(44100), 160)
 }
 
 /// 列出本機輸出裝置。列不出就回錯誤，前端不要畫下拉。
@@ -480,6 +524,13 @@ pub fn player_play_url(state: State<'_, PlayerState>, url: String) -> Result<(),
         return Err("只接受 http 或 https 串流網址".into());
     }
     send_cmd(state, PlayerCommand::PlayUrl { url: trimmed })
+}
+
+/// S7: 設定或取消「設為預設播放器」（HKCU 檔案關聯）。僅在使用者於設定頁面
+/// 明確操作時呼叫，不會自動寫入登錄檔。
+#[tauri::command]
+pub fn player_set_default_player(enable: bool) -> Result<(), String> {
+    crate::open_with::set_windows_association(enable)
 }
 
 /// 曲庫分面：artist / album / genre / folder。
@@ -523,7 +574,7 @@ pub fn write_tags_cmd(state: State<'_, DbState>, edit: crate::models::TagEdit) -
 /// 這台電腦能不能轉檔。
 #[tauri::command]
 pub fn ffmpeg_available_cmd() -> bool {
-    crate::extras::ffmpeg_available()
+    crate::tools::ffmpeg_available()
 }
 
 /// 轉檔。沒有 ffmpeg 就回錯誤，不回假路徑。
@@ -582,7 +633,8 @@ pub fn browse_folder_cmd() -> Result<Option<String>, String> {
         .map_err(|e| format!("無法開啟資料夾選擇器: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("資料夾選擇器失敗: {err}"));
+        let sanitized = sanitize_log(&err);
+        return Err(format!("資料夾選擇器失敗: {sanitized}"));
     }
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
@@ -648,7 +700,9 @@ fn pick_dialog(script: &str, fail: &str) -> Result<Option<String>, String> {
         .output()
         .map_err(|e| format!("{fail}: {e}"))?;
     if !out.status.success() {
-        return Err(format!("{fail}: {}", String::from_utf8_lossy(&out.stderr)));
+        let err = String::from_utf8_lossy(&out.stderr);
+        let sanitized = sanitize_log(&err);
+        return Err(format!("{fail}: {sanitized}"));
     }
     let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if path.is_empty() { Ok(None) } else { Ok(Some(path)) }
