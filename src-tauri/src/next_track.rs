@@ -5,7 +5,7 @@
 //! `set_next`：worker 從「待處理請求」槽取出最新請求，產出 `PreparedTrack`，連同自己的世代送進完成通道。
 //! 引擎迴圈收到完成通知時，世代不是最新的就丟給回收執行緒；是最新的才放進待播槽，快照的 `next_token` 變成這個 token。
 
-use crate::audio_decode::{SymStream, FfmpegStream};
+use crate::audio_decode::{SymStream, FfmpegStream, precheck_packet_budget};
 use crate::open_with::{validate_local_path, log_line};
 use crate::tools::locate;
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
@@ -89,6 +89,10 @@ impl StreamSource for StreamWrapper {
     fn open(&self, start_ms: i64) -> Result<Box<dyn Iterator<Item = f32> + Send>, String> {
         match self {
             StreamWrapper::SymStream { path, .. } => {
+                // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+                if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+                    return Err(format!("封包上限預檢失敗：{reason}"));
+                }
                 SymStream::open(Path::new(path), start_ms).map(|s| Box::new(s) as Box<dyn Iterator<Item = f32> + Send>)
             }
             StreamWrapper::FfmpegStream(s) => s.open_with_seek(start_ms),
@@ -294,6 +298,10 @@ fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
     
     match backend {
         Some(crate::scanner::Backend::Symphonia) => {
+            // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+            if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+                return Err(format!("封包上限預檢失敗：{reason}"));
+            }
             // 嘗試用 symphonia 開啟
             match SymStream::open(Path::new(path), 0) {
                 Ok(mut stream) => {
@@ -370,6 +378,10 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str) -> Result<PreparedTr
     let _codec = audio_stream["codec_name"].as_str().unwrap_or("");
     let sample_rate = audio_stream["sample_rate"].as_str().unwrap_or("0").parse().unwrap_or(0);
     let channels = audio_stream["channels"].as_u64().unwrap_or(0) as u16;
+    // ffprobe 可能回報 0 取樣率/聲道，視為無效 metadata，拒絕建立 PreparedTrack
+    if sample_rate == 0 || channels == 0 {
+        return Err(format!("ffprobe 回報無效音訊參數：取樣率={}，聲道={}", sample_rate, channels));
+    }
     let duration = value["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok());
     let duration_ms = duration.map(|d| (d * 1000.0) as i64).unwrap_or(0);
     

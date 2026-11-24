@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use crate::audio_decode::precheck_packet_budget;
 
 /// DSP 內部固定取樣率
 pub const INTERNAL_SAMPLE_RATE: u32 = 48000;
@@ -690,7 +691,7 @@ impl TrackChain {
 
     /// 是否結束
     pub fn is_finished(&self) -> bool {
-        self.finished && (self.current_index >= self.tracks.len() - 1)
+        self.finished && (self.tracks.is_empty() || self.current_index >= self.tracks.len() - 1)
     }
 }
 
@@ -1583,6 +1584,10 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
 
     match backend {
         Some(crate::scanner::Backend::Symphonia) => {
+            // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+            if let Err(reason) = precheck_packet_budget(std::path::Path::new(path)) {
+                return Err(format!("封包上限預檢失敗：{reason}"));
+            }
             match crate::audio_decode::SymStream::open(std::path::Path::new(path), 0) {
                 Ok(mut stream) => {
                     let duration_ms = stream.duration_ms().unwrap_or(0);

@@ -30,6 +30,161 @@ const MAX_PACKET_BYTES: usize = 256 * 1024; // SE7：Symphonia 單封包上限
 const FFPROBE_MAX_BYTES: usize = 64 * 1024; // SE6：ffprobe stdout 上限
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(10); // SE6：ffprobe 總逾時
 
+/// SE7：配置前封包上限預檢。在 SymStream::open() 之前呼叫，讀取檔案標頭
+/// 遍歷所有音軌與片段的宣告封包大小；若任何封包宣告大小超過 MAX_PACKET_BYTES，
+/// 回傳 Err（呼叫者不得呼叫 open()）。無法可靠遍歷某種格式的封包索引時，
+/// 回傳 Ok（允許 open），依賴 refill 第二層防護（packet.buf().len() > MAX_PACKET_BYTES）
+/// 在執行時捕獲超標封包。
+pub fn precheck_packet_budget(path: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Err("無法開啟檔案".to_string());
+    };
+
+    // 讀取前 16 bytes 判斷容器格式
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() {
+        return Err("無法讀取檔案標頭".to_string());
+    }
+
+    // MP4：ftyp box，掃描 box 結構尋找 stsz（Sample Size box）
+    if &header[4..8] == b"ftyp" {
+        return scan_mp4_stsz(&mut file);
+    }
+
+    // 其他格式（MKV、MP3、FLAC 等）：無法在配置前可靠遍歷封包索引，
+    // fail-open，依賴 refill 第二層防護（packet.buf().len() > MAX_PACKET_BYTES）
+    // 在執行時捕獲超標封包。
+    Ok(())
+}
+
+/// 掃描 MP4 box 結構尋找 stsz（Sample Size box），檢查所有樣本大小是否超過上限。
+/// 支援巢狀 container box（moov/meta/ilst 等）遞迴走訪，涵蓋所有音軌與片段。
+fn scan_mp4_stsz(file: &mut std::fs::File) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const LIMIT: u64 = 10 * 1024 * 1024; // 僅掃描前 10 MB
+    scan_mp4_boxes(file, 0, LIMIT)
+}
+
+/// 遞迴走訪 MP4 box，尋找 stbox 並檢查樣本大小。
+fn scan_mp4_boxes(file: &mut std::fs::File, start: u64, limit: u64) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut pos = start;
+    let end = start.saturating_add(limit);
+    let mut header = [0u8; 8];
+
+    while pos < end {
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            return Err("MP4 box 定位失敗".to_string());
+        }
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        if size == 0 {
+            // size == 0 表示本 box 佔用至檔案/父 box 結尾（MP4 規格），無法推導下一個 box 位置，
+            // 停止掃描但不視為錯誤（此處之後的 box 無法可靠定位）。
+            break;
+        }
+        if size < 8 {
+            return Err("MP4 box 大小異常".to_string());
+        }
+        let btype = &header[4..8];
+
+        // 若是 stsz box，解析樣本大小
+        if btype == b"stsz" {
+            return check_stsz_samples(file, pos, size);
+        }
+
+        // 若是 container box，遞迴走訪子 box
+        let is_container = matches!(
+            btype,
+            b"moov" | b"meta" | b"ilst" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts"
+                | b"mvex"
+        );
+        if is_container && size > 8 {
+            let child_start = pos + 8;
+            let child_len = size.saturating_sub(8);
+            scan_mp4_boxes(file, child_start, child_len)?;
+        }
+
+        let next = size.saturating_sub(8);
+        pos = pos.saturating_add(8).saturating_add(next);
+        if pos > end {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// 檢查 stsz box 內的樣本大小是否超過 MAX_PACKET_BYTES。
+fn check_stsz_samples(file: &mut std::fs::File, box_start: u64, box_size: u64) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    // stsz box 結構：size(4) + type(4) + version(1) + flags(3) + sample_size(4) + sample_count(4) + [sample_sizes]
+    if file.seek(SeekFrom::Start(box_start + 8)).is_err() {
+        return Err("無法定位 stsz 內容".to_string());
+    }
+    let mut ver_flags = [0u8; 4];
+    if file.read_exact(&mut ver_flags).is_err() {
+        return Err("無法讀取 stsz 版本與旗標".to_string());
+    }
+    let mut sample_size_buf = [0u8; 4];
+    if file.read_exact(&mut sample_size_buf).is_err() {
+        return Err("無法讀取 stsz sample_size".to_string());
+    }
+    let default_sample_size = u32::from_be_bytes(sample_size_buf);
+    let mut sample_count_buf = [0u8; 4];
+    if file.read_exact(&mut sample_count_buf).is_err() {
+        return Err("無法讀取 stsz sample_count".to_string());
+    }
+    let sample_count = u32::from_be_bytes(sample_count_buf);
+
+    // 若 default_sample_size > 0，所有樣本大小相同
+    if default_sample_size > 0 {
+        if default_sample_size as usize > MAX_PACKET_BYTES {
+            return Err(format!(
+                "MP4 單封包宣告大小 {} bytes 超過上限 {} bytes",
+                default_sample_size, MAX_PACKET_BYTES
+            ));
+        }
+        return Ok(());
+    }
+
+    // default_sample_size == 0：每個樣本有獨立大小，逐一讀取
+    // 以 remaining（box 內剩餘位元組）為上限，避免讀過 box 邊界；sample_count 上限也受 remaining 限制，防止惡意 MP4 造成過長迴圈（DoS）。
+    let remaining = box_size.saturating_sub(16); // 扣除已讀欄位
+    let max_samples = (remaining / 4) as u32; // 每個樣本大小 4 bytes
+    let read_limit = sample_count.min(max_samples);
+    let mut read_count = 0u32;
+    let mut buf = [0u8; 4];
+    while read_count < read_limit {
+        if file.read_exact(&mut buf).is_err() {
+            return Err("讀取 stsz 樣本大小失敗".to_string());
+        }
+        let s = u32::from_be_bytes(buf);
+        if s as usize > MAX_PACKET_BYTES {
+            return Err(format!(
+                "MP4 樣本 {} 單封包大小 {} bytes 超過上限 {} bytes",
+                read_count, s, MAX_PACKET_BYTES
+            ));
+        }
+        read_count += 1;
+    }
+    // 若 sample_count > max_samples，表示 box 內聲稱的樣本數超過實際空間，視為異常
+    if sample_count > max_samples {
+        return Err(format!(
+            "MP4 stsz 宣告樣本數 {} 超過 box 可容納數 {}，結構異常",
+            sample_count, max_samples
+        ));
+    }
+
+    Ok(())
+}
+
 /// SE6：所有 ffprobe 呼叫點共用全域並行配額（同時最多 4 個進程）。
 static FFPROBE_SLOTS_INIT: Once = Once::new();
 static mut FFPROBE_SLOTS: Option<(Mutex<usize>, Condvar)> = None;
@@ -168,6 +323,9 @@ pub struct SymStream {
 impl SymStream {
     /// 開檔並（可選）精準跳到 start_ms。回傳時已解出第一個封包，channels / sample_rate 可信。
     pub fn open(path: &Path, start_ms: i64) -> Result<Self, String> {
+        // SE7：配置前封包上限預檢，作為 open() 內部的第二道防禦線；
+        // 直接呼叫 open() 的所有路徑皆先經過此預檢，超標則拒絕不繼續開檔。
+        precheck_packet_budget(path)?;
         let file = File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
         let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
@@ -261,13 +419,12 @@ impl SymStream {
                     return false;
                 }
             };
-            if packet.track_id() != self.track_id {
-                continue;
-            }
-            // SE7：單封包上限
             if packet.buf().len() > MAX_PACKET_BYTES {
                 self.finished = true;
                 return false;
+            }
+            if packet.track_id() != self.track_id {
+                continue;
             }
             match self.decoder.decode(&packet) {
                 Ok(decoded) => {
@@ -299,7 +456,7 @@ impl SymStream {
                 }
                 Err(SymError::DecodeError(_)) => {
                     self.decode_errors += 1;
-                    if self.decode_errors > MAX_DECODE_ERRORS {
+                    if self.decode_errors >= MAX_DECODE_ERRORS {
                         self.finished = true;
                         return false;
                     }

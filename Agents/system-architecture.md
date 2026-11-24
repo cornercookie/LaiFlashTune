@@ -82,6 +82,13 @@ flowchart LR
 - 參數變更透過 `EqShared` 的版本號即時套用，不重開音源。只有 seek 與換裝置會重建 Sink 裡的音源。
 - 播放位置 = `seek_origin_ms + played`（已消耗的輸入 frame 扣掉緩衝），所以改速度時，進度仍然對應歌曲時間。
 
+## Symphonia 解碼限制（SE7）
+
+- 配置前封包上限預檢 `precheck_packet_budget(path)`：在 `SymStream::open()` 之前執行，讀取檔案標頭遍歷所有音軌與片段的宣告封包大小（MP4 解析 stsz box；其他格式無法可靠遍歷時回傳 Ok，fail-open，依賴 `refill()` 第二層防護）；若任何封包宣告大小超過 256 KB，不呼叫 `open()`，回傳錯誤。
+- `refill()` 第二層防護順序：取得封包 → 檢查 `packet.buf().len() > 256 KB`（超過即 `finished = true` 回傳 `false`）→ 音軌篩選 → `decoder.decode()`；大小檢查在音軌篩選之前，覆蓋所有音軌與後續片段。
+- 四個 `SymStream::open` 入口（`player.rs:405`、`playback_pipeline.rs:1586`、`next_track.rs:92,298`）均先呼叫 `precheck_packet_budget(path)`，超標則拒絕不呼叫 `open()`。
+- 解碼錯誤 `decode_errors` 欄位跨封包累計（`refill()` 迴圈內），超過 10 次即 `finished = true` 回傳 `false`；錯誤與成功封包交錯時仍繼續累計，不歸零。
+
 ## 外部相依
 
 | 相依 | 用途 | 找不到時 |

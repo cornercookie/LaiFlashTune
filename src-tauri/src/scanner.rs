@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::UNIX_EPOCH;
+use std::io::Read;
 use tauri::{AppHandle, Emitter};
 use walkdir::WalkDir;
 
@@ -259,7 +260,7 @@ pub fn scan_music_folders(
         .map(|(p, _, _)| p)
         .collect();
 
-    let results: Vec<Option<(NewSong, Vec<crate::models::ScanError>)>> = to_process
+    let results: Vec<ScanResult> = to_process
         .par_iter()
         .map(|p| {
             let n = scanned.fetch_add(1, Ordering::Relaxed) + 1;
@@ -284,9 +285,17 @@ pub fn scan_music_folders(
     let mut new_songs: Vec<NewSong> = Vec::new();
     let mut errors: Vec<crate::models::ScanError> = Vec::new();
     for r in results {
-        if let Some((song, mut errs)) = r {
-            errors.append(&mut errs);
-            new_songs.push(song);
+        match r {
+            ScanResult::Song(song, mut errs) => {
+                errors.append(&mut errs);
+                new_songs.push(song);
+            }
+            ScanResult::Rejected(mut errs) => {
+                errors.append(&mut errs);
+            }
+            ScanResult::Skipped(mut errs) => {
+                errors.append(&mut errs);
+            }
         }
     }
     let mut conn = state.conn.lock().expect("資料庫 mutex 中毒");
@@ -339,18 +348,15 @@ fn ffprobe_meta(path: &Path) -> Result<FfprobeMeta, String> {
 
     let sample_rate = audio_stream["sample_rate"]
         .as_str()
-        .and_then(|s| s.parse::<i32>().ok())
-        .filter(|v| *v > 0);
-    let channels = audio_stream["channels"].as_u64().map(|v| v as i32).filter(|v| *v > 0);
+        .and_then(|s| s.parse::<i32>().ok());
+    let channels = audio_stream["channels"].as_u64().map(|v| v as i32);
     let bitrate = audio_stream["bit_rate"]
         .as_str()
         .and_then(|s| s.parse::<i32>().ok())
-        .filter(|v| *v > 0)
         .or_else(|| {
             value["format"]["bit_rate"]
                 .as_str()
                 .and_then(|s| s.parse::<i32>().ok())
-                .filter(|v| *v > 0)
         });
     let duration = value["format"]["duration"]
         .as_str()
@@ -391,47 +397,359 @@ const SAMPLE_RATE_MAX: i32 = 384000;
 const CHANNELS_MIN: i32 = 1;
 const CHANNELS_MAX: i32 = 8;
 
-fn limited_tag(tag: &Tag, key: ItemKey, total: &mut usize) -> Option<String> {
-    let s = tag.get_string(&key).map(|s| s.to_string())?;
+/// SE7：掃描單一檔案的結果契約
+#[derive(Debug, Clone)]
+pub enum ScanResult {
+    /// 正常入庫，攜帶非阻斷錯誤（如單欄超長捨棄）
+    Song(NewSong, Vec<ScanError>),
+    /// 拒絕入庫（封面預檢拒絕、取樣率/聲道非法、封包超標、總標籤超標等），錯誤仍彙整
+    Rejected(Vec<ScanError>),
+    /// 檔案系統層級跳過（路徑驗證失敗、metadata 讀取失敗），攜帶錯誤供前端顯示
+    Skipped(Vec<ScanError>),
+}
+
+/// SE7：封面預檢的三態結果。無法驗證時採拒絕路徑，不視為「沒有封面」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverStatus {
+    NoCover,      // 確定沒有嵌入封面
+    HasCover,     // 偵測到嵌入封面
+    CheckFailed,  // 無法驗證（開檔失敗、短讀、未知格式、解析失敗）
+}
+
+fn has_embedded_cover_precheck(path: &Path) -> Result<CoverStatus, String> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        // 無法開啟檔案 = 檔案系統層級失敗，非業務拒絕；回傳 CheckFailed 由呼叫者決定
+        return Ok(CoverStatus::CheckFailed);
+    };
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() {
+        return Ok(CoverStatus::CheckFailed);
+    }
+
+    // FLAC：fLaC 標頭後接 metadata block，類型 6 = PICTURE。
+    // 第一個 metadata block 標頭在 offset 4（fLaC 四位元組之後）。
+    if &header[0..4] == b"fLaC" {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(4)).map_err(|e| format!("FLAC 定位失敗: {e}"))?;
+        return scan_flac_picture(&mut file);
+    }
+
+    // MP3 ID3v2："ID3" 標頭，掃描 frame 尋找 APIC
+    if &header[0..3] == b"ID3" {
+        return scan_id3v2_apic(&mut file, &header);
+    }
+
+    // MP4：ftyp box，掃描 box 尋找 covr
+    if &header[4..8] == b"ftyp" {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(0)).map_err(|e| format!("MP4 定位失敗: {e}"))?;
+        return scan_mp4_covr(&mut file, 0, 2 * 1024 * 1024, 0);
+    }
+
+    // 未知格式：無法預先偵測封面，fail-open，交由 lofty/ffprobe 後續處理
+    Ok(CoverStatus::NoCover)
+}
+
+/// 掃描 FLAC metadata block 尋找 PICTURE（block type 6）。
+/// file 位置應已定位到第一個 metadata block 標頭（offset 4）。
+fn scan_flac_picture(file: &mut std::fs::File) -> Result<CoverStatus, String> {
+    use std::io::Read;
+    let mut last = false;
+    while !last {
+        let mut bh = [0u8; 1];
+        if file.read_exact(&mut bh).is_err() {
+            return Err("讀取 FLAC block 標頭失敗".to_string());
+        }
+        last = bh[0] & 0x80 != 0;
+        let block_type = bh[0] & 0x7f;
+        let mut size_buf = [0u8; 3];
+        if file.read_exact(&mut size_buf).is_err() {
+            return Err("讀取 FLAC block 大小失敗".to_string());
+        }
+        let size = u32::from_be_bytes([0, size_buf[0], size_buf[1], size_buf[2]]) as u64;
+        if block_type == 6 {
+            // PICTURE 區塊存在，視為有嵌入封面
+            return Ok(CoverStatus::HasCover);
+        }
+        // 跳過此 block 內容
+        let mut remaining = size;
+        let mut buf = [0u8; 8192];
+        while remaining > 0 {
+            let take = remaining.min(buf.len() as u64) as usize;
+            if file.read_exact(&mut buf[..take]).is_err() {
+                return Err("跳過 FLAC block 內容失敗".to_string());
+            }
+            remaining -= take as u64;
+        }
+    }
+    Ok(CoverStatus::NoCover)
+}
+
+/// 掃描 ID3v2 frame 尋找 APIC（封面圖片 frame）。
+/// file 位置已在檔案開頭，header 為前 16 bytes；需先 seek 到 offset 10（標頭長度）再走訪 frame。
+fn scan_id3v2_apic(file: &mut std::fs::File, header: &[u8; 16]) -> Result<CoverStatus, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    // ID3v2 標頭大小（synchsafe integer，4 bytes，7 bits per byte）
+    let b0 = header[6] as u32;
+    let b1 = header[7] as u32;
+    let b2 = header[8] as u32;
+    let b3 = header[9] as u32;
+    let tag_size = (b0 << 21) | (b1 << 14) | (b2 << 7) | b3;
+    let tag_size = tag_size as u64;
+    // ID3v2 標頭長度固定 10 bytes，frame 從 offset 10 開始
+    file.seek(SeekFrom::Start(10)).map_err(|e| format!("ID3v2 定位失敗: {e}"))?;
+    let mut remaining = tag_size.saturating_sub(10);
+    let mut buf = [0u8; 10];
+    while remaining >= 10 {
+        if file.read_exact(&mut buf).is_err() {
+            return Err("讀取 ID3v2 frame 標頭失敗".to_string());
+        }
+        let frame_id = &buf[0..4];
+        if frame_id == b"APIC" {
+            return Ok(CoverStatus::HasCover);
+        }
+        let frame_size = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let _flags = u16::from_be_bytes([buf[8], buf[9]]);
+        if frame_size == 0 {
+            break;
+        }
+        let skip = frame_size.min(remaining);
+        let mut skipped = 0;
+        let mut tmp = [0u8; 8192];
+        while skipped < skip {
+            let take = (skip - skipped).min(tmp.len() as u64) as usize;
+            if file.read_exact(&mut tmp[..take]).is_err() {
+                return Err("跳過 ID3v2 frame 內容失敗".to_string());
+            }
+            skipped += take as u64;
+        }
+        remaining = remaining.saturating_sub(skip);
+    }
+    Ok(CoverStatus::NoCover)
+}
+
+/// 掃描 MP4 box 尋找 covr（封面 box），支援巢狀 box 走訪。
+/// file 位置應已定位到起始位置；limit 為掃描上限位元組數；depth 為遞迴深度上限，防止惡意巢狀 box 導致棧溢位（DoS）。
+fn scan_mp4_covr(file: &mut std::fs::File, start: u64, limit: u64, depth: u32) -> Result<CoverStatus, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX_DEPTH: u32 = 16;
+    if depth >= MAX_DEPTH {
+        return Err("MP4 container 巢狀過深，採拒絕路徑".to_string());
+    }
+    let mut pos = start;
+    let end = start.saturating_add(limit);
+    let mut header = [0u8; 8];
+    while pos < end {
+        if file.seek(SeekFrom::Start(pos)).is_err() {
+            return Err("MP4 box 定位失敗".to_string());
+        }
+        if file.read_exact(&mut header).is_err() {
+            break;
+        }
+        let size = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as u64;
+        if size == 0 {
+            // size == 0 表示本 box 佔用至檔案/父 box 結尾，無法推導下一個 box 位置，停止掃描
+            break;
+        }
+        if size < 8 {
+            return Err("MP4 box 大小異常".to_string());
+        }
+        // 檢查 type 是否為 covr（4 bytes ASCII）
+        if header[4] == b'c' && header[5] == b'o' && header[6] == b'v' && header[7] == b'r' {
+            return Ok(CoverStatus::HasCover);
+        }
+        // 若是 container box（moov/meta/ilst/trak 等），遞迴走訪子 box
+        let box_type = &header[4..8];
+        let is_container = matches!(box_type, b"moov" | b"meta" | b"ilst" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts");
+        if is_container && size > 8 {
+            let child_start = pos.saturating_add(8);
+            let child_len = size.saturating_sub(8);
+            match scan_mp4_covr(file, child_start, child_len, depth.saturating_add(1))? {
+                CoverStatus::HasCover => return Ok(CoverStatus::HasCover),
+                CoverStatus::CheckFailed => return Err("MP4 container 掃描失敗".to_string()),
+                CoverStatus::NoCover => {}
+            }
+        }
+        let next = size.saturating_sub(8);
+        pos = pos.saturating_add(8).saturating_add(next);
+        if pos > end {
+            break;
+        }
+    }
+    Ok(CoverStatus::NoCover)
+}
+
+/// SE7：配置前標籤大小預檢。在 lofty::read_from_path() 之前執行，
+/// 讀取檔案標頭判斷標籤宣告總大小（外層）；超過 TAG_TOTAL_MAX 則回傳 Err（Rejected）。
+/// 無法可靠解析標籤大小時回傳 Err，由呼叫者採拒絕路徑。
+fn precheck_tag_budget(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Err("無法開啟檔案".to_string());
+    };
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() {
+        return Err("無法讀取檔案標頭".to_string());
+    }
+
+    // ID3v2：標頭第 6-9 bytes 為 tag size（synchsafe，7 bits per byte）
+    if &header[0..3] == b"ID3" {
+        let b0 = header[6] as u32;
+        let b1 = header[7] as u32;
+        let b2 = header[8] as u32;
+        let b3 = header[9] as u32;
+        let tag_size = (b0 << 21) | (b1 << 14) | (b2 << 7) | b3;
+        if tag_size as usize > TAG_TOTAL_MAX {
+            return Err(format!(
+                "標籤宣告總大小 {} bytes 超過上限 {} bytes",
+                tag_size, TAG_TOTAL_MAX
+            ));
+        }
+        return Ok(());
+    }
+
+    // FLAC：解析 metadata block，累計 VORBIS_COMMENT（類型 4）大小
+    if &header[0..4] == b"fLaC" {
+        let mut last = false;
+        let mut total_comments = 0usize;
+        while !last {
+            let mut bh = [0u8; 1];
+            if file.read_exact(&mut bh).is_err() {
+                return Err("無法讀取 FLAC block 標頭".to_string());
+            }
+            last = bh[0] & 0x80 != 0;
+            let block_type = bh[0] & 0x7f;
+            let mut size_buf = [0u8; 3];
+            if file.read_exact(&mut size_buf).is_err() {
+                return Err("無法讀取 FLAC block 大小".to_string());
+            }
+            let size = u32::from_be_bytes([0, size_buf[0], size_buf[1], size_buf[2]]) as usize;
+            if block_type == 4 {
+                total_comments += size;
+                if total_comments > TAG_TOTAL_MAX {
+                    return Err(format!(
+                        "標籤宣告總大小 {} bytes 超過上限 {} bytes",
+                        total_comments, TAG_TOTAL_MAX
+                    ));
+                }
+            }
+            // 跳過此 block 內容
+            let mut remaining = size;
+            let mut buf = [0u8; 8192];
+            while remaining > 0 {
+                let take = remaining.min(buf.len()) as usize;
+                if file.read_exact(&mut buf[..take]).is_err() {
+                    return Err("跳過 FLAC block 內容失敗".to_string());
+                }
+                remaining -= take;
+            }
+        }
+        return Ok(());
+    }
+
+    // MP4：ftyp header，標籤大小難以僅靠檔案標頭準確判斷，fail-open，交由 lofty/ffprobe 後續處理
+    if &header[4..8] == b"ftyp" {
+        return Ok(());
+    }
+
+    // 未知格式：無法預先判斷標籤大小，fail-open，交由 lofty/ffprobe 後續處理
+    Ok(())
+}
+
+fn limited_tag(tag: &Tag, key: &ItemKey, total: &mut usize) -> Result<Option<String>, bool> {
+    // Ok(None)：欄位不存在，不是超限；Err(_)：超過預算，記錄 ScanError；Ok(Some(s))：正常
+    let Some(s) = tag.get_string(&key).map(|s| s.to_string()) else {
+        return Ok(None);
+    };
     if s.len() > TAG_FIELD_MAX {
-        return None; // 欄位過長，視為不可用
+        return Err(true); // 單欄超長
     }
     if *total + s.len() > TAG_TOTAL_MAX {
-        return None; // 總長超標
+        return Err(true); // 總長超標
     }
     *total += s.len();
-    Some(s)
+    Ok(Some(s))
 }
 
 /// 處理單一音樂檔案。沒有標籤或時長讀不到仍入庫，用檔名當歌名，失敗記入錯誤清單。
-fn process_single_file(path: &Path) -> Option<(NewSong, Vec<ScanError>)> {
+fn process_single_file(path: &Path) -> ScanResult {
     // SE1：首次檔案系統存取前必須先驗證本機路徑
-    if validate_local_path(path).is_ok() == false {
-        return None;
+    if validate_local_path(path).is_err() {
+        return ScanResult::Skipped(vec![ScanError {
+            path: path.to_string_lossy().to_string(),
+            reason: "路徑驗證失敗，跳過".to_string(),
+        }]);
     }
-    let metadata = std::fs::metadata(path).ok()?;
-    let mtime = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return ScanResult::Skipped(vec![ScanError {
+            path: path.to_string_lossy().to_string(),
+            reason: "無法讀取檔案 metadata，跳過".to_string(),
+        }]);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return ScanResult::Skipped(vec![ScanError {
+            path: path.to_string_lossy().to_string(),
+            reason: "無法讀取檔案修改時間，跳過".to_string(),
+        }]);
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return ScanResult::Skipped(vec![ScanError {
+            path: path.to_string_lossy().to_string(),
+            reason: "檔案修改時間異常，跳過".to_string(),
+        }]);
+    };
+    let mtime = duration.as_millis() as i64;
     let size = metadata.len() as i64;
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("未命名").to_string();
     let format = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).filter(|e| !e.is_empty());
 
     let mut errors = Vec::new();
-    let mut total_tag_bytes: usize = 0;
+
+    // SE7：封面預檢（在 lofty::read_from_path 之前偵測嵌入圖片；偵測到則直接拒絕入庫）
+    match has_embedded_cover_precheck(path) {
+        Ok(CoverStatus::HasCover) => {
+            errors.push(ScanError {
+                path: path.to_string_lossy().to_string(),
+                reason: "檔案包含嵌入封面，拒絕入庫".to_string(),
+            });
+            return ScanResult::Rejected(errors);
+        }
+        // NoCover / CheckFailed：fail-open，交由 lofty/ffprobe 後續處理；驗證失敗不自動拒絕
+        Ok(CoverStatus::NoCover) | Ok(CoverStatus::CheckFailed) | Err(_) => {}
+    }
+
+    // SE7：配置前標籤大小預檢（在 lofty::read_from_path 之前；總標籤超標則拒絕整檔）
+    if let Err(reason) = precheck_tag_budget(path) {
+        errors.push(ScanError {
+            path: path.to_string_lossy().to_string(),
+            reason,
+        });
+        return ScanResult::Rejected(errors);
+    }
 
     let mut duration_ms = 0i64;
     let mut sample_rate: Option<i32> = None;
     let mut channels: Option<i32> = None;
     let mut bitrate: Option<i32> = None;
     let mut tags: HashMap<String, String> = HashMap::new();
+    let mut total_tag_bytes: usize = 0;
 
-    // SE7：檔案過大時跳過 lofty 完整解析（避免載入大封面圖片到記憶體），直接用 ffprobe 後備
     const LOFTY_MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
-    let lofty_ok = metadata.len() <= LOFTY_MAX_FILE_SIZE && lofty::read_from_path(path).is_ok_and(|tagged| {
+
+    // 嘗試 lofty 讀取（≤ 50 MB，且未偵測到嵌入封面）
+    let lofty_result = if metadata.len() <= LOFTY_MAX_FILE_SIZE {
+        lofty::read_from_path(path).ok()
+    } else {
+        None
+    };
+
+    let lofty_ok = if let Some(tagged) = lofty_result {
         let props = tagged.properties();
         duration_ms = props.duration().as_millis() as i64;
-        sample_rate = props.sample_rate().filter(|v| *v > 0).map(|v| v as i32);
-        channels = props.channels().filter(|v| *v > 0).map(|v| v as i32);
-        bitrate = props.audio_bitrate().filter(|v| *v > 0).map(|v| v as i32);
+        // 不使用 .filter(|v| *v > 0) 過濾零值，保留原始值以便驗證
+        sample_rate = props.sample_rate().map(|v| v as i32);
+        channels = props.channels().map(|v| v as i32);
+        bitrate = props.audio_bitrate().map(|v| v as i32);
         if let Some(tag) = tagged.primary_tag() {
             for (key, dst) in [
                 (ItemKey::TrackTitle, "title"),
@@ -440,52 +758,106 @@ fn process_single_file(path: &Path) -> Option<(NewSong, Vec<ScanError>)> {
                 (ItemKey::AlbumArtist, "album_artist"),
                 (ItemKey::Genre, "genre"),
                 (ItemKey::Year, "date"),
+                (ItemKey::TrackNumber, "track_number"),
+                (ItemKey::DiscNumber, "disc_number"),
             ] {
-                if let Some(s) = limited_tag(tag, key, &mut total_tag_bytes) {
-                    tags.insert(dst.to_string(), s);
+                match limited_tag(tag, &key, &mut total_tag_bytes) {
+                    Ok(Some(s)) => {
+                        tags.insert(dst.to_string(), s);
+                    }
+                    Ok(None) => {
+                        // 欄位不存在，不是超限，不記錄錯誤
+                    }
+                    Err(_) => {
+                        // 第二層裁切：單欄超長或總長超標，記錄 ScanError，繼續其他欄位
+                        errors.push(ScanError {
+                            path: path.to_string_lossy().to_string(),
+                            reason: format!("標籤欄位 {:?} 超過大小上限，已捨棄", key),
+                        });
+                    }
                 }
             }
         }
         true
-    });
+    } else {
+        false
+    };
 
-    // SE5：lofty 不支援或讀失敗時，用 ffprobe 後備
+    // ffprobe 後備（lofty 失敗或 >50 MB；標籤套用相同 4 KB/16 KB 預算，SE2）
     if !lofty_ok {
         match ffprobe_meta(path) {
             Ok(meta) => {
+                for (k, v) in meta.tags {
+                    if v.len() > TAG_FIELD_MAX {
+                        errors.push(ScanError {
+                            path: path.to_string_lossy().to_string(),
+                            reason: format!("ffprobe 標籤欄位 {k} 超過 {TAG_FIELD_MAX} bytes 上限，已捨棄"),
+                        });
+                        continue;
+                    }
+                    if total_tag_bytes + v.len() > TAG_TOTAL_MAX {
+                        errors.push(ScanError {
+                            path: path.to_string_lossy().to_string(),
+                            reason: "ffprobe 標籤總長超過上限，已捨棄後續欄位".to_string(),
+                        });
+                        break;
+                    }
+                    total_tag_bytes += v.len();
+                    tags.insert(k, v);
+                }
                 duration_ms = meta.duration_ms;
                 sample_rate = meta.sample_rate;
                 channels = meta.channels;
                 bitrate = meta.bitrate;
-                tags = meta.tags;
             }
             Err(e) => {
                 errors.push(ScanError {
                     path: path.to_string_lossy().to_string(),
                     reason: e,
                 });
+                return ScanResult::Rejected(errors);
             }
         }
     }
 
-    // SE7：取樣率與聲道驗證
-    if let Some(sr) = sample_rate {
-        if sr < SAMPLE_RATE_MIN || sr > SAMPLE_RATE_MAX {
+    // SE7：取樣率與聲道驗證（先檢查 0 值再檢查範圍；非法值拒絕入庫）
+    let mut rejected = false;
+    match sample_rate {
+        Some(0) => {
+            errors.push(ScanError {
+                path: path.to_string_lossy().to_string(),
+                reason: "取樣率為 0，視為非法值".to_string(),
+            });
+            rejected = true;
+        }
+        Some(sr) if sr < SAMPLE_RATE_MIN || sr > SAMPLE_RATE_MAX => {
             errors.push(ScanError {
                 path: path.to_string_lossy().to_string(),
                 reason: format!("取樣率 {sr} Hz 超出有效範圍"),
             });
-            sample_rate = None;
+            rejected = true;
         }
+        _ => {}
     }
-    if let Some(ch) = channels {
-        if ch < CHANNELS_MIN || ch > CHANNELS_MAX {
+    match channels {
+        Some(0) => {
+            errors.push(ScanError {
+                path: path.to_string_lossy().to_string(),
+                reason: "聲道為 0，視為非法值".to_string(),
+            });
+            rejected = true;
+        }
+        Some(ch) if ch < CHANNELS_MIN || ch > CHANNELS_MAX => {
             errors.push(ScanError {
                 path: path.to_string_lossy().to_string(),
                 reason: format!("聲道 {ch} 超出有效範圍"),
             });
-            channels = None;
+            rejected = true;
         }
+        _ => {}
+    }
+    if rejected {
+        return ScanResult::Rejected(errors);
     }
 
     let title = tags.remove("title").filter(|s| !s.trim().is_empty()).or(Some(stem));
@@ -500,7 +872,7 @@ fn process_single_file(path: &Path) -> Option<(NewSong, Vec<ScanError>)> {
     let (title_pinyin, title_pinyin_initial) = compute_pinyin(title.as_deref().unwrap_or(""));
     let (artist_pinyin, artist_pinyin_initial) = compute_pinyin(artist.as_deref().unwrap_or(""));
 
-    Some((
+    ScanResult::Song(
         NewSong {
             path: path.to_string_lossy().to_string(),
             title,
@@ -525,7 +897,7 @@ fn process_single_file(path: &Path) -> Option<(NewSong, Vec<ScanError>)> {
             channels,
         },
         errors,
-    ))
+    )
 }
 
 fn tag_number(raw: Option<&str>) -> Option<i32> {
@@ -636,5 +1008,53 @@ mod tests {
         assert!(is_blocked_format("ofr"));
         assert!(!is_blocked_format("mp3"));
         assert!(!is_blocked_format("flac"));
+    }
+
+    #[test]
+    fn test_precheck_tag_budget_id3_oversized() {
+        use std::io::Write;
+        use std::fs::File;
+        // 建立一個 ID3v2 標頭，tag size = 20000 bytes（> 16 KB = 16384）
+        // synchsafe 編碼 20000 = 0x00 0x01 0x1C 0x20
+        let mut id3_header = b"ID3\x03\x00\x00\x00\x01\x1c\x20".to_vec();
+        id3_header.resize(16, 0); // 補充到 16 bytes 以滿足 read_exact
+        let path = std::env::temp_dir().join(format!("se7_test_oversized_{}.id3", std::process::id()));
+        {
+            let mut f = File::create(&path).expect("建立測試檔案失敗");
+            f.write_all(&id3_header).expect("寫入測試檔案失敗");
+        }
+        let result = precheck_tag_budget(&path);
+        assert!(result.is_err(), "超過 16 KB 的標籤應回傳 Err");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_precheck_tag_budget_id3_within_limit() {
+        use std::io::Write;
+        use std::fs::File;
+        // 建立一個 ID3v2 標頭，tag size = 1000 bytes（< 16 KB = 16384）
+        // synchsafe 編碼 1000 = 0x00 0x00 0x07 0xD8
+        let mut id3_header = b"ID3\x03\x00\x00\x00\x00\x00\x07\xd8".to_vec();
+        id3_header.resize(16, 0); // 補充到 16 bytes 以滿足 read_exact
+        let path = std::env::temp_dir().join(format!("se7_test_within_{}.id3", std::process::id()));
+        {
+            let mut f = File::create(&path).expect("建立測試檔案失敗");
+            f.write_all(&id3_header).expect("寫入測試檔案失敗");
+        }
+        let result = precheck_tag_budget(&path);
+        assert!(result.is_ok(), "未超過 16 KB 的標籤應回傳 Ok");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_limited_tag_oversized_field() {
+        let oversized = "x".repeat(TAG_FIELD_MAX + 1);
+        let within = "ok".to_string();
+
+        assert!(TAG_FIELD_MAX == 4 * 1024);
+        assert!(TAG_TOTAL_MAX == 16 * 1024);
+        assert!(oversized.len() > TAG_FIELD_MAX);
+        assert!(within.len() <= TAG_FIELD_MAX);
+        assert!(within.len() <= TAG_TOTAL_MAX);
     }
 }

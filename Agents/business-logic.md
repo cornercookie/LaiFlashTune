@@ -80,6 +80,14 @@ sequenceDiagram
 - 歌曲清單必須虛擬捲動，10 萬首也不能一次畫成 DOM。
 - 封面路徑是檔案系統路徑，要用 Tauri 的 file-src 轉換才能顯示。
 
+## 掃描與標籤限制（SE7）
+
+- lofty 讀取標籤前設定單欄 ≤ 4 KB、總標籤 ≤ 16 KB 上限；超過 16 KB 的總標籤拒絕整檔入庫（`Rejected`），單欄超 4 KB 由 `limited_tag()` 第二層裁切並記 `ScanError`，不中斷其他欄位。
+- 不載入嵌入封面進記憶體：掃描前先執行 `has_embedded_cover_precheck(path)` 偵測 ID3v2 APIC、MP4 `covr`、FLAC 圖片區塊；偵測到嵌入封面直接拒絕入庫，不走 lofty 也不走 ffprobe 後備；`cover_path` 固定為 `None`。
+- 取樣率驗證 8000–384000 Hz、聲道 1–8，超出視為無效（含 0 值）；不使用 `.filter(|v| *v > 0)` 過濾零值，先檢查 0 值再檢查範圍，非法值拒絕入庫並記 `ScanError`。
+- ffprobe 後備讀取的標籤進入共同處理前，套用相同 4 KB／16 KB 預算。
+- 掃描結果契約：`ScanResult::Song(NewSong, Vec<ScanError>)` 正常入庫、`ScanResult::Rejected(Vec<ScanError>)` 拒絕入庫但錯誤仍彙整、`ScanResult::Skipped` 檔案系統層級跳過；單一檔案錯誤不導致整個掃描失敗。
+
 ## 歌單
 
 - 頁籤就是工作區：開歌單會釘一個頁籤，關頁籤不會刪歌單；「全部歌曲」永遠在。開著的頁籤存在 `playlist_tabs`。

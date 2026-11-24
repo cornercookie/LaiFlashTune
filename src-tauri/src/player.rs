@@ -6,7 +6,7 @@ use crate::playback_pipeline::{
 };
 use crate::dsp::{DspSource, FxParams, FxChain, RateStage, BLOCK as DSP_BLOCK};
 use crate::eq::{EqProcessor, EqShared, BANDS, EQ_HZ, db_to_linear};
-use crate::audio_decode::{SymStream, FfmpegStream, ffprobe_json};
+use crate::audio_decode::{SymStream, FfmpegStream, ffprobe_json, precheck_packet_budget};
 use crate::open_with::{validate_local_path, log_line, log_load_error, sanitize_log};
 use crate::scanner::{playback_backend_for, meta_backend_for};
 use crate::tools::locate;
@@ -402,6 +402,10 @@ impl AudioEngine {
         // (TrackChain, TrackResampler, 串流來源（長檔/ffmpeg 串流）, decoder 標記)
         let (track_chain, track_resampler, stream_source, decoder) = match backend {
             Some(crate::scanner::Backend::Symphonia) => {
+                // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+                if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+                    return Err(format!("封包上限預檢失敗：{reason}"));
+                }
                 match SymStream::open(Path::new(path), position_ms) {
                     Ok(mut stream) => {
                         let duration_ms = stream.duration_ms().filter(|d| *d > 0).unwrap_or(0);
