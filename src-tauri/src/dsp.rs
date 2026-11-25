@@ -544,10 +544,10 @@ pub(crate) struct RateStage {
 }
 
 impl RateStage {
-    fn new(ch: usize, sr: u32) -> Self {
+    pub(crate) fn new(ch: usize, sr: u32) -> Self {
         Self { wsola: Wsola::new(ch, sr), rs: Resampler::new(ch), mid: Vec::new() }
     }
-    fn run(&mut self, input: &[f32], p: &FxParams, flush: bool, out: &mut Vec<f32>) {
+    pub(crate) fn run(&mut self, input: &[f32], p: &FxParams, flush: bool, out: &mut Vec<f32>) {
         let (r, sw) = p.rates();
         let mut mid = std::mem::take(&mut self.mid);
         mid.clear();

@@ -64,21 +64,20 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  F["檔案"] --> D{"長度 ≤ 15 分？"}
-  D -- 是 --> M["整首解碼成 Vec<f32><br/>（記憶體軌，算峰值）"]
-  D -- 否／不明 --> S["SymStream 逐封包<br/>（串流軌）"]
-  R["電台 URL"] --> FF["ffmpeg → s16le 44.1k 立體聲"]
-  M --> DSP
-  S --> DSP
+  F["檔案（短檔/記憶體軌）"] --> TR["TrackResampler<br/>重取樣到 48kHz 立體聲"]
+  S["SymStream 逐封包<br/>（長檔串流軌）"] --> TR
+  R["電台 URL"] --> FF["ffmpeg → PCM 48kHz 立體聲<br/>（電台略過 RateStage）"]
   FF --> DSP
-  subgraph DSP["DspSource（每 1024 frame 一個區塊）"]
+  TR --> DSP
+  subgraph DSP["DSP（48kHz 立體聲）"]
     direction LR
-    RT["速度／節奏／音高<br/>（電台略過）"] --> EQ["正規化＋前級＋18 段等化器"] --> FX["低音、高音增強、人聲消除、<br/>合唱、鑲邊、回音、殘響"] --> CL["限幅"]
+    EQ[EQ（每聲道獨立）] --> RT[速度／節奏／音高<br/>（RateStage，電台略過）] --> FX[音效：低音、高音增強、人聲消除、合唱、鑲邊、回音、殘響] --> NL[正規化] --> CL[限幅]
   end
-  DSP --> SINK["rodio Sink（音量）"] --> OUT["輸出裝置"]
+  DSP --> DC[DeviceConverter<br/>48kHz → 裝置取樣率] --> OUT[rodio Sink → 輸出裝置]
 ```
 
-- 解碼走 symphonia（`audio_decode.rs`），不用 rodio Decoder 開檔；rodio Decoder 只在 `catch_unwind` 裡當後備，而且 mp4 家族的格式不走這條。
+- 短檔（TrackChain）與長檔（SymStream）走同一條路徑：TrackResampler 重取樣到 48kHz 立體聲，再進入統一的 DSP 鏈。
+- `RateStage`（速度/節奏/音高）於軌載入/切換時建立；電台串流 `allow_rate=false` 略過 RateStage，直接走 EQ → 音效 → 正規化 → 限幅。
 - 參數變更透過 `EqShared` 的版本號即時套用，不重開音源。只有 seek 與換裝置會重建 Sink 裡的音源。
 - 播放位置 = `seek_origin_ms + played`（已消耗的輸入 frame 扣掉緩衝），所以改速度時，進度仍然對應歌曲時間。
 

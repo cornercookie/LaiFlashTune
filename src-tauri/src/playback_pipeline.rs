@@ -9,12 +9,13 @@
 //! - DeviceConverter：把 DSP 的 48kHz 雙聲道輸出，重取樣成裝置的取樣率與雙聲道
 //! - Sink：rodio 的音訊輸出端，只看到單一長駐的 DspSource
 
-use crate::dsp::{DspSource, FxChain, FxParams};
+use crate::dsp::{DspSource, FxChain, FxParams, RateStage};
 use crate::eq::{EqProcessor, EqShared};
-use crate::open_with::log_line;
+use crate::open_with::{log_line, open_validated_file, get_final_path_from_handle};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError, SendTimeoutError};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use rodio::Source;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use crate::audio_decode::precheck_packet_budget;
+use crate::scanner::playback_backend_for;
 
 /// DSP 內部固定取樣率
 pub const INTERNAL_SAMPLE_RATE: u32 = 48000;
@@ -119,6 +121,14 @@ pub struct PlaybackCore {
     pub(crate) eq_processor: Mutex<Option<EqProcessor>>,
     /// 音效鏈
     pub(crate) fx_chain: Mutex<Option<FxChain>>,
+    /// 速度/節奏/音高重取樣階段
+    pub(crate) rate_stage: Mutex<Option<RateStage>>,
+    /// TrackResampler 輸出暫存（48kHz 聲道樣本，尚未經 DSP）
+    pub(crate) track_out: Mutex<VecDeque<f32>>,
+    /// DSP 最終輸出佇列（立體聲交錯）
+    pub(crate) dsp_out: Mutex<VecDeque<f32>>,
+    /// DSP 參數快照（命令執行緒更新，音訊執行緒讀取）
+    pub(crate) dsp_params: Mutex<Option<FxParams>>,
     /// 交叉淡化毫秒
     crossfade_ms: AtomicU64,
     /// 峰值正規化開關
@@ -154,6 +164,10 @@ impl PlaybackCore {
             eq_shared,
             eq_processor: Mutex::new(None),
             fx_chain: Mutex::new(None),
+            rate_stage: Mutex::new(None),
+            track_out: Mutex::new(VecDeque::new()),
+            dsp_out: Mutex::new(VecDeque::new()),
+            dsp_params: Mutex::new(None),
             crossfade_ms: AtomicU64::new(0),
             normalize: AtomicBool::new(false),
             next_coordinator: Arc::new(NextCoordinator::new()),
@@ -327,68 +341,125 @@ impl PlaybackCore {
     /// Playing 狀態下的取樣：串流軌直接來源 → 原生樣本 → 重取樣 → EQ/正規化。
     fn next_playing(&self) -> Option<f32> {
         // 串流軌直接來源（適用長檔與 ffmpeg 串流），需經 TrackResampler 重取樣到 48kHz
-        if let Some(sample) = self.next_stream() {
-            let mut resampler = self.track_resampler.lock().unwrap();
-            if let Some(r) = resampler.as_mut() {
-                match r.process(sample) {
-                    Some(s) => return Some(self.apply_dsp(s)),
-                    None => return Some(0.0), // 重取樣器仍在累積區塊，回靜音
+        loop {
+            // 1. 先從 dsp_out 取樣本回傳（一個樣本即可回傳，不以兩幀為門檻）
+            {
+                let mut dsp_out = self.dsp_out.lock().unwrap();
+                if let Some(s) = dsp_out.pop_front() {
+                    return Some(s);
                 }
             }
-            return Some(self.apply_dsp(sample));
-        }
-        loop {
-            // 優先排出重取樣器已緩衝的 48kHz 輸出（含軌切換時的尾端資料）
+
+            // 2. 先耗盡 TrackResampler 剩餘輸出至 track_out，不遺漏已產出樣本
             {
                 let mut resampler = self.track_resampler.lock().unwrap();
                 if let Some(r) = resampler.as_mut() {
-                    if let Some(s) = r.pop_output() {
-                        return Some(self.apply_dsp(s));
+                    while let Some(s) = r.pop_output() {
+                        self.track_out.lock().unwrap().push_back(s);
                     }
                 }
             }
 
-            // 從 TrackChain 拿一個原生樣本；軌結束時 TrackChain 自行從待播槽 take 下一軌，
-            // 若槽也為空則回傳 None，代表這條鏈結束。
-            let sample = {
+            // 3. 若 track_out 夠兩個樣本，組成立體聲幀送入 apply_dsp_block
+            {
+                let enough = {
+                    let track_out = self.track_out.lock().unwrap();
+                    track_out.len() >= 2
+                };
+                if enough {
+                    let (l, r) = {
+                        let mut track_out = self.track_out.lock().unwrap();
+                        (track_out.pop_front().unwrap(), track_out.pop_front().unwrap())
+                    };
+                    let mut tmp_out: Vec<f32> = Vec::new();
+                    self.apply_dsp_block(&[l, r], &mut tmp_out);
+                    self.dsp_out.lock().unwrap().extend(tmp_out);
+                    continue;
+                }
+            }
+
+            // 4. track_out 不足兩個樣本，拉上游（優先串流軌，然後 TrackChain 軌）
+            let sample = self.next_stream().or_else(|| {
                 let mut chain = self.track_chain.lock().unwrap();
-                match chain.as_mut().and_then(|c| c.next()) {
-                    Some(s) => s,
-                    None => {
-                        // 鏈結束：先排出舊軌的重取樣器尾端資料，再進入 WaitingForNext
-                        {
-                            let mut resampler = self.track_resampler.lock().unwrap();
-                            resampler.as_mut().map(|r| r.flush_tail());
+                chain.as_mut().and_then(|c| c.next())
+            });
+            // 若從 TrackChain 取得樣本，檢查並處理軌切換（sync_identity 會建立新 RateStage 並清空佇列）
+            if sample.is_some() {
+                self.sync_identity();
+            }
+
+            match sample {
+                Some(s) => {
+                    // 5. 鎖定 track_resmpler，必須存在；若為 None 不繞過重取樣，輸出靜音
+                    let mut resampler = self.track_resampler.lock().unwrap();
+                    let Some(r) = resampler.as_mut() else {
+                        log_line("長檔串流：track_resampler 為 None，不繞過重取樣，輸出靜音");
+                        return Some(0.0);
+                    };
+                    // 6. 呼叫 process；Some(s) 追加至 track_out，None 表示累積中，繼續拉取上游
+                    match r.process(s) {
+                        Some(out_s) => {
+                            self.track_out.lock().unwrap().push_back(out_s);
                         }
-                        {
-                            let mut resampler = self.track_resampler.lock().unwrap();
-                            if let Some(r) = resampler.as_mut() {
-                                if let Some(s) = r.pop_output() {
-                                    return Some(self.apply_dsp(s));
+                        None => {
+                            // 累積中，繼續拉取上游
+                        }
+                    }
+                }
+                None => {
+                    // 上游結束：先 flush_tail 將 TrackResampler 尾端移至 pending_output（僅一次）
+                    {
+                        let mut resampler = self.track_resampler.lock().unwrap();
+                        resampler.as_mut().map(|r| r.flush_tail());
+                    }
+                    // 將 pending_output 舊軌尾端樣本經 EQ 後餵入舊 RateStage（flush=false）
+                    // 再以空輸入單次 flush=true 終結 WSOLA/Resampler 殘餘，輸出進 dsp_out
+                    {
+                        let mut old_rs = self.rate_stage.lock().unwrap();
+                        if let Some(mut rs) = old_rs.take() {
+                            let fx_params = self.dsp_params.lock().unwrap().clone().unwrap_or_default();
+                            let tail_samples = {
+                                let mut resampler = self.track_resampler.lock().unwrap();
+                                let r = resampler.as_mut().unwrap();
+                                std::mem::take(&mut r.pending_output)
+                            };
+                            if !tail_samples.is_empty() {
+                                let mut eq_processed: Vec<f32> = Vec::with_capacity(tail_samples.len());
+                                {
+                                    let mut eq = self.eq_processor.lock().unwrap();
+                                    if let Some(p) = eq.as_mut() {
+                                        for chunk in tail_samples.chunks(2) {
+                                            if chunk.len() < 2 { continue; }
+                                            eq_processed.push(p.process(chunk[0]));
+                                            eq_processed.push(p.process(chunk[1]));
+                                        }
+                                    } else {
+                                        eq_processed.extend_from_slice(&tail_samples);
+                                    }
+                                }
+                                let mut rs_out: Vec<f32> = Vec::new();
+                                rs.run(&eq_processed, &fx_params, false, &mut rs_out);
+                                rs.run(&[], &fx_params, true, &mut rs_out);
+                                // 尾段只經後段 DSP（FxChain→正規化→限幅），不重複 EQ/RateStage
+                                for chunk in rs_out.chunks(2) {
+                                    if chunk.len() < 2 { continue; }
+                                    let frame: [f32; 2] = [chunk[0], chunk[1]];
+                                    let mut tmp_out: Vec<f32> = Vec::new();
+                                    self.apply_dsp_block_post(&frame, &mut tmp_out);
+                                    self.dsp_out.lock().unwrap().extend(tmp_out);
                                 }
                             }
                         }
+                    }
+                    // 若兩個佇列皆空，進入 WaitingForNext；否則繼續消耗現有緩衝
+                    let dsp_out_empty = self.dsp_out.lock().unwrap().is_empty();
+                    let track_out_empty = self.track_out.lock().unwrap().is_empty();
+                    if dsp_out_empty && track_out_empty {
                         *self.playback_state.lock().unwrap() = PlaybackState::WaitingForNext;
                         return Some(0.0);
                     }
+                    continue;
                 }
-            };
-
-            // 同步身分（seq / token / 正規化增益）：只有軌切換時會變動。
-            // 軌切換時會 flush_tail 舊軌、commit_boundary、再切換重取樣器到新軌。
-            self.sync_identity();
-
-            // 重取樣到 48kHz 雙聲道；若回傳 None 代表重取樣器仍在累積區塊，繼續餵入
-            let out = {
-                let mut resampler = self.track_resampler.lock().unwrap();
-                match resampler.as_mut() {
-                    Some(r) => r.process(sample),
-                    None => None,
-                }
-            };
-            match out {
-                Some(s) => return Some(self.apply_dsp(s)),
-                None => continue,
             }
         }
     }
@@ -444,6 +515,49 @@ impl PlaybackCore {
                 resampler.as_mut().map(|r| r.set_track(Some(item)));
             }
         }
+        // 先完成舊 RateStage 的尾端排空：將 pending_output 舊軌尾端樣本經 EQ 後餵入舊 RateStage，
+        // 再以空輸入 flush=true 排空 WSOLA/Resampler 殘餘，輸出進入 dsp_out 供下次 next_playing() 回傳。
+            {
+                let mut old_rs = self.rate_stage.lock().unwrap();
+                if let Some(mut rs) = old_rs.take() {
+                    let fx_params = self.dsp_params.lock().unwrap().clone().unwrap_or_default();
+                    let tail_samples = {
+                        let mut resampler = self.track_resampler.lock().unwrap();
+                        let r = resampler.as_mut().unwrap();
+                        std::mem::take(&mut r.pending_output)
+                    };
+                    if !tail_samples.is_empty() {
+                        let mut eq_processed: Vec<f32> = Vec::with_capacity(tail_samples.len());
+                        {
+                            let mut eq = self.eq_processor.lock().unwrap();
+                            if let Some(p) = eq.as_mut() {
+                                for chunk in tail_samples.chunks(2) {
+                                    if chunk.len() < 2 { continue; }
+                                    eq_processed.push(p.process(chunk[0]));
+                                    eq_processed.push(p.process(chunk[1]));
+                                }
+                            } else {
+                                eq_processed.extend_from_slice(&tail_samples);
+                            }
+                        }
+                        let mut rs_out: Vec<f32> = Vec::new();
+                        rs.run(&eq_processed, &fx_params, false, &mut rs_out);
+                        rs.run(&[], &fx_params, true, &mut rs_out);
+                        // 尾段只經後段 DSP（FxChain→正規化→限幅），不重複 EQ/RateStage
+                        for chunk in rs_out.chunks(2) {
+                            if chunk.len() < 2 { continue; }
+                            let frame: [f32; 2] = [chunk[0], chunk[1]];
+                            let mut tmp_out: Vec<f32> = Vec::new();
+                            self.apply_dsp_block_post(&frame, &mut tmp_out);
+                            self.dsp_out.lock().unwrap().extend(tmp_out);
+                        }
+                    }
+                }
+            }
+            // 軌切換時重新建立 RateStage（速度/節奏/音高），並清空 track_out，避免舊位置殘留聲音
+            *self.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
+            self.track_out.lock().unwrap().clear();
+            // dsp_out 保留舊 RateStage 尾端輸出，供下次 next_playing() 回傳
         let boundary_in_48k = self.track_resampler.lock().unwrap().as_ref().unwrap().boundary_in_48k();
 
         // 身分（seq/token）在軌切換時立即發布；進度與邊界則在舊軌尾端（pending_output）完全輸出後再重置，
@@ -505,6 +619,115 @@ impl PlaybackCore {
             s = s * norm.clamp(0.0, 8.0);
         }
         s.clamp(-1.0, 1.0)
+    }
+
+    /// 套用 DSP 至立體聲幀：EQ → 速度/節奏/音高 (RateStage) → FxChain → 正規化 → 限幅。
+    /// 輸入一個立體聲幀 `[L, R]`，輸出零到多個處理後樣本（交錯立體聲）追加至 `out`。
+    fn apply_dsp_block(&self, frame: &[f32; 2], out: &mut Vec<f32>) {
+        // 取得參數快照（命令執行緒更新，音訊執行緒讀取；快照後立即釋放鎖）
+        let fx_params = {
+            let p = self.dsp_params.lock().unwrap();
+            p.clone().unwrap_or_default()
+        };
+
+        // EQ（每聲道獨立）
+        let (eq_l, eq_r) = {
+            let mut eq = self.eq_processor.lock().unwrap();
+            match eq.as_mut() {
+                Some(p) => (p.process(frame[0]), p.process(frame[1])),
+                None => (frame[0], frame[1]),
+            }
+        };
+
+        // 速度/節奏/音高 (RateStage)，正常處理時 flush=false
+        let mut tmp_out: Vec<f32> = Vec::new();
+        {
+            let mut rate = self.rate_stage.lock().unwrap();
+            if let Some(mut rs) = rate.as_mut() {
+                rs.run(&[eq_l, eq_r], &fx_params, false, &mut tmp_out);
+            } else {
+                tmp_out.push(eq_l);
+                tmp_out.push(eq_r);
+            }
+        }
+
+        // 對每個輸出立體聲幀套用 FxChain → 正規化 → 限幅
+        let mut frames_out: Vec<f32> = Vec::new();
+        for chunk in tmp_out.chunks(2) {
+            if chunk.len() < 2 {
+                continue; // 不完整的幀，捨棄
+            }
+            let mut l = chunk[0];
+            let mut r = chunk[1];
+
+            // FxChain 音效（立體聲幀）
+            {
+                let mut fx = self.fx_chain.lock().unwrap();
+                if let Some(mut p) = fx.as_mut() {
+                    p.set(&fx_params);
+                    let mut f = [l, r];
+                    p.frame(&mut f);
+                    l = f[0];
+                    r = f[1];
+                }
+            }
+
+            // 正規化
+            if self.normalize() {
+                let norm = f32::from_bits(self.current_norm_gain_bits.load(Ordering::Acquire) as u32);
+                let g = norm.clamp(0.0, 8.0);
+                l = l * g;
+                r = r * g;
+            }
+
+            // 限幅
+            l = l.clamp(-1.0, 1.0);
+            r = r.clamp(-1.0, 1.0);
+
+            frames_out.push(l);
+            frames_out.push(r);
+        }
+        out.extend_from_slice(&frames_out);
+    }
+
+    /// 套用後段 DSP 至立體聲幀：FxChain → 正規化 → 限幅（不重複 EQ 與 RateStage）。
+    /// 用於 tail 排空與 EOF 終結：輸入已經過 EQ 與 RateStage 的立體聲幀 `[L, R]`。
+    fn apply_dsp_block_post(&self, frame: &[f32; 2], out: &mut Vec<f32>) {
+        // 取得參數快照
+        let fx_params = {
+            let p = self.dsp_params.lock().unwrap();
+            p.clone().unwrap_or_default()
+        };
+
+        let mut l = frame[0];
+        let mut r = frame[1];
+
+        // FxChain 音效（立體聲幀）
+        {
+            let mut fx = self.fx_chain.lock().unwrap();
+            if let Some(mut p) = fx.as_mut() {
+                p.set(&fx_params);
+                let mut f = [l, r];
+                p.frame(&mut f);
+                l = f[0];
+                r = f[1];
+            }
+        }
+
+        // 正規化
+        if self.normalize() {
+            let norm = f32::from_bits(self.current_norm_gain_bits.load(Ordering::Acquire) as u32);
+            let g = norm.clamp(0.0, 8.0);
+            l = l * g;
+            r = r * g;
+        }
+
+        // 限幅
+        l = l.clamp(-1.0, 1.0);
+        r = r.clamp(-1.0, 1.0);
+
+        out.push(l);
+        out.push(r);
     }
 }
 
@@ -864,6 +1087,9 @@ impl TrackResampler {
     /// 排出舊軌殘餘的輸入與重取樣器延遲，產出尾端資料到 output_buffer。
     /// 在換軌或鏈結束前呼叫，避免丟失最後一段不足 BLOCK_FRAMES 的資料。
     pub fn flush_tail(&mut self) {
+        if self.tail_flushed {
+            return;
+        }
         let internal_ch = INTERNAL_CHANNELS as usize;
         let Some(resampler) = self.resampler.as_mut() else { return };
         let Some(ct) = self.current_track.as_ref() else { return };
@@ -1274,10 +1500,23 @@ pub enum TrackData {
     Stream(Arc<StreamWrapper>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum StreamWrapper {
     SymStream { path: String, sample_rate: u32, channels: u16, duration_ms: i64 },
     FfmpegStream(Arc<FfmpegStreamHandle>),
+    /// 延後開啟的 FFmpeg 串流（長檔），攜帶完整中繼與 handle
+        FfmpegDeferred {
+            path: String,
+            sample_rate: u32,
+            channels: u16,
+            duration_ms: i64,
+            seq: u64,
+            token: u64,
+            song_id: i64,
+            norm_gain: f32,
+            generation: u64,
+            handle: std::sync::Mutex<Option<std::fs::File>>,
+        },
 }
 
 /// FfmpegStream 的 handle（用於 PreparedTrack 跨執行緒傳遞）
@@ -1572,9 +1811,16 @@ impl Drop for NextCoordinator {
 
 /// 準備單一軌（解碼或開啟串流）
 fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<PreparedTrack, String> {
-    crate::open_with::validate_local_path(std::path::Path::new(path))?;
-
-    let ext = std::path::Path::new(path)
+    let path_buf = std::path::PathBuf::from(path);
+    
+    // 使用 handle 持有機制：開啟並驗證檔案，回傳持有的 handle
+    let mut file = open_validated_file(&path_buf)?;
+        let final_path = get_final_path_from_handle(&file)?;
+    
+        // 複製 handle 供長檔延後串流使用（若需要）
+        let file_for_stream = file.try_clone().map_err(|e| format!("複製 handle 失敗: {e}"))?;
+    
+        let ext = path_buf
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
@@ -1583,35 +1829,44 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
     let backend = crate::scanner::playback_backend_for(&ext);
 
     match backend {
-        Some(crate::scanner::Backend::Symphonia) => {
-            // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
-            if let Err(reason) = precheck_packet_budget(std::path::Path::new(path)) {
-                return Err(format!("封包上限預檢失敗：{reason}"));
-            }
-            match crate::audio_decode::SymStream::open(std::path::Path::new(path), 0) {
+            Some(crate::scanner::Backend::Symphonia) => {
+                // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+                if let Err(reason) = precheck_packet_budget(&mut file) {
+                    return Err(format!("封包上限預檢失敗：{reason}"));
+                }
+                // 嘗試用 symphonia 開啟（傳入 handle 與原始路徑）
+                match crate::audio_decode::SymStream::open(&mut file, &path_buf, 0) {
                 Ok(mut stream) => {
                     let duration_ms = stream.duration_ms().unwrap_or(0);
                     let is_long = duration_ms > 15 * 60 * 1000 || duration_ms == 0;
 
                     if is_long {
-                        Ok(PreparedTrack {
-                            seq,
-                            token,
-                            song_id,
-                            path: path.to_string(),
-                            decoder: "stream".to_string(),
-                            rate: stream.sample_rate(),
-                            channels: stream.channels(),
-                            duration_ms,
-                            norm_gain: 1.0,
-                            data: TrackData::Stream(Arc::new(StreamWrapper::SymStream {
-                                path: path.to_string(),
-                                sample_rate: stream.sample_rate(),
-                                channels: stream.channels(),
-                                duration_ms,
-                            })),
-                        })
+                                            // 長檔：建立延後串流，保留 handle 供播放時使用
+                                            Ok(PreparedTrack {
+                                                seq,
+                                                token,
+                                                song_id,
+                                                path: final_path.clone(),
+                                                decoder: "stream".to_string(),
+                                                rate: stream.sample_rate(),
+                                                channels: stream.channels(),
+                                                duration_ms,
+                                                norm_gain: 1.0,
+                                                data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred {
+                                                                                                    path: final_path,
+                                                                                                    sample_rate: stream.sample_rate(),
+                                                                                                    channels: stream.channels(),
+                                                                                                    duration_ms,
+                                                                                                    seq,
+                                                                                                    token,
+                                                                                                    song_id,
+                                                                                                    norm_gain: 1.0,
+                                                                                                    generation: 0, // 將在 set_next 時設定
+                                                                                                    handle: std::sync::Mutex::new(Some(file_for_stream)),
+                                                                                                })),
+                                            })
                     } else {
+                        // 短檔：整首解碼進記憶體，預檢後關閉 handle
                         let samples: Vec<f32> = stream.by_ref().collect();
                         let duration_ms = (samples.len() as f64 / (stream.sample_rate() as f64 * stream.channels() as f64) * 1000.0) as i64;
                         let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
@@ -1621,7 +1876,7 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
                             seq,
                             token,
                             song_id,
-                            path: path.to_string(),
+                            path: final_path,
                             decoder: "symphonia".to_string(),
                             rate: stream.sample_rate(),
                             channels: stream.channels(),
@@ -1632,12 +1887,16 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
                     }
                 }
                 Err(_) => {
-                    prepare_with_ffmpeg(path, song_id, &ext, seq, token)
-                }
+                                    // symphonia 失敗，嘗試 ffmpeg（需要重新開檔）
+                                    // file 已在 SymStream::open 中被移動，file_for_stream 仍可用於 ffmpeg
+                                    drop(file_for_stream);
+                                    prepare_with_ffmpeg(path, song_id, &ext, seq, token)
+                                }
             }
         }
         Some(crate::scanner::Backend::Ffmpeg) => {
-            prepare_with_ffmpeg(path, song_id, &ext, seq, token)
+            // ffmpeg 路徑：傳遞 final_path
+            prepare_with_ffmpeg_final(&final_path, song_id, &ext, seq, token)
         }
         None => {
             Err(format!("這個格式尚未支援: {}", ext))
@@ -1646,6 +1905,99 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
 }
 
 fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+    let ffprobe_path = crate::tools::locate("ffprobe.exe")
+        .map(|(p, _, _)| p)
+        .ok_or("找不到 ffprobe")?;
+    // SE6：ffprobe 64 KB / 10 秒上限
+    let value = crate::audio_decode::ffprobe_json(&ffprobe_path, path)?;
+
+    let streams = value["streams"].as_array().ok_or("無音訊串流")?;
+    let audio_stream = streams.iter().find(|s| s["codec_type"] == "audio").ok_or("無音訊串流")?;
+
+    let sample_rate = audio_stream["sample_rate"].as_str().unwrap_or("0").parse().unwrap_or(0);
+    let channels = audio_stream["channels"].as_u64().unwrap_or(0) as u16;
+    let duration = value["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok());
+    let duration_ms = duration.map(|d| (d * 1000.0) as i64).unwrap_or(0);
+
+    let is_long = duration_ms > 15 * 60 * 1000 || duration_ms == 0;
+
+    if is_long {
+        let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
+            .map(|(p, _, _)| p)
+            .ok_or("找不到 ffmpeg")?;
+
+        let stream = crate::audio_decode::FfmpegStream::new(&ffmpeg_path, path, sample_rate, channels, duration_ms)?;
+        let handle = FfmpegStreamHandle {
+            ffmpeg_path: stream.ffmpeg_path.clone(),
+            file_path: stream.file_path.clone(),
+            sample_rate: stream.sample_rate,
+            channels: stream.channels,
+            duration_ms: stream.duration_ms,
+            cancel: stream.cancel.clone(),
+            rx: stream.rx.clone(),
+        };
+
+        Ok(PreparedTrack {
+            seq,
+            token,
+            song_id,
+            path: path.to_string(),
+            decoder: "stream".to_string(),
+            rate: sample_rate,
+            channels,
+            duration_ms,
+            norm_gain: 1.0,
+            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
+        })
+    } else {
+        let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
+            .map(|(p, _, _)| p)
+            .ok_or("找不到 ffmpeg")?;
+
+        // SE3-1: 使用獨立 stderr 讀取執行緒與持久化 Sanitizer
+        let mut child = std::process::Command::new(&ffmpeg_path)
+            .args(["-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-i", path, "-f", "f32le", "-ac", &channels.to_string(), "-ar", &sample_rate.to_string(), "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ffmpeg 執行失敗: {e}"))?;
+
+        let stderr = child.stderr.take().ok_or("ffmpeg 無 stderr")?;
+        let stderr_thread = crate::open_with::spawn_stderr_sanitizer(Some(stderr), None);
+
+        let output = child.wait_with_output().map_err(|e| format!("ffmpeg 等待失敗: {e}"))?;
+        let _ = stderr_thread.join();
+        
+        if !output.status.success() {
+            return Err("ffmpeg 解碼失敗（詳細錯誤請見 open-with.log）".into());
+        }
+
+        let samples: Vec<f32> = output.stdout
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+
+        let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
+        let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
+        let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
+
+        Ok(PreparedTrack {
+            seq,
+            token,
+            song_id,
+            path: path.to_string(),
+            decoder: "ffmpeg".to_string(),
+            rate: sample_rate,
+            channels,
+            duration_ms,
+            norm_gain,
+            data: TrackData::Memory(Arc::new(samples)),
+        })
+    }
+}
+
+/// 使用最終規範路徑的 ffmpeg 準備（供 handle 機制呼叫）
+fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64) -> Result<PreparedTrack, String> {
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
         .ok_or("找不到 ffprobe")?;
@@ -2000,5 +2352,87 @@ mod tests {
         coord.set_next("/a.mp3".into(), 1, 10);
         // worker 可能正在準備（或阻塞於 completion 通道），drop 時不得永久等待
         drop(coord);
+    }
+
+    #[test]
+    fn test_playback_core_dsp_out_drain_order() {
+        let core = core_with_eq();
+        core.set_playback_state(PlaybackState::Playing);
+
+        // 直接將樣本放入 dsp_out，應該優先回傳（不經過 track_out/upstream）
+        core.dsp_out.lock().unwrap().push_back(0.5);
+        core.dsp_out.lock().unwrap().push_back(-0.3);
+
+        let s1 = core.next_playing().unwrap();
+        assert!((s1 - 0.5).abs() < 1e-6, "dsp_out 應優先回傳第一個樣本");
+
+        let s2 = core.next_playing().unwrap();
+        assert!((s2 - (-0.3)).abs() < 1e-6, "dsp_out 應續回傳第二個樣本");
+
+        // dsp_out 耗盡且無 track_out/upstream，應回傳靜音並進入 WaitingForNext
+        let s3 = core.next_playing().unwrap();
+        assert_eq!(s3, 0.0, "dsp_out 耗盡且無上游時應回傳靜音");
+    }
+
+    #[test]
+    fn test_playback_core_rate_stage_tail_drain() {
+        let core = core_with_eq();
+        core.set_playback_state(PlaybackState::Playing);
+
+        // 安裝第一軌（440Hz，振幅 0.3，約 0.05 s @ 44.1kHz 雙聲道）
+        let mut chain = TrackChain::new();
+        chain.append(sine_track(44100, 2, 0.05, 1, 10, 1));
+        chain.set_coordinator(core.next_coordinator());
+        core.track_chain.lock().unwrap().replace(chain);
+
+        let mut resampler = TrackResampler::new();
+        resampler.set_track(Some(sine_track(44100, 2, 0.05, 1, 10, 1)));
+        core.track_resampler.lock().unwrap().replace(resampler);
+        *core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
+
+        // 將第二軌（880Hz，振幅 1.0，約 0.1 s @ 48kHz 雙聲道，足夠長讓 TrackResampler 產出）放入待播槽
+        let second_samples: Vec<f32> = (0..((48000 * 2) as f32 * 0.1) as usize)
+            .map(|i| {
+                let frame = i / 2;
+                (2.0 * std::f32::consts::PI * 880.0 * frame as f32 / 48000.0).sin() * 1.0
+            })
+            .collect();
+        core.next_coordinator()
+            .slot
+            .lock()
+            .unwrap()
+            .replace(PreparedTrack {
+                seq: 2,
+                token: 20,
+                song_id: 2,
+                path: "test".into(),
+                decoder: "symphonia".into(),
+                rate: 48000,
+                channels: 2,
+                duration_ms: 100,
+                norm_gain: 1.0,
+                data: TrackData::Memory(Arc::new(second_samples)),
+            });
+
+        // 播放直到軌切換並持續消耗，確認第二軌音訊確實出現（振幅 1.0 > 第一軌 0.3）
+        // 不依賴 seq（sync_identity 會在舊尾音尚存於 dsp_out 時就發布新身分），
+        // 而是直接檢查樣本內容：第一軌振幅 ≤ 0.3，第二軌振幅 1.0，|s| > 0.5 僅可能來自第二軌。
+        let mut found_second = false;
+        let mut total = 0u64;
+        for _ in 0..100000 {
+            match core.next() {
+                Some(s) => {
+                    total += 1;
+                    if s.abs() > 0.5 {
+                        found_second = true;
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        assert!(total > 0, "應有樣本輸出");
+        assert!(found_second, "第二軌（振幅 1.0）音訊應確實出現，而非僅為舊軌尾音（振幅 ≤ 0.3）");
     }
 }

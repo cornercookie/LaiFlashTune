@@ -403,10 +403,11 @@ impl AudioEngine {
         let (track_chain, track_resampler, stream_source, decoder) = match backend {
             Some(crate::scanner::Backend::Symphonia) => {
                 // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
-                if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+                let mut file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
+                if let Err(reason) = precheck_packet_budget(&mut file) {
                     return Err(format!("封包上限預檢失敗：{reason}"));
                 }
-                match SymStream::open(Path::new(path), position_ms) {
+                match SymStream::open(&mut file, Path::new(path), position_ms) {
                     Ok(mut stream) => {
                         let duration_ms = stream.duration_ms().filter(|d| *d > 0).unwrap_or(0);
                         let is_long = duration_ms > STREAM_OVER_MS || duration_ms == 0;
@@ -431,6 +432,7 @@ impl AudioEngine {
                                 path: path.to_string(),
                                 decoder: "stream".to_string(),
                             }));
+                            *self.core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
                             (
                                 TrackChain::new(),
                                 resampler,
@@ -479,6 +481,11 @@ impl AudioEngine {
         *self.core.track_chain.lock().unwrap() = Some(track_chain);
         *self.core.track_resampler.lock().unwrap() = Some(track_resampler);
         self.core.set_stream_source(stream_source);
+        // 手動換軌/seek 安裝新來源前清空 DSP 輸出佇列，避免舊位置殘留聲音
+        self.core.track_out.lock().unwrap().clear();
+        self.core.dsp_out.lock().unwrap().clear();
+        // 重設 RateStage（速度/節奏/音高），避免舊軌殘留緩衝影響新軌（涵蓋短檔與長檔）
+        *self.core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
 
         // 換軌時重新串接一個新的 OutputProxy 到長駐 Sink（同一 proxy_id，active_id 不變）
         if let Some(ref sink) = self.sink {
@@ -545,7 +552,21 @@ impl AudioEngine {
             // 串流軌由設定為 TrackChain 之外的 stream_source 直接播放（不回收，由 set_stream_source 換軌時釋放）
             let stream_source: Option<Box<dyn Iterator<Item = f32> + Send>> = Some(Box::new(stream));
             let chain = TrackChain::new();
-            let resampler = TrackResampler::new();
+            let mut resampler = TrackResampler::new();
+            resampler.set_track(Some(TrackChainItem {
+                samples: Arc::new(Vec::new()),
+                sample_rate: final_sr,
+                channels: final_ch,
+                duration_ms,
+                song_id,
+                norm_gain: 1.0,
+                token,
+                seq,
+                native_frame_pos: 0,
+                path: path.to_string(),
+                decoder: "stream".to_string(),
+            }));
+            *self.core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
             Ok((chain, resampler, stream_source, "stream".to_string()))
         } else {
             let ffmpeg_path = locate("ffmpeg.exe")
@@ -898,6 +919,8 @@ fn audio_loop(
                 }
                 PlayerCommand::SetFx { fx } => {
                     engine.core.eq_shared.update(|p| p.fx = fx);
+                    let fx_params = engine.core.eq_shared.get().fx;
+                    *engine.core.dsp_params.lock().unwrap() = Some(fx_params);
                 }
                 PlayerCommand::SetOutput { name } => {
                     if let Err(e) = engine.switch_output(&name) {

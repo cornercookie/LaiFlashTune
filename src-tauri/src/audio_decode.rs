@@ -35,12 +35,8 @@ const FFPROBE_TIMEOUT: Duration = Duration::from_secs(10); // SE6：ffprobe 總�
 /// 回傳 Err（呼叫者不得呼叫 open()）。無法可靠遍歷某種格式的封包索引時，
 /// 回傳 Ok（允許 open），依賴 refill 第二層防護（packet.buf().len() > MAX_PACKET_BYTES）
 /// 在執行時捕獲超標封包。
-pub fn precheck_packet_budget(path: &Path) -> Result<(), String> {
+pub fn precheck_packet_budget(file: &mut File) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return Err("無法開啟檔案".to_string());
-    };
 
     // 讀取前 16 bytes 判斷容器格式
     let mut header = [0u8; 16];
@@ -50,7 +46,7 @@ pub fn precheck_packet_budget(path: &Path) -> Result<(), String> {
 
     // MP4：ftyp box，掃描 box 結構尋找 stsz（Sample Size box）
     if &header[4..8] == b"ftyp" {
-        return scan_mp4_stsz(&mut file);
+        scan_mp4_stsz(file)?;
     }
 
     // 其他格式（MKV、MP3、FLAC 等）：無法在配置前可靠遍歷封包索引，
@@ -61,7 +57,7 @@ pub fn precheck_packet_budget(path: &Path) -> Result<(), String> {
 
 /// 掃描 MP4 box 結構尋找 stsz（Sample Size box），檢查所有樣本大小是否超過上限。
 /// 支援巢狀 container box（moov/meta/ilst 等）遞迴走訪，涵蓋所有音軌與片段。
-fn scan_mp4_stsz(file: &mut std::fs::File) -> Result<(), String> {
+fn scan_mp4_stsz(file: &mut File) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
 
     const LIMIT: u64 = 10 * 1024 * 1024; // 僅掃描前 10 MB
@@ -322,12 +318,12 @@ pub struct SymStream {
 
 impl SymStream {
     /// 開檔並（可選）精準跳到 start_ms。回傳時已解出第一個封包，channels / sample_rate 可信。
-    pub fn open(path: &Path, start_ms: i64) -> Result<Self, String> {
+    /// 接受已驗證的 File handle 與原始路徑（用於 hint 副檔名），避免重新開檔競態。
+    pub fn open(file: &mut File, path: &Path, start_ms: i64) -> Result<Self, String> {
         // SE7：配置前封包上限預檢，作為 open() 內部的第二道防禦線；
         // 直接呼叫 open() 的所有路徑皆先經過此預檢，超標則拒絕不繼續開檔。
-        precheck_packet_budget(path)?;
-        let file = File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        precheck_packet_budget(file)?;
+        let mss = MediaSourceStream::new(Box::new(file.try_clone().map_err(|e| format!("複製 handle 失敗: {e}"))?), Default::default());
         let mut hint = Hint::new();
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             hint.with_extension(&ext.to_ascii_lowercase());

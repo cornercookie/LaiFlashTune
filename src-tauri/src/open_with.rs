@@ -7,7 +7,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
+use std::os::windows::io::FromRawHandle;
 use tauri::{AppHandle, Emitter, Manager};
+use std::fs::File;
 
 use crate::models::OpenedFile;
 use crate::tools::is_trusted_local_path;
@@ -211,14 +213,83 @@ struct WIN32_FILE_ATTRIBUTE_DATA {
     }
 
     // 步驟 3: 驗證本機檔案存在
-    if !path.exists() {
-        return Err("檔案不存在".into());
+        if !path.exists() {
+            return Err("檔案不存在".into());
+        }
+
+        Ok(())
     }
 
-    Ok(())
-}
+    /// 開啟並驗證檔案，回傳持有的 handle（FILE_SHARE_READ，禁止寫入/刪除共享）。
+    /// 核心路徑（預檢、解碼）將直接使用此 handle，消除重新開檔競態。
+    /// 呼叫者負責在使用完畢後關閉 handle。
+    pub fn open_validated_file(path: &Path) -> Result<File, String> {
+        crate::open_with::validate_local_path(path)?;
+    
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use std::ptr::null_mut;
+            use winapi::um::fileapi::CreateFileW;
+            use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+            use winapi::um::winnt::{FILE_SHARE_READ, GENERIC_READ};
+        
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ,
+                    null_mut(),
+                    3, // OPEN_EXISTING
+                    0,
+                    null_mut(),
+                )
+            };
+        
+            if handle == INVALID_HANDLE_VALUE {
+                return Err("開啟檔案失敗".into());
+            }
+        
+            // 將原始 handle 轉為 std::fs::File
+            let file = unsafe { File::from_raw_handle(handle as _) };
+            return Ok(file);
+        }
+    
+        #[cfg(not(windows))]
+        {
+            std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))
+        }
+    }
 
-/// S2: 統一清洗管線 - 所有子程序 stderr 與其他日誌入口共用
+    /// 取得 handle 的最終規範路徑（用於 ffprobe/ffmpeg 子程序）
+        #[cfg(windows)]
+        pub fn get_final_path_from_handle(file: &File) -> Result<String, String> {
+            use std::os::windows::io::AsRawHandle;
+            use std::ptr::null_mut;
+            use winapi::um::fileapi::GetFinalPathNameByHandleW;
+            use winapi::um::winbase::VOLUME_NAME_DOS;
+            use winapi::ctypes::c_void;
+    
+            let handle = file.as_raw_handle() as *mut c_void;
+            let mut final_path = [0u16; 32768];
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    handle,
+                    final_path.as_mut_ptr(),
+                    final_path.len() as u32,
+                    VOLUME_NAME_DOS,
+                )
+            };
+    
+            if len > 0 && len < final_path.len() as u32 {
+                Ok(String::from_utf16_lossy(&final_path[..len as usize]))
+            } else {
+                Err("取得最終路徑失敗".into())
+            }
+        }
+
+    /// S2: 統一清洗管線 - 所有子程序 stderr 與其他日誌入口共用
 /// 清洗順序為有界狀態機，跨讀取區塊保留辨識狀態
 pub fn sanitize_log(input: &str) -> String {
     let mut sanitizer = Sanitizer::new();

@@ -6,10 +6,12 @@
 //! 引擎迴圈收到完成通知時，世代不是最新的就丟給回收執行緒；是最新的才放進待播槽，快照的 `next_token` 變成這個 token。
 
 use crate::audio_decode::{SymStream, FfmpegStream, precheck_packet_budget};
-use crate::open_with::{validate_local_path, log_line};
+use crate::open_with::{validate_local_path, log_line, get_final_path_from_handle, spawn_stderr_sanitizer};
+use crate::playback_pipeline::CancelHandle;
 use crate::tools::locate;
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
 use rodio::Source;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,10 +81,144 @@ pub trait StreamSource: Send + Sync {
 }
 
 /// 用於串流模式的包裝器，持有路徑並能重新開啟
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum StreamWrapper {
     SymStream { path: String, sample_rate: u32, channels: u16, duration_ms: i64 },
     FfmpegStream(FfmpegStream),
+    /// 延後開啟的 FFmpeg 串流（長檔），攜帶完整中繼與 handle
+    FfmpegDeferred {
+        path: String,
+        sample_rate: u32,
+        channels: u16,
+        duration_ms: i64,
+        seq: u64,
+        token: u64,
+        song_id: i64,
+        norm_gain: f32,
+        generation: u64,
+        handle: std::sync::Mutex<Option<std::fs::File>>,
+    },
+}
+
+fn open_ffmpeg_deferred(
+    handle: &std::sync::Mutex<Option<std::fs::File>>,
+    path: &str,
+    sample_rate: u32,
+    channels: u16,
+    duration_ms: i64,
+    seq: u64,
+    token: u64,
+    song_id: i64,
+    norm_gain: f32,
+    generation: u64,
+    start_ms: i64,
+) -> Result<Box<dyn Iterator<Item = f32> + Send>, String> {
+    // 使用 handle 開啟 FFmpeg 子程序
+    let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
+        .map(|(p, _, _)| p)
+        .ok_or("找不到 ffmpeg")?;
+
+    // 從 Mutex 取出 handle 所有權，確保鎖在閉包前釋放
+    let file = {
+        let mut guard = handle.lock().unwrap();
+        guard.take().ok_or("handle 已被取走")?
+    };
+    let final_path = get_final_path_from_handle(&file)?;
+
+    let cancel = Arc::new(CancelHandle::new(Duration::from_secs(10)));
+    let (tx, rx) = crossbeam_channel::bounded(128);
+
+    let file_path_owned = final_path.clone();
+    let ffmpeg_path_owned = ffmpeg_path.to_path_buf();
+    let cancel_stdout = cancel.clone();
+    let cancel_stderr = cancel.clone();
+
+    // stdout 讀取執行緒
+    let stdout_thread = thread::spawn(move || {
+        let mut child = match Command::new(&ffmpeg_path_owned)
+                    .args([
+                        "-nostdin",
+                        "-v", "error",
+                        "-protocol_whitelist", "file,pipe",
+                        "-ss", &format!("{:.3}", start_ms as f64 / 1000.0),
+                        "-i", &file_path_owned,
+                        "-map", "0:a:0",
+                        "-f", "f32le",
+                        "-ac", &channels.to_string(),
+                        "-ar", &sample_rate.to_string(),
+                        "-"
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        eprintln!("ffmpeg spawn failed: {e}");
+                        return;
+                    }
+                };
+
+        // 先取出 stdout 和 stderr，再移動 child
+        let mut stdout = match child.stdout.take() {
+            Some(out) => out,
+            None => return,
+        };
+
+        let mut stderr = child.stderr.take();
+
+        cancel_stdout.set_child(child);
+
+        // stderr 讀取執行緒：使用共用 helper（SE3-4）
+        let stderr_thread = spawn_stderr_sanitizer(stderr, Some(cancel_stderr));
+
+        // 讀取 stdout 並送入通道
+        const CHUNK_SAMPLES: usize = 4096; // 16 KiB @ 48kHz stereo f32
+        let mut chunk = Vec::with_capacity(CHUNK_SAMPLES * 4);
+        let mut buf = [0u8; 8192];
+
+        loop {
+            if cancel_stdout.is_cancelled() {
+                break;
+            }
+
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    chunk.extend_from_slice(&buf[..n]);
+                    while chunk.len() >= CHUNK_SAMPLES * 4 {
+                        let chunk_bytes: Vec<u8> = chunk.drain(..CHUNK_SAMPLES * 4).collect();
+                        let samples: Vec<f32> = chunk_bytes
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+
+                        // 嘗試發送，帶背壓重試
+                        loop {
+                            if cancel_stdout.is_cancelled() {
+                                break;
+                            }
+                            match tx.try_send(samples.clone()) {
+                                Ok(()) => break,
+                                Err(TrySendError::Full(_)) => {
+                                    thread::sleep(Duration::from_millis(5));
+                                    continue;
+                                }
+                                Err(TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let _ = tx.send(Vec::new()); // 結束信號
+        let _ = stderr_thread.join();
+    });
+
+    // 返回包裝的迭代器
+    Ok(Box::new(DeferredFfmpegIter { rx, buffer: Vec::new(), pos: 0, _stdout_thread: Some(stdout_thread) }))
 }
 
 impl StreamSource for StreamWrapper {
@@ -90,30 +226,79 @@ impl StreamSource for StreamWrapper {
         match self {
             StreamWrapper::SymStream { path, .. } => {
                 // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
-                if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+                let mut file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
+                if let Err(reason) = precheck_packet_budget(&mut file) {
                     return Err(format!("封包上限預檢失敗：{reason}"));
                 }
-                SymStream::open(Path::new(path), start_ms).map(|s| Box::new(s) as Box<dyn Iterator<Item = f32> + Send>)
+                SymStream::open(&mut file, Path::new(path), start_ms).map(|s| Box::new(s) as Box<dyn Iterator<Item = f32> + Send>)
             }
             StreamWrapper::FfmpegStream(s) => s.open_with_seek(start_ms),
+            StreamWrapper::FfmpegDeferred { path, sample_rate, channels, duration_ms, seq, token, song_id, norm_gain, generation, handle, .. } => {
+                // 使用獨立函數開啟 FFmpeg 延後串流，避免在閉包中捕獲 self 的引用
+                open_ffmpeg_deferred(handle, path, *sample_rate, *channels, *duration_ms, *seq, *token, *song_id, *norm_gain, *generation, start_ms)
+            }
         }
     }
     fn sample_rate(&self) -> u32 {
         match self {
             StreamWrapper::SymStream { sample_rate, .. } => *sample_rate,
             StreamWrapper::FfmpegStream(s) => s.sample_rate(),
+            StreamWrapper::FfmpegDeferred { sample_rate, .. } => *sample_rate,
         }
     }
     fn channels(&self) -> u16 {
         match self {
             StreamWrapper::SymStream { channels, .. } => *channels,
             StreamWrapper::FfmpegStream(s) => s.channels(),
+            StreamWrapper::FfmpegDeferred { channels, .. } => *channels,
         }
     }
     fn duration_ms(&self) -> Option<i64> {
         match self {
             StreamWrapper::SymStream { duration_ms, .. } => Some(*duration_ms),
             StreamWrapper::FfmpegStream(s) => s.duration_ms(),
+            StreamWrapper::FfmpegDeferred { duration_ms, .. } => Some(*duration_ms),
+        }
+    }
+}
+
+/// 延後開啟 FFmpeg 串流的迭代器（用於 FfmpegDeferred）
+struct DeferredFfmpegIter {
+    rx: crossbeam_channel::Receiver<Vec<f32>>,
+    buffer: Vec<f32>,
+    pos: usize,
+    _stdout_thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Iterator for DeferredFfmpegIter {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // 先從緩衝區取樣本
+        if self.pos < self.buffer.len() {
+            let sample = self.buffer[self.pos];
+            self.pos += 1;
+            return Some(sample);
+        }
+
+        // 緩衝區耗盡，從通道接收新 chunk
+        match self.rx.recv() {
+            Ok(chunk) => {
+                if chunk.is_empty() {
+                    // 結束信號
+                    return None;
+                }
+                self.buffer = chunk;
+                self.pos = 0;
+                if self.pos < self.buffer.len() {
+                    let sample = self.buffer[self.pos];
+                    self.pos += 1;
+                    Some(sample)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None, // 通道關閉
         }
     }
 }
@@ -141,6 +326,7 @@ struct PrepareRequest {
     path: String,
     song_id: i64,
     generation: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl NextCoordinator {
@@ -179,18 +365,18 @@ impl NextCoordinator {
                     Err(_) => break, // 通道關閉，退出
                 };
                 
-                if cancel_flag.load(Ordering::Relaxed) {
+                if cancel_flag.load(Ordering::Relaxed) || request.cancel.load(Ordering::Relaxed) {
                     continue;
                 }
                 
                 // 執行準備工作
-                if let Ok(track) = prepare_track(&request.path, request.song_id) {
+                if let Ok(track) = prepare_track(&request.path, request.song_id, request.cancel) {
                     let _ = completion_tx.send((track, request.generation));
                 }
             }
         })
     }
-    
+
     /// 設定下一首（立即回傳，背景準備）
     pub fn set_next(&self, path: String, song_id: i64) -> u64 {
         let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
@@ -203,12 +389,25 @@ impl NextCoordinator {
             }
         }
         
-        // 送入待處理請求（只保留最新）
-                let _ = self.pending_tx.as_ref().unwrap().send(PrepareRequest {
+        // 送入待處理請求（只保留最新）- NT1: non-blocking replace
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tx = self.pending_tx.as_ref().unwrap();
+        let path_clone = path.clone();
+        if let Err(TrySendError::Full(_)) = tx.try_send(PrepareRequest {
             path,
             song_id,
             generation: gen,
-        });
+            cancel: cancel.clone(),
+        }) {
+            // 滿了：丟掉舊的再送新的
+            let _ = self.pending_rx.try_recv();
+            let _ = tx.try_send(PrepareRequest {
+                path: path_clone,
+                song_id,
+                generation: gen,
+                cancel,
+            });
+        }
         
         gen
     }
@@ -282,9 +481,10 @@ impl Drop for NextCoordinator {
 }
 
 /// 準備單一軌（解碼或開啟串流）
-fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
-    // S1: 驗證本機路徑
+fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<PreparedTrack, String> {
+    // S1: 驗證本機路徑並取得 handle（NT6: TOCTOU 緩解）
     validate_local_path(Path::new(path))?;
+    let mut file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
     
     let ext = Path::new(path)
         .extension()
@@ -299,17 +499,20 @@ fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
     match backend {
         Some(crate::scanner::Backend::Symphonia) => {
             // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
-            if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+            // 使用 handle 而非路徑，避免 TOCTOU
+            file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek 失敗: {e}"))?;
+            if let Err(reason) = precheck_packet_budget(&mut file.try_clone().map_err(|e| format!("clone handle 失敗: {e}"))?) {
                 return Err(format!("封包上限預檢失敗：{reason}"));
             }
             // 嘗試用 symphonia 開啟
-            match SymStream::open(Path::new(path), 0) {
+            file.seek(SeekFrom::Start(0)).map_err(|e| format!("seek 失敗: {e}"))?;
+            match SymStream::open(&mut file.try_clone().map_err(|e| format!("clone handle 失敗: {e}"))?, Path::new(path), 0) {
                 Ok(mut stream) => {
                     let duration_ms = stream.duration_ms().unwrap_or(0);
                     let is_long = duration_ms > 15 * 60 * 1000 || duration_ms == 0;
                     
                     if is_long {
-                        // 長檔案：串流模式 - 需要重新開啟檔案
+                        // 長檔案：串流模式 - 使用 FfmpegDeferred 攜帶 handle
                         Ok(PreparedTrack {
                             seq: 0, // 由引擎分配
                             token: 0, // 由引擎分配
@@ -320,12 +523,18 @@ fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
                             channels: stream.channels(),
                             duration_ms,
                             norm_gain: 1.0,
-                            data: TrackData::Stream(Arc::new(StreamWrapper::SymStream { 
-                                                            path: path.to_string(), 
-                                                            sample_rate: stream.sample_rate(), 
-                                                            channels: stream.channels(), 
-                                                            duration_ms 
-                                                        })),
+                            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred { 
+                                path: path.to_string(), 
+                                sample_rate: stream.sample_rate(), 
+                                channels: stream.channels(), 
+                                duration_ms,
+                                seq: 0,
+                                token: 0,
+                                song_id,
+                                norm_gain: 1.0,
+                                generation: 0,
+                                handle: std::sync::Mutex::new(Some(file)),
+                            })),
                         })
                     } else {
                         // 短檔案：整首解碼進記憶體
@@ -350,12 +559,12 @@ fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
                 }
                 Err(e) => {
                     // symphonia 失敗，嘗試 ffmpeg
-                    prepare_with_ffmpeg(path, song_id, &ext)
+                    prepare_with_ffmpeg(path, song_id, &ext, file, cancel)
                 }
             }
         }
         Some(crate::scanner::Backend::Ffmpeg) => {
-            prepare_with_ffmpeg(path, song_id, &ext)
+            prepare_with_ffmpeg(path, song_id, &ext, file, cancel)
         }
         None => {
             // 受阻格式
@@ -364,7 +573,7 @@ fn prepare_track(path: &str, song_id: i64) -> Result<PreparedTrack, String> {
     }
 }
 
-fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str, file: std::fs::File, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<PreparedTrack, String> {
     // 使用 ffprobe 讀取中繼資料（SE6：64 KB / 10 秒上限）
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
@@ -388,13 +597,7 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str) -> Result<PreparedTr
     let is_long = duration_ms > 15 * 60 * 1000 || duration_ms == 0;
     
     if is_long {
-        // 串流模式
-        let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
-            .map(|(p, _, _)| p)
-            .ok_or("找不到 ffmpeg")?;
-        
-        let stream = FfmpegStream::new(&ffmpeg_path, path, sample_rate, channels, duration_ms)?;
-        
+        // 串流模式 - 使用 FfmpegDeferred 攜帶 handle（NT6）
         Ok(PreparedTrack {
             seq: 0,
             token: 0,
@@ -405,55 +608,89 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str) -> Result<PreparedTr
             channels,
             duration_ms,
             norm_gain: 1.0,
-            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(stream))),
-        })
-    } else {
-            // 短檔案：用 ffmpeg 整首解碼
-            let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
-                .map(|(p, _, _)| p)
-                .ok_or("找不到 ffmpeg")?;
-        
-            // SE3-1: 使用獨立 stderr 讀取執行緒與持久化 Sanitizer
-            let mut child = std::process::Command::new(&ffmpeg_path)
-                .args(["-nostdin", "-v", "error", "-i", path, "-f", "f32le", "-ac", &channels.to_string(), "-ar", &sample_rate.to_string(), "-"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("ffmpeg 執行失敗: {e}"))?;
-
-            let stderr = child.stderr.take().ok_or("ffmpeg 無 stderr")?;
-            let stderr_thread = crate::open_with::spawn_stderr_sanitizer(Some(stderr), None);
-
-            let output = child.wait_with_output().map_err(|e| format!("ffmpeg 等待失敗: {e}"))?;
-            let _ = stderr_thread.join();
-        
-            if !output.status.success() {
-                return Err("ffmpeg 解碼失敗（詳細錯誤請見 open-with.log）".into());
-            }
-        
-            // 解析 f32le 輸出
-            let samples: Vec<f32> = output.stdout
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect();
-        
-            let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
-            let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
-            let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
-        
-            Ok(PreparedTrack {
+            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred {
+                path: path.to_string(),
+                sample_rate,
+                channels,
+                duration_ms,
                 seq: 0,
                 token: 0,
                 song_id,
-                path: path.to_string(),
-                decoder: "ffmpeg".to_string(),
-                rate: sample_rate,
-                channels,
-                duration_ms,
-                norm_gain,
-                data: TrackData::Memory(Arc::new(samples)),
-            })
+                norm_gain: 1.0,
+                generation: 0,
+                handle: std::sync::Mutex::new(Some(file)),
+            })),
+        })
+    } else {
+        // 短檔案：用 ffmpeg 整首解碼（NT4: 輸出上限）
+        let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
+            .map(|(p, _, _)| p)
+            .ok_or("找不到 ffmpeg")?;
+    
+        // SE3-1: 使用獨立 stderr 讀取執行緒與持久化 Sanitizer
+        let mut child = std::process::Command::new(&ffmpeg_path)
+            .args(["-nostdin", "-v", "error", "-i", path, "-f", "f32le", "-ac", &channels.to_string(), "-ar", &sample_rate.to_string(), "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("ffmpeg 執行失敗: {e}"))?;
+
+        let stderr = child.stderr.take().ok_or("ffmpeg 無 stderr")?;
+        let stderr_thread = spawn_stderr_sanitizer(Some(stderr), None);
+        
+        // 限制 stdout 讀取大小（NT4: 防 OOM）
+        const MAX_PCM_BYTES: usize = 400 * 1024 * 1024; // 400 MB
+        let mut stdout = child.stdout.take().ok_or("ffmpeg 無 stdout")?;
+        let mut output = Vec::with_capacity(1024 * 1024);
+        let mut buf = [0u8; 8192];
+        
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = child.kill();
+                return Err("cancelled".into());
+            }
+            if output.len() > MAX_PCM_BYTES {
+                let _ = child.kill();
+                return Err("PCM size exceeds limit".into());
+            }
+            
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buf[..n]),
+                Err(_) => break,
+            }
         }
+        
+        let _ = child.wait();
+        let _ = stderr_thread.join();
+
+        if output.len() > MAX_PCM_BYTES {
+            return Err("PCM size exceeds limit".into());
+        }
+
+        // 解析 f32le 輸出
+        let samples: Vec<f32> = output
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+    
+        let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
+        let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
+        let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
+    
+        Ok(PreparedTrack {
+            seq: 0,
+            token: 0,
+            song_id,
+            path: path.to_string(),
+            decoder: "ffmpeg".to_string(),
+            rate: sample_rate,
+            channels,
+            duration_ms,
+            norm_gain,
+            data: TrackData::Memory(Arc::new(samples)),
+        })
+    }
 }
 
 #[cfg(test)]

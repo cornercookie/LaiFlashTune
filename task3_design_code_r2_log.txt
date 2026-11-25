@@ -1,0 +1,3138 @@
+Reading prompt from stdin...
+OpenAI Codex v0.163.0
+--------
+workdir: C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+model: gpt-6-astra
+provider: openai
+approval: on-request
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 01a20bd7-198d-7680-9faf-37dcbf9bd5c6
+--------
+user
+# [#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈 — Design 審查 Code 第 2 輪（對象 v8）
+
+## 背景
+SonicLedger：Tauri v2 + Rust + React 可攜 Windows 音樂播放器。
+
+## 當前設計
+檔案：`planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md` (v8)
+對應 Planning：`planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md`
+相關參考：`AGENTS.md`、`Agents/system-architecture.md`、`Agents/business-logic.md`、`planning/ROADMAP.md`、`planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Review.md`
+
+## 本輪為複查（第 2 輪，對象 v8）
+第 1 輪（不通過）指出 9 個阻擋（F1–F9）與 2 個重要（F8、F9），v8 已全部回應：
+- F1：`RateStage::new()`、`run()` 改為 `pub(crate)`；`new()` channels 參數為 `usize`；`dsp.rs` 列入變更清單（4.2、變更檔案清單）
+- F2：`apply_dsp` 改為 `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`，餵入區塊輸出零到多幀；`PlaybackCore` 新增 `dsp_out` 佇列（4.1、4.2）
+- F3：先從 `dsp_out` 取樣本，不足再拉上游；`None` 表示未滿區塊而非靜音（4.1）
+- F4：RateStage 建立時機涵蓋初次載入、手動換軌、seek、自然交接（4.2）
+- F5：`PlaybackCore` 新增 `dsp_params` 快照，命令執行緒更新，`apply_dsp_block` 讀取快照供 RateStage 與 FxChain 使用（4.2）
+- F6：FFmpeg 長檔分支建立 `RateStage` 並 `set_track`；Symphonia 後備路徑納入統一安裝入口（變更檔案清單 player.rs、4.2）
+- F7：EOF 上游只 flush 一次 → 全部尾段經 EQ／舊 RateStage → RateStage 只終結一次 → 排完 `dsp_out` → 進 WaitingForNext；不可重複 flush_tail（4.3）
+- F8：DSP 檢查點映射列為待實作；以舊軌最後一個 DSP 輸出幀位置提交邊界（4.3）
+- F9：區塊數值改為 2048（與管線一致）；尾段用游標或佇列批次消耗；需量測換軌最壞耗時（4.1、風險對策表）
+
+請以唯讀方式複查 Design.md v8：
+1. 確認 F1–F9 的修正是否足夠，且與現有原始碼（`src-tauri/src/playback_pipeline.rs`、`src-tauri/src/dsp.rs`、`src-tauri/src/player.rs`、`src-tauri/src/eq.rs`）相容。
+2. 確認是否有新的阻擋或重要問題。
+3. 給出最終 verdict：`結論：通過 / 有條件通過 / 不通過`。
+
+## 輸出要求
+- 每條發現需帶證據（doc line + code file:line），核對不到的標註 `推測`。
+- 嚴重度：阻擋 / 重要 / 次要。
+- 輸出表格：`# | 嚴重度 | 位置 | 問題 | 證據 | 建議`
+- 最後一行寫 `結論：通過 / 有條件通過 / 不通過`
+- 唯讀審查，不修改 repo 中任何檔案。
+2026-11-24T04:36:16.768673Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer realm=\"OAuth\", resource_metadata=\"https://openai.canva.com/.well-known/oauth-protected-resource/mcp\", error=\"invalid_token\", error_description=\"Missing or invalid access token\"" })
+warning: Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.
+  user (C:\Users\jake4\.codex\config.toml): `windows_wsl_setup_acknowledged` is ignored.
+warning: Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.
+  user (C:\Users\jake4\.codex\config.toml): `windows_wsl_setup_acknowledged` is ignored.
+2026-11-24T04:36:16.976437Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer resource_metadata=\"https://mcp.gamma.app/.well-known/oauth-protected-resource\"" })
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+我會先讀取專案規則與必要技能，再逐項核對 v8 的 F1–F9 修正及直接相關原始碼；全程唯讀，不修改檔案。
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "Get-Content -LiteralPath 'AGENTS.md'; Get-Content -LiteralPath 'C:/Users/jake4/.codex/skills/dev-workflow/SKILL.md'; Get-Content -LiteralPath 'C:/Users/jake4/.codex/skills/system-documentation-standard/SKILL.md'; Get-Content -LiteralPath 'C:/Users/jake4/.codex/skills/system-documentation-standard/references/core-rules.md'; Get-Content -LiteralPath 'C:/Users/jake4/.codex/skills/system-architecture-doc/SKILL.md'" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 482ms:
+# AGENTS.md
+
+SonicLedger：Tauri v2＋Rust＋React 的可攜式 Windows 音樂播放器。這份只放每個任務都適用的規則；專案知識在 `Agents/`，用到哪一塊就讀哪一份。
+
+## 專案知識（`Agents/`）
+
+- 新增或修改 command、事件、執行緒、外部程序 → [`Agents/system-architecture.md`](Agents/system-architecture.md)
+- 判斷功能該放前端還是後端、找某個功能在哪個檔案 → [`Agents/service-architecture.md`](Agents/service-architecture.md)
+- 動到資料表、欄位、索引、`app_config` 的 key → [`Agents/database.md`](Agents/database.md)
+- 改播放、歌單、曲庫、搜尋、音效、工具的行為規則 → [`Agents/business-logic.md`](Agents/business-logic.md)
+- 碰到檔案系統、登錄檔、子程序、網路、Tauri capability、系統管理員權限 → [`Agents/permissions.md`](Agents/permissions.md)
+
+其他文件：產品原則 `PRODUCT.md`；視覺設計規範 `DESIGN-SYSTEM.md`（根目錄這份是畫面風格，不是任務的 Design.md）；分期路線圖 `planning/ROADMAP.md`；舊的段落式計畫 `PLAN.md`（已完成，只供查歷史）。
+
+## 開發流程
+
+每個任務照這個順序走，前一步沒完成就不進下一步。
+
+1. **寫 Design.md**：放在 `planning/<任務>/Design.md`，一個任務一份。設計與實作步驟寫在同一份，不另外開 Implementation.md。內容：
+   - 目標與範圍
+   - 圖：依任務挑流程圖、時序圖或架構圖（Mermaid），用得上的才畫
+   - 現況（附檔案與行號）
+   - 做法與實作步驟（要改哪些檔、依什麼順序）
+   - 資料變更
+   - 完成條件（可量測、可重現）
+   - 風險
+2. **Design 審查**：依序做 Spec → Code → Security 三階段，每階段的阻擋問題修完才進下一階段。
+3. **實作**：由 OpenCode（`opencode run`）照 Design.md 的步驟做；做法有變更就先改 Design.md，再改程式。主導的 agent 負責拆工作、核對結果、跑測試與建置。
+4. **實作審查**：同樣依序做 Spec → Code → Security。
+5. **收尾**：更新受影響的 `Agents/` 文件與 `planning/ROADMAP.md` 的狀態，重建 release exe。
+
+### 審查
+
+- 審查一律由 Codex 做：`codex exec --sandbox read-only -c model_reasoning_effort=high`。作者（寫 Design 或實作的 agent）不能自己審；OpenCode 負責實作，所以也不擔任審查者。審查時只讀，不能改 repo。
+- 三個階段要審的東西：
+  - **Spec**：需求、產品原則、完成條件是否對得上，有沒有缺漏。
+  - **Code**：Design 階段審做法在現有程式與套件上是否可行；實作階段審正確性、測試、可維護性。
+  - **Security**：檔案路徑、子程序參數、登錄檔、本機連接埠、網路、Tauri capability、權限提升。
+- 審查結果記在同一個資料夾的 `Review.md`，依「Design／實作 × Spec／Code／Security」分節。每一條都標成已修、不修（附理由）或待確認。
+- 審查者的說法要先拿原始資料（程式碼、官方文件、實際執行結果）核對過才採用；核對不了的標成待確認。
+
+## 通用規則
+
+- 介面與文件用繁體中文。
+- 控制項要能驅動引擎才可以畫；做不到的功能明確寫做不到。
+- 資料只寫在執行檔旁的 `data/`。連網功能預設關閉。
+- **repo 是公開的**：文件、註解、畫面文字一律用「參考播放器」稱呼比對對象，功能用通用名稱。提交前執行 `git grep -n -i -e 'a[i]mp'`，結果要是空的。已推上去的歷史紀錄不改寫。
+- Tauri command 的參數用 camelCase；巢狀結構照 Rust 欄位名稱，或在 Rust 端加 `rename_all`。
+- **完成的定義**：
+  - `cargo test --release --manifest-path src-tauri/Cargo.toml` 與 `node --test "src/player/*.test.mjs"`（glob 要加引號，交給 node 展開）全過。
+  - 關掉正在跑的 `src-tauri/target/release/sonicledger.exe`，執行 `npx tauri build`，確認新的 `dist/assets/index-*.js` 檔名在 exe 裡。安裝程式步驟出現缺 `.ico` 的錯誤不算 exe 建置失敗。
+  - 不留著正在跑的 `npm run dev`、vite 或測試用程序。
+---
+name: dev-workflow
+description: 依使用者撰寫的 Planning（如 planning.md）開發時的流程：產出合併設計、實作與審查紀錄的 Design.md，送審前確認待確認事項，設計完成後與實作完成後各做 Spec／Code／Security 審查，阻塞依據、最小修正、複查範圍與升級規則，以及交付判定。看到 planning.md、要撰寫設計文件或要審查設計／實作時使用；不用於一般問答或與 Planning 無關的單純程式修改。
+---
+
+# 開發流程
+
+| 文件資訊 | 內容 |
+| --- | --- |
+| 版本／建立／更新 | v1.2／2026-10-21／2026-10-30 |
+| 變更摘要 | v1.0 由 taifex-server `Agents/development-workflow.md` v1.4 移出為跨專案技能；審查用語改為「設計審查／實作審查」與「第 N 次複查」，明確審查次數不設上限；新增各階段使用的技能與其輸出的轉換規則。v1.1 新增：使用者要求時，Agent 可依 `planning-writer` 起草 Planning。v1.2 新增「專案指示檔與知識文件」：專案指示檔統一為 `AGENTS.md`、專案知識放 `Agents/` 五個主題、停用 `maintenance.md`；明確 Design.md 為每個任務各一份並以圖表為主 |
+| 依據 | 2026-10-19 使用者確認的開發流程；2026-10-21 使用者於 taifex-server [#17] 檢討後確認的範圍與審查規則；2026-10-30 使用者於 JIM 專案確認的文件分工調整 |
+
+專案的 `AGENTS.md` 另有更具體規定時，依專案規定；使用者當次明確指示優先。
+
+## 專案指示檔與知識文件
+
+- **指示檔：** 專案指示檔統一使用根目錄的 `AGENTS.md`。專案若仍有 `CLAUDE.md`，將其內容依下列分工併入 `AGENTS.md` 與 `Agents/` 後移除；專案沒有 `CLAUDE.md` 時略過。
+- **`AGENTS.md` 只放跨任務都適用的通用規則**（工作方式、必讀順序、禁止事項、驗證方式），專案知識只用連結指向 `Agents/`，連結文字寫明「什麼情況要讀」。
+- **`Agents/` 維護五個知識主題**，每主題一份文件：服務架構（含各功能的前後端歸屬）、系統架構、資料庫結構、業務邏輯、使用者權限。可依專案需要增加主題，但同一主題不拆成多份。
+- **停用 `maintenance.md`：** 專案若有 `maintenance.md`，把 Agent 需要的資料與規範拆入對應的 `Agents/` 主題或 `AGENTS.md` 後停用；沒有則只建立並維護 `Agents/`。
+- **開工讀取：** 只讀本次任務受影響的 `Agents/` 主題；任務改變架構、資料表、業務規則或權限時，於交付前回寫對應主題並更新其文件基本資訊。
+- 知識文件以現有程式碼為準；與程式不一致時依程式修正文件，並於任務 Design 記錄差異。
+
+## 文件分工
+
+| 文件 | 撰寫與維護者 | 用途 |
+| --- | --- | --- |
+| Planning（沿用使用者的實際檔名，如 `planning.md`） | 使用者 | 需求、目標、範圍與限制。Agent 讀取並引用，未經明確指示不改寫、改名或刪除 |
+| `Design.md` | Agent | 依 Planning 產出設計；實作時在同一份文件補上實作、審查、驗證與剩餘工作 |
+
+- 任務文件以 Markdown 寫入專案的 `docs/<任務資料夾>/`，沿用專案既有目錄慣例；同一任務不拆成多個平行目錄。只有使用者明確要求才產出 Word／PDF。
+- `Design.md` 是每個任務在開發流程中各自產出的文件，合併原本的設計與實作紀錄，不另外產出 `implementation.md`；整個專案不共用一份 Design.md，跨任務知識放 `Agents/`。
+- Design 盡可能以 Mermaid 圖表呈現設計：流程圖、時序圖或架構圖，依任務挑選最能說明變更的圖，不必每種都畫；文字補充圖表無法表達的規則與契約。
+- Design 保留 Planning 的來源連結與必要需求摘要，摘要不取代原始規劃。發現需求缺口或設計偏離時明列差異，不改寫 Planning 來配合實作。需求由使用者在對話提供時，引用該次指示，不自建 Planning 冒充使用者文件。
+- 使用者要求 Agent 撰寫 Planning 時，依 `planning-writer` 技能以使用者的描述起草，經使用者確認後即為使用者文件；之後 Agent 未經使用者指示不得修改。
+- Design 屬內部任務工作紀錄，審查紀錄與修訂經過保留在其中。`system-documentation-standard` 第 26 條「正式文件不得混入內部審查紀錄」適用於另行產出、交付客戶的正式文件，不適用於 Design。
+- 設計階段寫預期行為與驗證方法，實作階段才填實際結果；保留重要設計修訂理由及前後差異，不事後改寫成從未變動。
+- 跨任務持續有效的知識回寫 `Agents/` 對應主題（見「專案指示檔與知識文件」）。
+- 格式使用本技能的 [Design 範本](assets/Design.md)；專案自有範本時依專案範本。系統文件另依 `system-documentation-standard` 及相應技能。
+
+## 範圍
+
+- 開工前讀完 `AGENTS.md` 列出的必讀文件。專案要求的技能或文件不存在時，開工前告知使用者，不在文件末尾帶過。
+- Planning 列出的待確認事項，以及撰寫 Design 時發現的需求缺口，須在送設計審查前向使用者確認。可在 Design 提出建議答案，但未確認前不得視為定案，也不得送審；確認結果引用使用者原始指示記入 Design。
+- 會新增規格、邊界案例、驗收條件或測試而超出 Planning 範圍者，須經使用者同意才納入。
+- 描述系統既有的邊界與錯誤行為（例如載入失敗時畫面如何呈現）不屬擴充範圍，可直接寫入；為其新增驗收、測試或保證，仍須使用者同意。
+- 內容詳略依 Planning 規模調整，不為填滿範本或檢查清單而新增 Planning 未要求的內容。
+
+## 流程與退回路徑
+
+```mermaid
+flowchart TB
+    planning["使用者撰寫 Planning"] --> intake["Agent 閱讀 Planning 與受影響的 Agents/ 主題"]
+    intake --> design["Agent 產出或修訂 Design.md"]
+    design --> confirm["向使用者確認待確認事項與需求缺口"]
+    confirm --> ds["設計審查：Spec"]
+    ds --> dc["設計審查：Code"]
+    dc --> dsec["設計審查：Security"]
+    dsec --> dg{"三階段皆通過？"}
+    dg -->|否：修正後複查受影響階段| design
+    dg -->|是| build["實作並更新 Design 的實際變更"]
+    build --> verify["執行相關驗證，記錄證據"]
+    verify --> ps["實作審查：Spec"]
+    ps --> pc["實作審查：Code"]
+    pc --> psec["實作審查：Security"]
+    psec --> pg{"三階段皆通過且驗收有證據？"}
+    pg -->|否：實作缺失| build
+    pg -->|否：需求或設計改變| design
+    pg -->|是| knowledge["回寫受影響的 Agents/ 主題"]
+    knowledge --> final["核對文件一致性並交付結果與限制"]
+```
+
+任一階段發現阻塞時即退回修正，無須等下一階段。
+
+## 審查：兩個時點，每次三階段
+
+審查在兩個時點進行：**設計完成後（實作前）** 與 **實作及驗證完成後**。每個時點都依 **Spec → Code → Security** 執行三個階段，分別保留結論，不能以一次籠統的「審查通過」取代。每個時點可複查多次直到收斂，次數不設上限。
+
+| 階段 | 設計審查 | 實作審查 |
+| --- | --- | --- |
+| Spec（規格） | 將 Planning／需求原文與 Design 並排核對：範圍、前後端責任、適用的正常／邊界／失敗行為、契約與可判定驗收；不以 Agent 摘要取代原規劃 | 逐項比對 Planning、Design 與實際行為；檢查漏做、偏離、回歸與測試證據，確認未完成項目已明列 |
+| Code（程式與可實作性） | 讀取受影響現有程式與呼叫者，審查預定修改路徑、相容性、資料遷移、並行與可測性；新模組尚無程式時審查設計契約並記錄限制 | 讀取實際差異及上下游路徑，檢查正確性、錯誤處理、持久化、相容性、測試有效性與可維護性 |
+| Security（資安） | 檢查信任邊界、身分驗證、後端授權、資料裁切、敏感資訊、輸入、外部副作用及部署限制 | 核對實際程式與設定的授權／拒絕路徑、敏感資料處理、輸入與外部整合；依變更風險使用適合的資安檢查 |
+
+純文件任務的 Code 階段審查來源、路徑、連結與規則可執行性；Security 階段審查資訊揭露與安全規範是否遺漏。仍須留下紀錄，不能聲稱已做產品程式審查或完整資安掃描。
+
+### 各階段使用的技能
+
+| 階段 | 設計審查 | 實作審查 |
+| --- | --- | --- |
+| Spec | 無專用技能，依上表並排核對 Planning 與 Design；系統規格文件另依 `system-spec-writer` 的品質檢查 | `code-reviewer` 的 `references/spec-compliance-review.md`：缺漏需求、多餘新增、理解落差 |
+| Code | 無專用技能，依上表讀取受影響程式與呼叫者 | `code-reviewer` |
+| Security | 無專用技能，依上表檢查信任邊界與授權 | `security-reviewer` |
+
+使用這些技能時，本技能的規則優先：
+
+- **範圍基準：** 以 Planning 與已確認決策為準。`spec-compliance-review.md` 的「缺漏需求」只計 Planning 要求的項目；其檢查清單中的邊界情境，Planning 未要求者不構成阻塞。「多餘新增」照常檢查，即擴充範圍。
+- **分類對應：** 技能輸出的 Critical／Major／Minor 或 Critical／High／Medium／Low 嚴重度，不直接等於本流程的結論。符合「阻塞」定義且附依據者列阻塞；其餘列建議或範圍外。技能的 Verdict（Approve／Request Changes）改以本流程的「需修正／受阻／通過」記錄。
+- **資安審查方式：** `security-reviewer` 只做程式與設定的唯讀審查，以及本機已安裝工具的靜態掃描。主動測試、滲透測試、對任何執行中環境的攻擊性測試，須使用者明確授權並界定範圍；正式環境不得測試。
+- **來源：** `code-reviewer`、`security-reviewer` 取自 `Jeffallan/claude-skills`（MIT），commit `36f3fe8`，2026-10-21 安裝；Codex 與 Claude 各存一份。
+
+## 發現、修正與複查
+
+- **紀錄：** 每一階段記錄時點（設計／實作）、第幾次複查、日期、審查者及方法、審查版本與檔案範圍、發現位置與影響、修正、複查證據及結論，存於該任務的 Design。
+- **結論：** 使用「待審查」「需修正」「受阻」「通過」。沒有實際審查或缺少必要證據時保持待審查／受阻。沒有相關風險時寫「已檢查，無此類變更」，不可跳過整個階段。
+- **阻塞：** 只限核心行為不明確、權限錯誤、資料遺失風險、驗收無法判定，或可核對的事實錯誤。修正後複查該階段及受影響的後續階段。
+- **阻塞須附依據：** 每條阻塞須指出所違反的 Planning／需求原文、已確認決策，或錯誤事實的檔案與行號；指不出依據者最多列為建議。「缺少某類邊界情境」本身不構成阻塞，除非 Planning 要求，或缺少它會使驗收無法判定。
+- **建議與範圍外：** 建議不計入結論。會擴充範圍的建議最多列一行「供使用者決定」，未經同意不納入 Design。
+- **最小修正：** 作者只修正阻塞，以更正或刪除為主，不以新增規格、邊界案例、驗收或測試作為修正手段；需要新增規格才能修正時，轉交使用者決定。
+- **複查範圍：** 第二次起，審查者只確認上一次的阻塞是否關閉，以及本次修改是否引入新阻塞；未修改的內容不重新全面審查。需求或設計方向改變時，才對受影響章節重新全面審查。
+- **交給使用者決定：** 同一階段連續兩次複查仍有阻塞，或阻塞數量未下降時，Agent 停止自行修改，把剩餘發現、各自依據與可行選項交給使用者。這不代表審查結束，使用者決定後照常繼續複查直到通過。
+- **審查提示：** 委派其他 Agent 審查時使用 [審查提示範本](assets/Review-Prompt.md)；作者自審也依同一標準分類發現。
+- **獨立性：** 審查回覆與作者自驗分開。有獨立審查者時讓其直接閱讀需求、Design、相關程式及驗證證據。未實際委派時不得宣稱第三方審查；不得擅自向外部模型傳送內部資料。
+- **進入實作：** 設計審查三階段皆通過才能實作。涉及人員核准或外部操作時，另遵使用者授權；審查通過本身不授權發布或部署。
+- **多 Agent 協作：** 開始時安排獨立驗證角色，持續檢查關鍵路徑與整合衝突；是否委派依使用者及當次指示。
+- **知識回寫後：** 回寫若改變設計、權限或安全規範，複查受影響階段；最後檢查 Design、專案知識與實作一致。
+
+## 交付判定
+
+Design 必須包含實際變更、已執行的驗證及證據、設計審查與實作審查各三階段的紀錄、未完成項目與環境限制。功能完成、正式部署與真人驗收分別記錄；未部署不得寫成已上線。驗證方式依專案的驗證規則。
+---
+name: system-documentation-standard
+description: 撰寫、更新或審核系統規劃、需求規格及架構文件時，套用台灣繁體中文文件規範、資料流與跨文件審查、Markdown 優先交付及正式文件管控。與專業規格、架構及圖表技能搭配；不套用於一般問答、行銷文案或單純程式修改。
+---
+
+# 系統文件撰寫與審核規範
+
+本技能管理系統文件的共同撰寫、審查與交付要求，不取代需求分析、架構設計或繪圖技能。首次套用時必須完整讀取 [28 條核心規範](references/core-rules.md)。該檔是使用者規範的唯一維護來源；以下為執行方式，依使用者澄清維持相同語義。使用者當次明確指示優先；相關技能及範本的預設與本規範衝突時，依本規範調整。
+
+## 適用與協作
+
+- 系統規格工作搭配 `system-spec-writer`；架構文件搭配 `system-architecture-doc`；圖表搭配 `system-architecture-diagrams`。僅讀取本次需要的技能，不為小幅文字修訂擴大工作。
+- 本技能可單獨審核系統文件。使用者只要求審核時，列出問題，不擅自重寫。
+- 共用規範與上述技能並列安裝；引用缺失時先確認路徑，無法讀取就說明缺失，不宣稱已套用。不得循環載入已讀取的技能。
+
+## 撰寫與更新
+
+1. 先讀已提供的需求與相關文件，辨識本期範圍、既定名稱、文件版本及可信來源。來源依可靠性、確認狀態與適用範圍判斷；已確認的內部需求、既有設計與程式碼可以使用，未確認草稿不作定案依據。正文先概述必要內容，再補充章節或來源連結，不要求讀者自行找其他文件來理解核心設計。
+2. 文件預設使用台灣繁體中文，只有使用者明確要求時才改用其他語言；適用於正文、標題、圖表標籤及說明。使用客觀、精煉的主動語態。專業術語與代號首次交代中文名稱和意義，有通用或已確認縮寫時採「中文（英文縮寫）」。沒有縮寫時使用中文或必要英文全名，不為命名而創造縮寫或提出不必要問題。正文與圖表優先使用業務名稱；需保留技術名稱時先定義，不能讓閱讀者猜測。
+3. 欄位定義與介面契約是第 24 條所要求的技術內容：可在欄位表、契約、程式碼區塊及確有技術必要的說明保留精確名稱，附中文業務意義與用途。未定義的自創變數或代號不得直接出現；一般業務正文使用業務名稱。
+4. 先將各文件以 Markdown 寫入 `docs`，可依專案慣例使用子目錄。更新時沿用文件身分、版本與需求編號；既有檔案不在 `docs` 時不擅自搬移或刪除，指出路徑差異，依開發者明確指示處理。只在開發者要求後才轉出 Word 或 PDF。
+5. 文件開頭提供「文件基本資訊」：名稱、版本、建立日期、更新日期與各章節變更摘要。日期與歷史版本沒有依據時不捏造。標題最多四級，細分使用項目符號或粗體。
+6. 主動規劃資料流：來源、驗證與轉換、儲存、傳出及結果；同時交代正常、邊界及錯誤行為。將非本期實作項目集中於「非本期範圍（Out of Scope）」獨立章節。
+7. 說明採用技術的選用理由。涉及架構與資料流時，獨立說明身分驗證、適用權限控管模型及傳輸加密標準；只有採用角色權限控管（RBAC）時才展開角色權限，不強制套用此模型。資訊足夠時建立非功能性需求章節，涵蓋效能、併發、資料保留及可用性；未知值列問題，不捏造。
+8. 系統介接或 API 依實際協定描述契約。HTTP 介面包含方法、端點、欄位、請求、回應、狀態碼與錯誤代碼；其他介接描述通道或位置、資料格式、處理結果、錯誤及適用的重送行為，不硬套 HTTP 欄位。範例不得引入未確認行為。
+9. 圖表優先保留 Mermaid 或其他可編輯程式碼，讀取相應圖型規範；名稱、資料庫、箭頭動作及正文一致。轉出 Word／PDF 時，圖號與圖名在圖下，表號與表名在表上。
+10. 每個主要功能定義業務驗收條件與預期結果，依交付需求納入正式文件。內部交付前的品質檢查、自查流程與審核紀錄另存 `docs/internal/<主題>/Delivery_Checklist.md`；詳細測試案例可另存 `AC_List.md`，不因其為內部案例而刪除正式文件的業務驗收章節。Markdown 工作草稿可保留明確標示的討論、假設與待決方案；正式文件移除這些內容，必要待確認問題仍可列出，但不能寫成已決方案。
+
+## 審核與連動更新
+
+需要保存內部交付前檢查時使用 [交付檢查範本](assets/delivery-checklist-template.md)，不以該檢查清單取代正式文件的業務驗收章節。
+
+- 審查架構完整性、設計合理性、與其他文件是否矛盾，以及來源可靠性。追蹤代表性資料從輸入到結果，檢查失敗後的資料狀態與恢復方式；核對技術選型是否支持需求。
+- 長文件分章產出。每新增或修改一章，核對前置章節的名詞、元件、資料流、介面與圖表；同步更新受影響的資料描述及內部驗收，不只修正文句。
+- 輸出審核問題時交代文件位置、證據、影響、修正建議與需開發者決定的事項；來源不足或架構矛盾要提出討論。可繼續不受影響的草稿工作，不宣稱疑義已解除。
+- 使用其他 Agent 工具審核時，要求第三方專家角度，不暗示預期結論。提供文件、相關架構及必要來源，要求檢查完整性、合理性、跨文件矛盾、來源可靠性及缺漏情境；僅比對正確性、拼字或措辭不足以判定正式交付。此規則規範已啟用的審核，不強制每次編輯都委派 Agent，也不授權向外部服務傳送文件。
+- 正式交付前確認：基本資訊與章節變更齊全、術語一致、無含糊措辭或表情符號、非本期內容獨立、資料流含例外、安全機制及技術理由明確、契約完整、內部交付檢查與討論紀錄未混入正文，業務驗收條件完整、來源可核對。關鍵疑義未解時交付草稿及問題，不能標示正式完成。
+- 交付說明列出文件位置、已檢查範圍與待開發者確認事項。自查、第三方 Agent 意見、人員核准與測試結果分開，不互相冒充。
+# 系統文件核心規範
+
+以下保留原 27 條規範的編號，並新增第 28 條語言規範，依使用者於 2026-10-09 的澄清修訂第 1、7、10、11、22、24、26 條。目的是防止未定義代號、以跳轉取代說明，以及內部工作流程混入正式文件；不得把助理建議冒充使用者要求。
+
+1. 首次出現的專業術語或系統代號，必須先定義中文名稱與意義；有通用或已確認的英文縮寫時採「中文（英文縮寫）」格式，後續可使用縮寫。沒有縮寫時使用中文或必要的英文全名，不自行創造縮寫。不使用閱讀者無從理解的自創變數或代號；確實需要新識別名稱時，先說明用途、業務意義與定義。正文以業務描述優先，例如「目標起始時間」；需精確交代介面欄位或技術契約時可保留名稱，但必須附中文意義，不讓代號取代解釋。
+2. 規劃文件撰寫時也要一併討論 Data Flow。
+3. 文件架構先各自以 Markdown 格式寫到 `docs` 裡，開發者要求再產出 docx 檔案或 PDF 檔案。
+4. 架構規劃需要審核的內容涵蓋架構完整性、是否與其他文件架構矛盾、來源是否可靠；有疑義就提出來跟開發者討論。
+5. 使用其他 Agent 工具審核時，應讓其以第三方的角度給予意見，評估架構設計是否完整、是否合理；僅比對正確性或用字遣詞，不足以達到可以產出正式文件的程度。
+6. 避免在規劃文件中出現含糊不清的用詞，如「團隊算法訓練」，一定會被挑戰「這是什麼意思？具體來說要做什麼？」。
+7. Markdown 工作草稿可保留清楚標示的內部討論、假設與待決方案。正式文件保持客觀專業，移除口語化討論過程及未定案的推測性描述；決策背景轉化為客觀的技術選型理由或業務需求背景。正式文件可列具體待確認問題，不把未決方案寫成已核准設計。
+8. 明確界定系統範圍（Scope）：正式文件應專注於本期將實作的功能。若有在需求訪談中提及、但「本期不實作」的項目，嚴禁與正式功能混寫，必須統一歸納至「非本期範圍（Out of Scope）」獨立章節，避免客戶產生錯誤期待或驗收爭議。
+9. 當規劃文件需要呈現架構圖、流程圖（Data Flow）或循序圖（Sequence Diagram）時，Agent 應優先輸出標準的 Mermaid 或程式碼，而非嘗試直接生成圖片檔，以利後續開發者調整圖表與統一渲染風格，並確保圖表內文字與內文一致。
+10. 來源必須可靠、可追溯且支援對應主張。可使用已確認的內部需求、既有設計與程式碼；未確認草稿不能當成定案依據，未取得的外部文件不能虛構引用。正文應自足，不以要求讀者另看內部草稿、未公開文件或其他章節代替必要說明。涉及通用法規或公開技術標準時，提供官方來源名稱及可查證連結。
+11. 先概述本段需要的內容、機制或結果，再以「詳見某某章節」補充細節位置。不得只寫「見第 X 章」或只提供文件連結，讓閱讀者自行拼湊必要背景；交叉引用是補充，不是替代說明。
+12. 文件上下用詞要保持一致。
+13. 規劃文件用的圖片產出時，務必參照相關類型圖片的撰寫規範，避免資料庫名稱沒有統一、添加不必要的符號、容易有歧義的動作名稱。
+14. 套用的技術要說明選用理由。
+15. 產出 docx 或 PDF 文件時，「圖 X」這類編號都放在圖片下方；表格編號放在表格上方。
+16. 避免放置非常見用語，以免造成客戶或其他開發者困惑。
+17. 替換中國用語，開發者面對的場景多為台灣的單位。
+18. 正式文件不可出現表情符號或 Emoji。
+19. 正式文件產出時，必須包含「文件基本資訊」區塊，包含文件名稱、版本號（如 v1.0）、建立／更新日期，以及各章節的變更摘要，以符合正式文件的管控規範。
+20. 規劃文件與 Data Flow 不可只寫順利執行的流程（Happy Path）。Agent 必須主動規劃並補齊邊界條件（Edge Cases）與錯誤處理機制（如：API 呼叫逾時、資料格式錯誤、斷線重連機制），並於文件中說明對應的系統行為。
+21. 為確保轉出 docx 或 PDF 時的目錄結構正確，Agent 在撰寫 Markdown 時，標題層級最多下探至第四級（`####`）。若需更細節的分類，強制改用項目符號（Bullet points）或粗體標示，避免文件目錄過度碎裂。
+22. 涉及系統架構與資料流規劃時，獨立說明身分驗證機制、適用的權限控管模型與資料傳輸加密標準。採用角色權限控管（RBAC）時描述角色及權限；其他模型依專案需求說明，不強制所有系統使用 RBAC。不適用或尚未決定的項目必須說明理由或列待確認，不虛構已採用機制。
+23. 若規劃文件字數過長，Agent 應分章節產出。產出新章節時，必須嚴格檢視是否與前置章節的「名詞定義」、「系統架構」與「Data Flow」保持一致，避免前後邏輯斷裂或架構圖與內文對不起來。
+24. 系統介接或應用程式介面（API）依實際協定使用一致的契約結構，說明呼叫或發布方、接收方、欄位與中文業務意義、請求或訊息格式、回應或處理結果，以及錯誤代碼與失敗行為。超文字傳輸協定（HTTP）介面包含方法、端點結構、請求與回應格式、狀態碼及錯誤代碼；事件、訊息與檔案介接描述其通道或位置、資料格式、處理結果及重送等適用語義，不硬套 HTTP 欄位。精確欄位名稱可出現，但不得使用未定義的自創代號或以代號代替說明。
+25. 除功能性流程與資安（如第 22 點）外，若資訊充足，Agent 應主動在規劃文件中建立「非功能性需求」章節，包含預期效能（Response Time）、併發處理量（Concurrency）、資料保留策略（Data Retention）與系統可用性（Availability）的設計原則。
+26. 每個主要功能或複雜邏輯須具備驗收視角，建立預期結果與可判定的完成條件。正式文件可且應依交付需求包含業務驗收條件、系統預期結果及驗收範圍；不得混入 Agent 或團隊內部交付前的自查流程、審核清單、評分紀錄及內部討論。內部交付檢查另存工作檔；業務驗收內容與內部品質檢查必須明確區分。
+27. 文件寫作風格必須保持「客觀、精煉、斬釘截鐵」，使用主動語態，絕對禁止使用 AI 常見的過度鋪陳用語（例如：「總結來說」、「值得注意的是」、「在當今快速發展的科技環境下」），直接切入技術與業務重點。
+28. 文件預設使用台灣繁體中文，涵蓋正文、標題、圖表標籤及說明；只有使用者明確要求時才改用其他語言。專業術語的英文名稱或縮寫、產品名稱及必要的技術契約名稱依相關規範保留，不因此改變文件的主要語言。
+---
+name: system-architecture-doc
+description: 撰寫、更新或審查系統架構說明書、軟體架構設計文件（SAD/SDD）與技術設計文件（Technical Design Document, TDD）；將需求、程式碼與既有文件轉為可追溯的架構敘述、圖表、決策及驗收依據。適用於架構文件交付與技術審查，不用於單純行銷提案或測試驅動開發（Test-Driven Development）。
+---
+
+# 系統架構文件
+
+產出讓業務、開發、維運與審查者能理解系統邊界、核對實作並檢驗設計的文件。文件預設使用台灣繁體中文，只有使用者明確要求時才改用其他語言；遵從使用者指定的契約章節與交付格式。此 skill 的規則是內部工作慣例，不等同任何認證標準。
+
+## 共用文件規範
+
+本技能用於系統規劃文件時，必須先讀取同層的 [系統文件撰寫與審核規範](../system-documentation-standard/SKILL.md)，並依其指示讀取 28 條核心規範。該規範優先於本技能與範本的交付預設；已讀取時不重複載入。僅處理獨立圖檔時採用相關命名、圖表及審查規則，不強制新增整份規劃文件。
+
+
+## 選擇工作模式
+
+- **新建完整架構書**：讀取 [撰寫 SOP](references/workflow.md) 與 [撰寫規範](references/writing-standard.md)，以 [架構書骨架](assets/architecture-template.md) 裁切章節。
+- **單一功能 TDD**：讀取 SOP，使用 [TDD 骨架](assets/tdd-template.md)，交代變更前後、方案取捨、介面、失敗處理與 rollout，不強制擴成整本架構書。
+- **從程式碼補文件／更新文件**：先鎖定版本與範圍；依 SOP 核對既有敘述。分開寫 As-is 與 To-be，保留未受影響內容與既有命名。
+- **審查既有文件**：讀取 [審查規準](references/review.md)，提供證據、影響、修正與驗證方式；只有被要求修改時才改寫文件。
+- 畫圖時讀取 [圖表邏輯](references/diagrams.md)；需要參考範例或解釋方法來源時讀取 [研究來源](references/sources.md)；需要示範如何串起證據、圖與驗收時讀取 [原創示例](references/worked-example.md)。不必每次重做網路研究。
+
+## 工作底線
+
+1. 先確認文件用途、讀者、系統邊界、版本與來源。優先讀取已提供資料；只詢問會改變主要架構或交付範圍的缺口，其餘列入待確認事項並繼續。
+2. 對關鍵敘述區分 **已驗證、來源宣稱、假設、提案、待確認**。檔案存在不代表功能已部署；設計目標不代表量測成果；矛盾來源需並列版本與待裁決點。
+3. 維持可追溯鏈：需求／品質目標 → 元件或介面 → 場景／圖 → 決策／風險 → 驗收方式。沿用專案 ID；無既有編號時只為需追蹤的項目建立 ID。
+4. 先整理元件與關係，再繪圖；圖、正文、介面表使用同一名稱。未知拓樸、效能數字、模型準確度與已核准決策不可自行補成事實。
+5. 深度以風險與讀者需要裁切。沒有適用性的內容寫明理由或省略；不得用大量空白章節冒充完整交付。草稿可保留明確缺口，正式完成判定依審查規準。
+6. 交付前做跨章一致性與品質檢查，修正可直接修正的問題，保留仍需專案證據的事項。AI 自查不冒充人員簽核、測試執行或正式驗收。
+
+## 內部驗收範本
+
+驗收與追溯使用 [架構驗收範本](assets/internal-ac-template.md) 或 [技術設計驗收範本](assets/internal-tdd-ac-template.md)，可作詳細測試案例並寫入 `docs/internal/<主題>/AC_List.md`；正式文件仍保留業務驗收條件、預期結果與追溯。內部交付自查和審核過程另存 `Delivery_Checklist.md`，不混入正式正文。Markdown 工作草稿可保留有標示的提案；正式文件移除未定案推測與討論過程，保留客觀背景及必要待確認事項。
+
+## 交付方式
+
+遵循使用者指定的路徑與格式；未指定時，在目前工作區的 `docs` 產出各文件的 Markdown 與必要圖表原始碼。只有開發者要求後才產出 Word／PDF；屆時使用可用的對應文件工具或技能並檢查版面，圖號在圖下、表號在表上；不可把 Markdown 改副檔名當成轉檔。缺少轉檔或繪圖工具時交付來源並明示尚未驗證的部分。
+
+完整交付通常包含主文件、圖表來源、簡短審查結果與待確認事項；小幅修改可在回覆中交代差異，不強制建立額外文件。保留外部來源連結；不要把內部資料或圖表送到未授權的公開服務。文件工作本身不代表授權部署、改程式或代替人員核准。
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "rg -n 'SonicLedger|TrackResampler|Imp1Imp3' 'C:/Users/jake4/.codex/memories/MEMORY.md'" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ exited 1 in 296ms:
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "Get-Content -LiteralPath 'C:/Users/jake4/.codex/skills/system-architecture-doc/references/review.md'; Get-Content -LiteralPath 'Agents/system-architecture.md'; Get-Content -LiteralPath 'Agents/business-logic.md'" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$paths = @('"'planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md','planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md','planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Review.md'); foreach ("'$p in $paths) { Write-Output "FILE: $p"; $n=0; Get-Content -LiteralPath $p | ForEach-Object { $n++; '"'{0,4}: {1}' -f "'$n,$_ }; Get-FileHash -LiteralPath $p }; git status --short; rg -n '"'Imp1|Imp3|TrackResampler|DSP' planning/ROADMAP.md" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 449ms:
+# 架構文件審查規準
+
+審查同時涵蓋設計完整性與合理性、與其他文件的架構矛盾及來源可靠性。正式正文不得混入內部討論、未定案推測或交付自查清單；業務驗收與追溯仍須依交付需求呈現。來源可靠性依確認狀態與主張檢查，不因內部來源而一律排除。委派其他 Agent 時要求第三方專家意見，提供位置、證據、影響與待討論問題，不以文字校對代替架構審核。
+
+本規準是 skill 的內部品質檢查，非 arc42、C4 或任何標準機構的認證。區分文件品質、設計風險、實作符合性；有文件證據不代表系統測試通過。
+
+## 審查維度
+
+| 維度 | 審查問題 | 有效判斷依據 |
+|---|---|---|
+| 需求與邊界 | 核心需求是否有設計落點？哪些事明確不做？ | 需求來源、追溯表、邊界與外部依賴 |
+| 證據與狀態 | 事實、假設、提案是否分開？現況屬哪一版本？ | 可重查的來源；量測與目標分離；矛盾有標記 |
+| 結構與責任 | 責任是否遺漏、重疊或無擁有者？ | 元件表、結構圖、資料擁有權與介面 |
+| 行為與資料 | 成功及適用失敗路徑能否實作？ | timeout／重試／冪等／交易／補償與人工流程 |
+| 品質與取捨 | 目標是否可驗證，設計是否支援？ | 品質情境、替代方案與代價，不只技術清單 |
+| 部署與營運 | 系統如何上線、觀測、處理故障？ | 環境映射、部署／遷移／回復、告警及還原方法 |
+| 存取與保護 | 權限在哪裡強制執行，資料跨何邊界？ | 授權位置、敏感資料處理、依賴信任及稽核 |
+| 圖文一致 | 同名是否同物，箭頭與內文是否矛盾？ | diagrams.md 的語意與渲染檢查 |
+| 可驗收性 | 如何證明需求達成，誰需提供什麼證據？ | 測試條件、指標、預期、結果狀態與來源 |
+
+每一維度標記「符合／部分符合／缺漏／不適用」，附位置與原因；不適用必須有上下文理由。使用者沒要求量化評分時不用百分比；若有指定評分表，採其權重，重大缺陷不可用其他分數抵銷。
+
+## 問題分級
+
+- **阻擋交付**：會讓讀者依錯誤事實做重大決定，或核心範圍完全不可判讀。例如虛構已驗證成果、重大圖文矛盾、核心介面／資料責任不明。阻擋的是正式交付判定，不是停止整理可用草稿。
+- **重大**：關鍵品質或操作路徑無法驗收，例如重試寫入但未交代重複效果、必須遷移卻沒有失敗回復策略。
+- **一般**：局部缺漏造成理解或維護困難，尚不影響主要方案判斷。
+- **建議**：可讀性或表達改善，非必要整改。
+
+根據具體系統風險調整級別；不要看到某個詞缺席就自動升級。只檢查使用者指定範圍，未檢查部分標為未審查。
+
+## 結論與門檻
+
+- **可送人員審查**：核心內容有足夠依據、無未解的阻擋／重大問題；提案與未知已清楚揭露。這不等同人員核准。
+- **需修訂**：存在足以影響設計、維運或驗收判斷的缺漏／矛盾。
+- **資訊不足，僅可作草稿**：現有證據不足以確認核心現況或需求，仍應交付已完成內容與具體補件清單。
+
+非關鍵未知可有明確後續而不妨礙送審；核心品質目標、關鍵契約或部署現況若是本次正式交付必需，不能用「待確認」掩蓋後宣告完成。
+
+## 問題輸出格式
+
+`問題 ID｜級別｜文件位置／圖號｜可觀察問題與證據｜實際影響｜具體修正｜修正後如何驗證`
+
+先列最高影響的問題，再給檢查範圍、已完成驗證與未驗證部分。缺漏用「文件未描述」；只有查到實作證據才說「系統未實作」。審查時不要把自己的技術偏好當成缺陷。
+# 系統架構
+
+```mermaid
+flowchart LR
+  subgraph Win["Windows（使用者權限）"]
+    subgraph App["sonicledger.exe"]
+      UI["WebView2<br/>React 前端"]
+      Core["Tauri 主執行緒<br/>commands / 事件"]
+      Audio["音訊執行緒<br/>AudioEngine"]
+      Scan["掃描（rayon 平行）"]
+      Listen["單一實例監聽<br/>127.0.0.1:47321"]
+      Tray["系統匣 / SMTC"]
+    end
+    DB[("data/app.db<br/>SQLite")]
+    Files["音樂檔、.lrc、data/covers"]
+    FF["ffmpeg.exe（PATH）"]
+    PS["powershell（檔案對話框）"]
+    Reg["HKCU 檔案關聯"]
+    Dev["音訊輸出裝置<br/>WASAPI 共享"]
+  end
+  Net["電台串流 URL"]
+
+  UI -- invoke / 250ms 輪詢 player_status --> Core
+  Core -- PlayerCommand（mpsc） --> Audio
+  Audio -- EngineSnapshot（Mutex） --> Core
+  Core -- Mutex<Connection> --> DB
+  Scan --> DB
+  Scan --> Files
+  Audio --> Files
+  Audio -- rodio / cpal --> Dev
+  Audio -- 電台 --> FF
+  FF --> Net
+  Core -- 轉檔 --> FF
+  Core --> PS
+  Core --> Reg
+  Listen -- open-file 事件 --> UI
+  Tray -- transport 事件 --> UI
+```
+
+## 啟動順序（`src-tauri/src/main.rs`）
+
+1. 寫入 HKCU 檔案關聯（`open_with::register_windows_association`，每次啟動都寫，exe 搬家後會自己更新）。
+2. 解析 argv 裡的音訊路徑。如果已經有一個實例在跑，就把路徑透過 `127.0.0.1:47321` 轉交給它，然後自己結束。
+3. 建立 `data/`、開啟 `data/app.db`，執行 `init_db`（缺欄才 `ALTER`，搜尋索引不符就重建）。
+4. 啟動音訊執行緒 `start_player_thread`。
+5. 建立 Tauri app，掛上 `DbState`、`PlayerState`、`OpenedFile`，在 `setup` 啟動單一實例監聽、系統匣與 SMTC。
+6. 關閉視窗時，前端 `onCloseRequested` 先寫入工作階段，再呼叫 `destroy()`。Rust 端有 3 秒的看門狗，視窗還在就強制 `exit(0)`。
+
+## 執行緒與溝通
+
+| 元件 | 執行緒 | 溝通方式 |
+|---|---|---|
+| React UI | WebView2 | `invoke`、`listen` |
+| commands | Tauri 執行緒池 | `DbState.conn: Mutex<Connection>` 一條連線 |
+| AudioEngine | 專屬執行緒，以 80ms `recv_timeout` 輪詢 | `PlayerCommand`（mpsc）進；`EngineSnapshot`（`Arc<Mutex>`）出 |
+| DspSource | cpal 輸出回呼（rodio 拉取） | 讀 `EqShared` 的版本號；寫 `played` 計數器（AtomicU64） |
+| 電台解碼 | 每台一條執行緒，跑 ffmpeg 子程序 | mpsc 傳 PCM 區塊；`AtomicBool` 停止 |
+| 單一實例監聽 | 背景執行緒 | TCP 收路徑 → 發 `open-file` 事件 |
+| 系統匣 / SMTC | Tauri / souvlaki | 發 `transport` 事件（toggle / prev / next） |
+
+`player_position` 固定回傳 0；播放位置只看 `player_status`。
+
+## 音訊管線
+
+```mermaid
+flowchart LR
+  F["檔案"] --> D{"長度 ≤ 15 分？"}
+  D -- 是 --> M["整首解碼成 Vec<f32><br/>（記憶體軌，算峰值）"]
+  D -- 否／不明 --> S["SymStream 逐封包<br/>（串流軌）"]
+  R["電台 URL"] --> FF["ffmpeg → s16le 44.1k 立體聲"]
+  M --> DSP
+  S --> DSP
+  FF --> DSP
+  subgraph DSP["DspSource（每 1024 frame 一個區塊）"]
+    direction LR
+    RT["速度／節奏／音高<br/>（電台略過）"] --> EQ["正規化＋前級＋18 段等化器"] --> FX["低音、高音增強、人聲消除、<br/>合唱、鑲邊、回音、殘響"] --> CL["限幅"]
+  end
+  DSP --> SINK["rodio Sink（音量）"] --> OUT["輸出裝置"]
+```
+
+- 解碼走 symphonia（`audio_decode.rs`），不用 rodio Decoder 開檔；rodio Decoder 只在 `catch_unwind` 裡當後備，而且 mp4 家族的格式不走這條。
+- 參數變更透過 `EqShared` 的版本號即時套用，不重開音源。只有 seek 與換裝置會重建 Sink 裡的音源。
+- 播放位置 = `seek_origin_ms + played`（已消耗的輸入 frame 扣掉緩衝），所以改速度時，進度仍然對應歌曲時間。
+
+## Symphonia 解碼限制（SE7）
+
+- 配置前封包上限預檢 `precheck_packet_budget(path)`：在 `SymStream::open()` 之前執行，讀取檔案標頭遍歷所有音軌與片段的宣告封包大小（MP4 解析 stsz box；其他格式無法可靠遍歷時回傳 Ok，fail-open，依賴 `refill()` 第二層防護）；若任何封包宣告大小超過 256 KB，不呼叫 `open()`，回傳錯誤。
+- `refill()` 第二層防護順序：取得封包 → 檢查 `packet.buf().len() > 256 KB`（超過即 `finished = true` 回傳 `false`）→ 音軌篩選 → `decoder.decode()`；大小檢查在音軌篩選之前，覆蓋所有音軌與後續片段。
+- 四個 `SymStream::open` 入口（`player.rs:405`、`playback_pipeline.rs:1586`、`next_track.rs:92,298`）均先呼叫 `precheck_packet_budget(path)`，超標則拒絕不呼叫 `open()`。
+- 解碼錯誤 `decode_errors` 欄位跨封包累計（`refill()` 迴圈內），超過 10 次即 `finished = true` 回傳 `false`；錯誤與成功封包交錯時仍繼續累計，不歸零。
+
+## 外部相依
+
+| 相依 | 用途 | 找不到時 |
+|---|---|---|
+| ffmpeg（PATH） | 電台、轉檔 | 明確顯示需要 ffmpeg，不假裝在播或已轉完 |
+| PowerShell | 資料夾與檔案對話框（`FolderBrowserDialog`、`OpenFileDialog`） | 回傳錯誤 |
+| `reg` | HKCU 檔案關聯 | 寫入失敗只記 log |
+| WebView2 | 介面 | Windows 10 1803 以上內建 |
+# 業務邏輯
+
+改行為之前先讀對應章節。每一條都是使用者確認過、或修過 bug 才定下來的規則。
+
+## 播放與播放模式
+
+```mermaid
+sequenceDiagram
+  participant U as 使用者
+  participant FE as Shell.tsx
+  participant AE as AudioEngine
+  U->>FE: 點兩下一首歌
+  FE->>AE: player_load(path, songId)（會開始播）
+  FE->>AE: player_play（保險）、player_set_volume(音量)
+  FE->>AE: 依模式決定是否 player_preload(下一首)
+  loop 每 250ms
+    FE->>AE: player_status
+    AE-->>FE: position、duration、ended、error…
+  end
+  AE-->>FE: ended = true（Sink 播空了）
+  alt 順序模式
+    FE-->>U: 停住，不接下一首
+  else 單曲循環
+    FE->>AE: 重新播同一首
+  else 全部循環／隨機
+    FE->>AE: player_load(下一首)
+  end
+```
+
+- 四種模式：**順序**（這首播完就停）、**全部循環**、**隨機**、**單曲循環**。模式按鈕旁要顯示文字，而且順序與全部循環的圖示和顏色要不同。
+- 手動按下一首永遠會換歌；單曲循環只在自然播完時重播同一首。
+- 引擎不能自己接預載的下一首（這會繞過模式）。之後做無縫播放時，改成「引擎只接前端依模式預載的那一首」。
+- `player_load` 會開始播；要停在某個位置但不出聲，用 `player_prepare`。先載入再暫停會漏出一點聲音。
+- `player_load` 之後要直接呼叫 `playerSetVolume(音量)`，不能用 `muted ? 0 : 音量`，否則剛開始播的聲音會被歸零。
+- 15 分鐘以上（或長度不明）的檔案用串流播放：不做峰值正規化，也不參與交叉淡化。交叉淡化只在兩首都是記憶體軌、而且模式是全部循環或隨機時混音。
+- symphonia 0.5 不會修剪 AAC 開頭的 2112 個 priming 樣本（約 44ms），這是固定的，不是 seek 的 bug。
+
+## 工作階段（重新開啟時接回進度）
+
+- 存在 `app_config.session`。只在暫停、切歌、關閉時寫入，位置最多每 5 秒寫一次；不在 250ms 輪詢時寫。
+- 啟動時停在上次的歌曲與位置，**不自動播放**。不存電台，也不自動重連電台。
+- 曲庫裡已經不存在的 id（歌曲或佇列）直接丟掉，不報錯。
+- 右鍵開啟與工作階段恢復同時發生時，以右鍵開啟的檔案為準：恢復流程的 token 要在任何 `await` 之前取樣（`openWithRestore.ts` 的 `sessionRestoreActions`）。
+
+## 右鍵開啟與拖放
+
+```mermaid
+sequenceDiagram
+  participant W as Windows
+  participant N as 新程序
+  participant R as 執行中的實例
+  participant FE as Shell.tsx
+  W->>N: sonicledger.exe "C:\a.flac"
+  N->>N: audio_arg() 從 argv 找出音訊路徑
+  alt 已經有實例在跑
+    N->>R: TCP 127.0.0.1:47321 傳送路徑
+    N-->>W: 結束
+    R->>FE: open-file 事件
+  else 第一個實例
+    N->>N: 路徑存入 OpenedFile
+    FE->>N: take_opened_file_cmd（啟動時與每 400ms）
+  end
+  FE->>FE: songByPath（包在 try/catch 裡）
+  alt 在曲庫裡
+    FE->>FE: playSong
+  else 不在曲庫裡
+    FE->>FE: 用原始路徑建一首臨時歌曲（ghost）並播放
+  end
+```
+
+- 支援的副檔名以 `open_with.rs` 的清單為準，而且必須跟實際能解碼的格式一致（目前不一致，P0-2 會處理）。
+- 開了視窗卻沒有出聲時，先看 `data/open-with.log`：沒有 argv 是檔案關聯的問題；有 `LOAD_ERR` 是解碼失敗；出現在 `LOAD_OK` 之後的 `CMD player_prepare`，代表工作階段恢復把剛開的歌換掉了。
+- 拖放用 `classify_drop_cmd` 分類：一個檔案就直接播；資料夾就加入曲庫並掃描；拖進歌單頁籤的多個檔案就加入那個歌單，而且不換目前播放的歌。
+
+## 曲庫與搜尋
+
+- 缺檔標成 `missing=1`，不刪除列；掃描一個資料夾時，不能標記資料夾以外的歌。
+- 音軌號與碟號存正整數或 NULL，不存 0。專輯檢視依碟號、音軌號、歌名排序；最近播放依播放時間排序。這兩個都不套用曲庫的排序鍵。
+- 搜尋：每個詞都要符合（AND）。3 個字以上用 FTS5 trigram `MATCH`（任意位置的子字串、不分大小寫）；1–2 個字改用 `LIKE`。比對範圍是曲名、歌手、專輯、去空白的拼音、拼音首字母。搜尋結果要套用到清單上，不能只存在本機狀態裡。
+- 歌曲清單必須虛擬捲動，10 萬首也不能一次畫成 DOM。
+- 封面路徑是檔案系統路徑，要用 Tauri 的 file-src 轉換才能顯示。
+
+## 掃描與標籤限制（SE7）
+
+- lofty 讀取標籤前設定單欄 ≤ 4 KB、總標籤 ≤ 16 KB 上限；超過 16 KB 的總標籤拒絕整檔入庫（`Rejected`），單欄超 4 KB 由 `limited_tag()` 第二層裁切並記 `ScanError`，不中斷其他欄位。
+- 不載入嵌入封面進記憶體：掃描前先執行 `has_embedded_cover_precheck(path)` 偵測 ID3v2 APIC、MP4 `covr`、FLAC 圖片區塊；偵測到嵌入封面直接拒絕入庫，不走 lofty 也不走 ffprobe 後備；`cover_path` 固定為 `None`。
+- 取樣率驗證 8000–384000 Hz、聲道 1–8，超出視為無效（含 0 值）；不使用 `.filter(|v| *v > 0)` 過濾零值，先檢查 0 值再檢查範圍，非法值拒絕入庫並記 `ScanError`。
+- ffprobe 後備讀取的標籤進入共同處理前，套用相同 4 KB／16 KB 預算。
+- 掃描結果契約：`ScanResult::Song(NewSong, Vec<ScanError>)` 正常入庫、`ScanResult::Rejected(Vec<ScanError>)` 拒絕入庫但錯誤仍彙整、`ScanResult::Skipped` 檔案系統層級跳過；單一檔案錯誤不導致整個掃描失敗。
+
+## 歌單
+
+- 頁籤就是工作區：開歌單會釘一個頁籤，關頁籤不會刪歌單；「全部歌曲」永遠在。開著的頁籤存在 `playlist_tabs`。
+- 側欄不放刪除按鈕；「全部歌曲」「最近播放」是檢視，不能刪。
+- 排序寫入用 `playlist_items.id`，不是 `song_id`。
+- 智慧歌單依規則重算，不存項目，不能拖曳或移除項目。規則只能用欄位白名單（`query_smart_playlist_songs`），不接受自由 SQL。
+- m3u：只處理 UTF-8 的 `.m3u` 與 `.m3u8`。相對路徑以 m3u 所在的資料夾展開。對不到的行逐一列出，不能默默丟掉。
+
+## 等化器與音效
+
+- 18 段半八度：31、63、87、125、175、250、350、500、700、1K、1.4K、2K、2.8K、4K、5.6K、8K、11K、16K。各段與前級都是 ±15 dB，有總開關（關閉時各段與前級都不作用）。
+- `design_gains` 解各段之間的互相干擾，讓每段中心頻率的實際響應等於推桿值；畫面上的曲線由 `eq_response_cmd` 用同一套算出來，不能在前端另算一套近似值。
+- 十種音效：速度、節奏、音高、低音、高音增強、人聲消除、合唱、鑲邊、回音、殘響。全部關閉時輸出要跟輸入逐樣本相同。速度、節奏、音高不作用於電台。
+- 改參數時不重開音源（不能每拖一下推桿就 `restart_from`）。
+- 預設 `{ name, bands, preamp?, bind? }`。種子是本播放器自己調的曲線，只在沒有同名預設時補上；使用者可以覆寫、刪除。
+- 自動套用的比對順序：綁定這首檔案 → 綁定這張專輯 → 綁定這個曲風 → 依曲風的內建建議 → 回退預設。每首歌只在換到它時套用一次，之後使用者手動調整不會被蓋回去。
+- 情境建議會一次替換等化器、前級與音效；音效從預設值開始覆寫，不保留上一個情境的設定。
+
+## 工具
+
+- **批次標籤**：只改歌手、專輯、曲風、年份，不在同一批裡改曲名或音軌號。失敗的檔案逐一列出，不能用「整批成功」帶過。
+- **轉檔**：本機有 ffmpeg 才執行，沒有就明說。mp3 顯示 128／192／320 kbps 選項，flac、wav、ogg 不顯示位元率。不顯示假的進度條。
+- **電台**：只收使用者貼的 http/https 網址，不內建電台目錄，也不猜 ICY 資訊；ICY 的 stream title 持續顯示。電台用 ffmpeg 轉成 PCM 播放，沒有 ffmpeg 就明說。
+
+## 視窗與系統整合
+
+- 輸出裝置：列得出裝置才顯示下拉選單。過濾掉螢幕、HDMI 音訊（NVIDIA High Definition Audio、Intel Display Audio、AMD High Definition Audio Device、Microsoft LifeCam），系統預設裝置排第一個。切換時從目前位置接著播，電台會重新連線。
+- 系統匣的「結束」會關閉視窗，讓關閉時的寫入照常執行。不搶全域的 `MediaPlayPause`（媒體鍵交給 SMTC）。設定裡不放媒體鍵開關。
+- 迷你模式：同一個視窗縮成 480×200 並置頂；還原時回到 1200×800，最小尺寸 900×600。
+- 睡眠計時：N 分鐘後暫停，或這首播完就停；只在視窗開著時有效。
+- 版面從 900×600 最小尺寸起都要能用：頁尾分兩列；清單依自己量到的寬度藏欄（小於 760 藏日期、小於 600 藏軌號與次數、小於 460 藏專輯）。
+
+hook: PostToolUse
+ exited 1 in 588ms:
+FILE: planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md
+   1: # [#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈 Design.md
+   2: 
+   3: > 本期的設計與實作步驟都在這份；審查紀錄在同資料夾的 `Review.md`。流程見根目錄 `AGENTS.md`。
+   4: 
+   5: ## 文件資訊表
+   6: 
+   7: | 項目 | 內容 |
+   8: |---|---|
+   9: | 版本 | v8 |
+  10: | 對應 Planning | `planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md` |
+  11: | 設計依據 | Planning Description / User Story / Expected behavior / Acceptance Criteria；`src-tauri/src/playback_pipeline.rs` PipeLine 註解（line 3-10）；`Agents/business-logic.md` 等化器與音效章節（line 99-108）；`Agents/system-architecture.md` 音訊管線圖（line 63-79） |
+  12: | 程式基準 | `src-tauri/src/playback_pipeline.rs`、`src-tauri/src/player.rs`、`src-tauri/src/dsp.rs` |
+  13: | 建立 | 2026-11-24 |
+  14: | 更新 | 2026-11-24（設計審查 Code 第 1 輪回應：v8 修正方法可見性、輸出佇列、process/pop_output 消耗契約、長檔載入入口、FxChain 參數刷新、FFmpeg 長檔後備路徑、EOF 狀態機、DSP 檢查點映射、區塊拉取說明） |
+  15: 
+  16: ## 需求對照表（R1…R4）
+  17: 
+  18: | 編號 | Planning 原文 | 現況 (`path:line`) | 設計決策 |
+  19: |---|---|---|---|
+  20: | R1 | `TrackResampler` 在長檔串流路徑中被配置（`set_track` 指定原生取樣率/聲道） | `player.rs:420-433` 已為長檔建立 `TrackResampler` 並呼叫 `set_track(Some(...))`，指定 `sample_rate`/`channels`；但 `track_chain` 為空 `TrackChain::new()`（line 435），長檔不經 TrackChain；FFmpeg 長檔分支（line 539-549）僅 `TrackResampler::new()`，尚未 `set_track`，且無 `RateStage` 建立 | **修正**：`player.rs` 長檔載入入口需補齊 `set_track` 與 `RateStage` 建立，涵蓋初次載入、手動換軌、seek 與自然交接（見 4.2）。 |
+  21: | R2 | `next_playing()` 中串流樣本也經過 `TrackResampler::process()` 重取樣到 48kHz | `playback_pipeline.rs:328-338` `next_playing()` 呼叫 `next_stream()` 取得串流樣本；若 `track_resampler` 為 `None`（line 337-338），則**繞過重取樣直接 `apply_dsp(sample)`**；且 `next_stream()` 單次回傳單一 `f32`，與立體聲幀處理未對齊 | **修正**：移除 `resampler` 為 `None` 的繞過路徑；長檔串流樣本必須經 `TrackResampler::process()` 重取樣到 48kHz 後再進入 DSP；以立體聲幀（L,R）一次交給 `apply_dsp`。 |
+  22: | R3 | `apply_dsp()` 套用 `FxChain`（含殘響、節奏、音高、回音等），不只 EQ 與正規化 | `playback_pipeline.rs:484-508` `apply_dsp()` 已套用 EQ 處理器 + `FxChain::frame` + 正規化；但 `FxChain`（`dsp.rs:274`）僅含 bass/enhancer/voice_remover/chorus/flanger/echo/reverb，**缺少速度/節奏/音高**（這三者在 `dsp.rs:540` `RateStage`，但只供 `DspSource` 使用，未併入 `PlaybackCore**）；且 `apply_dsp` 以單聲道幀 `[s]` 單一樣本送入 `FxChain`，立體聲右聲道未經音效處理 | **修正**：在 `PlaybackCore` 管線中加入 `RateStage`（速度/節奏/音高）；`apply_dsp()` 改為以立體聲幀 `[L, R]` 一次送入 `FxChain`，兩聲道都經音效；電台串流略過速度/節奏/音高（`allow_rate=false`，與 `Agents/business-logic.md` 第 99 條一致）。 |
+  23: | R4 | 長檔與短檔走同一條處理路徑 | `playback_pipeline.rs:328-393` `next_playing()` 中串流軌（`next_stream`）與 TrackChain 軌（`track_chain.next()`）走不同分支，匯合點僅在 `apply_dsp` | **統一**：串流軌與記憶體軌在 `TrackResampler` 產出 48kHz 立體聲樣本後匯合，同樣經 `apply_dsp()`（EQ → 速度/節奏/音高 → 音效 → 正規化 → 限幅），再進 `DeviceConverter` → `Sink`。 |
+  24: 
+  25: ## 架構變更圖
+  26: 
+  27: ```mermaid
+  28: flowchart LR
+  29:   subgraph LongFile[長檔串流軌（SymStream）]
+  30:     SF[SymStream 逐封包解碼<br/>原生取樣率/聲道] --> TR[TrackResampler<br/>重取樣到 48kHz 立體聲]
+  31:   end
+  32:   subgraph ShortFile[短檔記憶體軌（TrackChain）]
+  33:     TC[TrackChain 輸出原生樣本] --> TR2[TrackResampler<br/>重取樣到 48kHz 立體聲]
+  34:   end
+  35:   TR --> DSP[DSP（48kHz 立體聲）<br/>EQ → 速度/節奏/音高 → 音效 → 正規化 → 限幅]
+  36:   TR2 --> DSP
+  37:   DSP --> DC[DeviceConverter<br/>48kHz → 裝置取樣率]
+  38:   DC --> SK[rodio Sink → 輸出裝置]
+  39: ```
+  40: 
+  41: ## 詳細設計
+  42: 
+  43: ### 4.1 長檔串流必須經 TrackResampler 重取樣（R1、R2）
+  44: 
+  45: `playback_pipeline.rs` `next_playing()`：
+  46: 
+  47: - 現行 `next_stream()`（line 397-400）從 `stream_source` 取得單一 `f32` 原生樣本，線程安全地鎖定 `stream_source` Mutex。
+  48: - `PlaybackCore` 新增 `dsp_out: Mutex<VecDeque<f32>>` 輸出佇列（立體聲交錯），`next_playing()` 先消耗佇列，不足再拉上游。
+  49: - 修改 `next_playing()` 的串流軌分支（line 328-338）：
+  50:   1. 先從 `dsp_out` 佇列取樣本，若不足兩個（一立體聲幀 `[L, R]`），繼續執行步驟 2-4 直到夠兩個或上游結束。
+  51:   2. 呼叫 `next_stream()` 取得原生樣本。
+  52:   3. 鎖定 `track_resampler`，**必須**存在（長檔載入時 `player.rs:420` 已建立）；若為 `None` 回傳錯誤記錄並輸出靜音，不得繞過。
+  53:   4. 呼叫 `TrackResampler::process(&[sample]) -> Option<Vec<f32>>` 累積至 BLOCK_FRAMES（2048）後經 rubato 重取樣到 48kHz 立體聲交錯；回傳 `Some(vec)` 含零到多個聲道樣本，全部追加至 `dsp_out`；`None` 表示尚未累積滿一個輸出區塊（非靜音，非結束），繼續拉取上游。
+  54:   5. 從 `dsp_out` 取兩個樣本組成 `[L, R]`，送入 `apply_dsp_block()`（見 4.2）。
+  55: - 上游結束（`next_stream()` 回傳 `None`）且 `dsp_out` 耗盡後，進入軌結束流程（見 4.3）。
+  56: - 移除 line 337-338 的繞過路徑（`resampler` 為 `None` 時直接 `apply_dsp(sample)`）。
+  57: 
+  58: ### 4.2 apply_dsp_block 改為區塊輸入、零到多幀輸出並併入 RateStage（R3）
+  59: 
+  60: `playback_pipeline.rs`：
+  61: 
+  62: - `PlaybackCore` 新增欄位：
+  63:   - `rate_stage: Mutex<Option<RateStage>>`（`RateStage` 在 `crate::dsp`，`dsp.rs:540`）；
+  64:   - `dsp_out: Mutex<VecDeque<f32>>`（立體聲交錯輸出佇列，供 `next_playing()` 逐樣本消耗）；
+  65:   - `dsp_params: Mutex<Option<FxParams>>`（參數快照，命令執行緒更新，音訊執行緒讀取）。
+  66: - `PlaybackCore::new()`（line 135-162）中初始化 `rate_stage: Mutex::new(None)`、`dsp_out: Mutex::new(VecDeque::new())`、`dsp_params: Mutex::new(None)`。
+  67: - `dsp.rs` 需修正：`RateStage::new(channels: usize, sample_rate: u32)` 與 `RateStage::run(&mut self, input: &[f32], flush: bool, out: &mut Vec<f32>)` 目前為私有（line 547、550），須改為 `pub(crate)`，以便 `playback_pipeline.rs` 跨模組呼叫；`new()` 的 `channels` 參數為 `usize`，呼叫處傳入 `INTERNAL_CHANNELS as usize`。
+  68: - 軌載入/切換時（初次載入、手動換軌、seek、自然交接），建立 `RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE)`，並依 `FxParams` 設定 `allow_rate`（本地檔案 `true`，電台串流 `false`，與 `Agents/business-logic.md` 第 99 條一致）。
+  69: - `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`：餵入一區塊原始樣本（立體聲交錯），輸出零到多個處理後樣本追加至 `out`：
+  70:   1. 取得 `FxParams` 快照（`EqShared` 版本號，即時生效，參數不在區塊中途突變）；
+  71:   2. EQ（每聲道獨立，現有 `eq_processor`）；
+  72:   3. 速度/節奏/音高（`RateStage.run()`，依 `FxParams`；電台略過）；
+  73:   4. `FxChain` 音效（bass/enhancer/voice_remover/chorus/flanger/echo/reverb，立體聲幀 `&mut [f32; 2]`）；
+  74:   5. 正規化（`norm_gain`）；
+  75:   6. 限幅 `clamp(-1.0, 1.0)`。
+  76: - `next_playing()` 從 `dsp_out` 佇列取兩個樣本組成 `[L, R]` 幀；若不足兩個，繼續拉取上游 `next_stream()` → `TrackResampler::process()` → `apply_dsp_block()` 直到夠兩個或上游結束；上游結束且 `dsp_out` 耗盡則進入軌結束流程（見 4.3）。
+  77: - `FxChain::frame(f: &mut [f32])` 已依聲道索引處理（`dsp.rs:332-386`），傳入長度為 2 的切片即可正確處理左右聲道。
+  78: 
+  79: ### 4.3 軌切換與身分/邊界發布
+  80: 
+  81: - `TrackResampler.flush_tail()` / `commit_boundary()` / `set_track()` 在軌切換時已由 `sync_identity()`（line 412-481）序列化：先 flush_tail 舊軌尾端 → commit_boundary 寫入邊界 → set_track 切換到新軌。
+  82: - 軌切換時 `RateStage` 與舊軌尾端的處理順序（參考 `DspSource::fill()` EOF 路徑 `dsp.rs:659-669`）：`sync_identity()` 先以 `TrackResampler.flush_tail()` 將上游舊軌尾端移至 `pending_output`（`playback_pipeline.rs:432-444`）；舊軌尾端樣本先經 EQ（每聲道獨立，與 `apply_dsp()` 第 1 步一致），再以 `flush=false` 逐幀送入舊 `RateStage.run()`，讓 WSOLA / Resampler 正常累積與變速/變調處理；全部餵完後，以空輸入呼叫一次 `RateStage.run(&[], flush=true, ...)`，以 `wsola.drain_raw()` / `rs.drain_raw()` 排空內部殘餘（`dsp.rs:550-568`，與來源結束時 EOF 排空同路徑 `dsp.rs:659-669`）。步驟的 `run` 產出（已過 EQ 與 RateStage）僅經後續音效 → 正規化 → 限幅排出，不再重複進入 RateStage 或 EQ，與正常資料的 `apply_dsp()`（EQ → RateStage → 音效 → 正規化 → 限幅）於 RateStage 後方階段對齊，確保無縫；最後才捨棄舊 `RateStage` 並建立新實例。故重建不會截斷舊軌尾端。
+  83: - `boundary_in_48k` 由 `TrackResampler.boundary_in_48k()` 發布；`boundary_out_48k` 以舊軌最後一個 DSP 輸出幀的位置提交（DSP 檢查點映射列為待實作，`playback_pipeline.rs:53-55` 目前僅為註解，實際 453-455 行直接使用 `current_boundary_out_start()`，初值為 0）。
+  84: 
+  85: ### 4.4 錯誤處理
+  86: 
+  87: - `TrackResampler` 為 `None` 時（長檔載入失敗）：記錄 `log_line`，`next_playing()` 輸出靜音幀，不 panic。
+  88: - `RateStage` / `FxChain` 處理錯誤：現有 `log_line` 記錄，輸出靜音幀，不中斷播放。
+  89: - `next_stream()` 回傳 `None`（串流來源結束）：上游只 flush 一次（`flush_tail`）→ 全部尾端樣本先經 EQ → 舊 `RateStage`（`flush=false` 全部餵入，最後單次 `flush=true` 排空殘餘）→ 音效 → 正規化 → 限幅 → 進 `dsp_out`；`dsp_out` 耗盡後進入 `WaitingForNext`。`RateStage` 只終結一次，不可重複呼叫 `flush_tail()` 或再次 flush 上游（rubato `process_partial(None)` 是補零區塊，非「是否已排空」的查詢，重複呼叫會反覆產生輸出，無法穩定進入等待分支）。
+  90: 
+  91: ## IPC 指令契約變更
+  92: 
+  93: 本任務不新增或修改 Tauri IPC 指令；所有變更皆在 `PlaybackCore` 內部處理，對前端透明。
+  94: - 公開 Tauri command：無變更。
+  95: - 內部函式：`PlaybackCore::apply_dsp()` 簽名由 `apply_dsp(&self, sample: f32) -> f32` 變更為 `apply_dsp(&self, frame: &mut [f32; 2]) -> [f32; 2]`；`next_playing()` 內部調用方式相應調整。
+  96: - 事件：無變更。
+  97: 
+  98: ## 前端狀態與 UI 變更
+  99: 
+ 100: 無前端變更。速度/節奏/音高等音效參數已透過現有 `EqShared` 版本號即時套用（`Agents/business-logic.md` 第 104 條：改參數時不重開音源）。
+ 101: 
+ 102: ## 設計待確認事項
+ 103: 
+ 104: | 編號 | 事項 | 決定 | 理由 |
+ 105: |---|---|---|---|
+ 106: | Q1 | 速度/節奏/音高（`RateStage`）對本地長檔是否啟用？電台串流呢？ | **已決定：本地長檔啟用；電台串流 `allow_rate=false` 略過**。 | `Agents/business-logic.md` 第 99 條：「速度、節奏、音高不作用於電台。」長檔為本地檔案，應套用完整音效。 |
+ 107: | Q2 | `apply_dsp` 收到的 48kHz 樣本為立體聲交錯（`INTERNAL_CHANNELS=2`），`next_stream()` 單次回傳單一 `f32`，兩次呼叫組成一幀 `[L, R]` 是否正確？ | **已決定：正確**。`TrackResampler.process()` 輸出立體聲交錯樣本，`pop_output()` 依序回傳 L, R, L, R…；`next_playing()` 取兩次組成一幀。 | `playback_pipeline.rs:29` `INTERNAL_CHANNELS: u16 = 2`；`TrackResampler` `process()`/`pop_output()` 輸出交錯立體聲。 |
+ 108: | Q3 | 軌切換時 `RateStage` 的 WSOLA tail / Resampler 緩衝需 flush 否？ | **已決定：上游舊軌尾端先經 EQ，再以 `flush=false` 全部餵入舊 `RateStage`，全部餵完後以空輸入呼叫一次 `flush=true` 排空殘餘，保留輸出後再捨棄並重建。** | 軌切換順序：`sync_identity()` 先以 `TrackResampler.flush_tail()` 將上游舊軌尾端移至 `pending_output`（`playback_pipeline.rs:432-444`）；舊軌尾端樣本先經 EQ（每聲道獨立，與 `apply_dsp()` 第 1 步一致），再以 `flush=false` 逐幀送入舊 `RateStage.run()`，全部餵完後以空輸入呼叫一次 `RateStage.run(&[], flush=true, ...)`，以 `wsola.drain_raw()` / `rs.drain_raw()` 排空內部殘餘（`dsp.rs:550-568`，與來源結束時 EOF 排空同路徑 `dsp.rs:659-669`）；`run` 產出僅經後續音效 → 正規化 → 限幅排出，不再重複進入 RateStage 或 EQ，與正常資料 `apply_dsp()`（EQ → RateStage → 音效 → 正規化 → 限幅）於 RateStage 後方階段對齊，確保無縫；最後才捨棄舊 `RateStage` 並建立新實例。故重建不會截斷舊軌尾端。 |
+ 109: 
+ 110: Q1-Q3 均已決定，可送審。
+ 111: 
+ 112: ## 驗收條件對照
+ 113: 
+ 114: | AC 編號 | Planning 條件 | 設計對應 | 測試方式 |
+ 115: |---|---|---|---|
+ 116: | AC1 | 長檔串流樣本經 TrackResampler 重取樣到 48kHz | R1、R2 → `playback_pipeline.rs` `next_playing()` 串流軌分支，移除繞過路徑 | 單元測試：建立長檔串流來源（未知長度或 >15 分鐘），確認 `next_playing()` 的輸出樣本經過 `TrackResampler::process()`（非直接 `apply_dsp(raw_sample)`）；驗證輸出為 48kHz 立體聲 |
+ 117: | AC2 | `apply_dsp()` 套用 FxChain（含殘響、節奏、音高、回音等） | R3 → `playback_pipeline.rs` `apply_dsp()` 加入 `RateStage`（速度/節奏/音高）並以立體聲幀送入 `FxChain` | 單元測試：分別驗證 `tempo != 1.0`（樣本數變、音高不變）、`pitch != 0.0`（樣本數不變、內容變）、`speed != 1.0`（兩者皆變）、`reverb_on`（殘疊尾音）、`echo_on`（延遲重複）；全部關閉時為 bit-exact passthrough |
+ 118: | AC3 | `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過 | — | 執行測試命令，0 失敗 |
+ 119: | AC4 | `npx tauri build` 成功 | — | 執行 `npx tauri build`，exe 產出並含新的 `dist/assets/index-*.js` |
+ 120: 
+ 121: ## 風險對策表
+ 122: 
+ 123: | 風險 | 可能性 | 影響 | 對策 |
+ 124: |---|---|---|---|
+ 125: | `RateStage` WSOLA 在串流軌上累積過多緩衝，導致延遲 | 中 | 中 | `RateStage.run()` 本身依輸入量產出，不主動累積；`next_playing()` 以 1024-frame 區塊拉取，天然背壓 |
+ 126: | 軌切換時 `RateStage` 殘餘樣本混入下一軌 | 低 | 中 | 軌切換時重新建立 `RateStage`（Q3 已決定） |
+ 127: | `apply_dsp` 改為立體聲幀後，單聲道來源（串流軌可能為單聲道）聲道對齊錯誤 | 低 | 中 | `TrackResampler` 輸出固定 `INTERNAL_CHANNELS=2` 立體聲交錯，單聲道輸入已在 `process()` 中以聲道 0 填充（`playback_pipeline.rs:961` `if c < ch { c } else { 0 }`） |
+ 128: | `npx tauri build` 失敗（TypeScript 型別不對齊） | 低 | 中 | 本任務無前端變更，不影響 `src/types.ts` |
+ 129: 
+ 130: ## 實作順序建議
+ 131: 
+ 132: ```mermaid
+ 133: flowchart LR
+ 134:   A[playback_pipeline.rs: PlaybackCore 新增 rate_stage 欄位，new() 初始化] --> B[playback_pipeline.rs: apply_dsp 改為立體聲幀 [L,R]，加入 RateStage]
+ 135:   B --> C[playback_pipeline.rs: next_playing() 串流軌分支移除 resampler 繞過，取兩次 pop_output 組成一幀]
+ 136:   C --> D[playback_pipeline.rs: 軌切換時重新建立 RateStage，依 FxParams 設定 allow_rate]
+ 137:   D --> E[cargo test --release 驗證]
+ 138:   E --> F[npx tauri build 驗證]
+ 139: ```
+ 140: 
+ 141: ## 測試案例表
+ 142: 
+ 143: | 測試案例 | 對應 AC | 類型 | 驗證重點 |
+ 144: |---|---|---|---|
+ 145: | 長檔串流樣本經 TrackResampler 重取樣 | AC1 | 單元測試 | 模擬 SymStream 迭代器（未知長度），確認 `next_playing()` 輸出經過 `TrackResampler::process()`（非直接 `apply_dsp(raw)`），輸出為 48kHz 立體聲交錯 |
+ 146: | 串流軌 resampler 為 None 時不繞過 | AC1 | 單元測試 | `track_resampler` 設為 `None`，確認輸出靜音並記錄錯誤，不直接處理原始樣本 |
+ 147: | `apply_dsp_block` 區塊輸入、零到多幀輸出 | AC2 | 單元測試 | 餵入區塊，確認輸出樣本數可變（WSOLA 累積後成批產出），非固定一幀 |
+ 148: | `dsp_out` 佇列先進先出 | AC1 | 單元測試 | 確認 `next_playing()` 先從 `dsp_out` 取樣本，不足再拉上游，不插入靜音 |
+ 149: | `apply_dsp` 立體聲幀處理 | AC2 | 單元測試 | 輸入 `[L, R]` 幀，確認左右聲道皆經 `FxChain` 處理（聲道索引 0 與 1 皆被使用） |
+ 150: | 速度/節奏/音高參數生效（分別驗證） | AC2 | 單元測試 | `tempo != 1.0`：輸出樣本數變化、音高不變；`pitch != 0.0`：樣本數不變、內容變化；`speed != 1.0`：樣本數與內容皆變；`reverb_on`：輸出殘疊尾音；`echo_on`：輸出延遲重複 |
+ 151: | 全部音效關閉為 bit-exact passthrough | AC2 | 單元測試 | 所有 FxParams 為預設關閉狀態，`apply_dsp_block([L, R])` 輸出等於輸入 |
+ 152: | 軌切換 EOF 一次性排空 | AC2 | 單元測試 | 確認舊軌尾端經 EQ → `flush=false` 全部餵入舊 `RateStage` → 單次 `flush=true` 排空，產出僅走後段音效／正規化／限幅，不重複 EQ 或 RateStage |
+ 153: | `cargo test --release` 全過 | AC3 | 建置驗證 | 0 失敗 |
+ 154: | `npx tauri build` 成功 | AC4 | 建置驗證 | exe 產出 |
+ 155: 
+ 156: ## 變更檔案清單
+ 157: 
+ 158: | 檔案 | 變更類型 | 說明 |
+ 159: |---|---|---|
+ 160: | `src-tauri/src/playback_pipeline.rs` | 需修正 | `PlaybackCore` 新增 `rate_stage: Mutex<Option<RateStage>>`、`dsp_out: Mutex<VecDeque<f32>>`、`dsp_params: Mutex<Option<FxParams>>`；`new()` 初始化；`apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)` 改為餵入區塊、輸出零到多幀，併入 RateStage（速度/節奏/音高）；`next_playing()` 串流軌分支移除 `resampler` 為 `None` 的繞過路徑，先從 `dsp_out` 取樣本，不足再拉上游；軌載入/切換時建立 `RateStage`，依 `FxParams.allow_rate` 設定 |
+ 161: | `src-tauri/src/dsp.rs` | 需修正 | `RateStage::new(channels: usize, sample_rate: u32)` 與 `RateStage::run(&mut self, input: &[f32], flush: bool, out: &mut Vec<f32>)` 改為 `pub(crate)`（line 540, 547, 550）；`new()` 的 `channels` 參數為 `usize`，呼叫處傳入 `INTERNAL_CHANNELS as usize` |
+ 162: | `src-tauri/src/player.rs` | 需修正 | FFmpeg 長檔分支（line 539-549）需建立 `RateStage` 並呼叫 `set_track`，與短檔同一來源安裝入口；Symphonia 失敗後備路徑需納入統一安裝流程（見發現 F6） |
+ 163: | `src-tauri/src/` 其他 | 無 | 無前端、無 IPC、無資料庫變更 |
+ 164: 
+ 165: ## 回寫 Agents/ 文件規劃
+ 166: 
+ 167: 交付前需同步更新：
+ 168: - `Agents/system-architecture.md`：音訊管線圖中 DSP 子圖加入「速度/節奏/音高（RateStage）」；註記長檔串流軌必經 TrackResampler
+ 169: - `Agents/business-logic.md`：第 99 條等化器與音效章節已涵蓋 10 種音效，確認長檔串流軌亦走完整 DSP 鏈（無須增修，僅確認一致）
+ 170: - `planning/ROADMAP.md`：將 P0 `[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈` 標記為完成
+ 171: 
+ 172: ## 審查記錄區
+ 173: 
+ 174: ### 設計審查（實作前）
+ 175: 
+ 176: | 階段 | 結論 | 發現編號 | 修正狀態 |
+ 177: |---|---|---|---|
+ 178: | Spec | 通過 | SC#1、SC#2 | 皆已關閉（v7） |
+ 179: | Code | 不通過（第 1 輪） | F1–F9 | v8 修正中（見修正追蹤表） |
+ 180: | Security | — | — | — |
+ 181: 
+ 182: ### 實作審查（實作後）
+ 183: 
+ 184: | 階段 | 結論 | 發現編號 | 修正狀態 |
+ 185: |---|---|---|---|
+ 186: | Spec | — | — | — |
+ 187: | Code | — | — | — |
+ 188: | Security | — | — | — |
+ 189: 
+ 190: 修正追蹤表：編號 / 來源 / 修正動作 / Design.md 對應位置 / 狀態
+ 191: 
+ 192: | 編號 | 來源 | 修正動作 | Design.md 對應位置 | 狀態 |
+ 193: |---|---|---|---|---|
+ 194: | F1 | Code 審查第 1 輪 | `RateStage::new()`、`run()` 改為 `pub(crate)`；`new()` channels 參數為 `usize`；`dsp.rs` 列入變更清單 | 4.2、變更檔案清單 | 修正中（v8） |
+ 195: | F2 | Code 審查第 1 輪 | `apply_dsp` 改為 `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`，餵入區塊輸出零到多幀；`PlaybackCore` 新增 `dsp_out` 佇列 | 4.1、4.2 | 修正中（v8） |
+ 196: | F3 | Code 審查第 1 輪 | `process()`/`pop_output()` 改為「先消耗 `dsp_out`，不足再拉上游」；`None` 表示未滿區塊而非靜音，繼續拉取 | 4.1 | 修正中（v8） |
+ 197: | F4 | Code 審查第 1 輪 | RateStage 建立時機涵蓋初次載入、手動換軌、seek、自然交接；新增 PlaybackCore 載入入口 | 4.2 | 修正中（v8） |
+ 198: | F5 | Code 審查第 1 輪 | PlaybackCore 新增 `dsp_params` 快照，命令執行緒更新、`apply_dsp_block` 讀取快照供 RateStage 與 FxChain 使用 | 4.2 | 修正中（v8） |
+ 199: | F6 | Code 審查第 1 輪 | FFmpeg 長檔分支建立 `RateStage` 並 `set_track`；Symphonia 後備路徑納入統一安裝入口 | 變更檔案清單（player.rs）、4.2 | 修正中（v8） |
+ 200: | F7 | Code 審查第 1 輪 | EOF 狀態：上游 flush 一次 → 全部尾段經 EQ／舊 RateStage → RateStage 只終結一次 → 排完 `dsp_out` → 進 WaitingForNext；不可重複 flush_tail | 4.3 | 修正中（v8） |
+ 201: | F8 | Code 審查第 1 輪 | DSP 檢查點映射列為待實作；以舊軌最後一個 DSP 輸出幀位置提交邊界 | 4.3、76 行註解 | 修正中（v8） |
+ 202: | F9 | Code 審查第 1 輪 | 區塊數值改為 2048（與管線一致）；尾段用游標或佇列批次消耗；需量測換軌最壞耗時 | 4.1、風險對策表 | 修正中（v8） |
+
+Algorithm       Hash                                                                   Path
+---------       ----                                                                   ----
+SHA256          AA0FBE096333F8EB28BA43DE79FC3FA7B3AE6EE2679AC48CFEE1E67EEE61858E       C:\tempDevelopmenyEnviroment\La…
+FILE: planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md
+   1: <!-- 本文件為規劃文件，不完全是實作依據。 -->
+   2: 
+   3: # [#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈
+   4: 
+   5: ## Description
+   6: 長檔（串流軌）繞過 TrackResampler，直接進入輸出，未經重取樣到固定 48kHz。`apply_dsp()` 僅套用 EQ 與正規化，缺少殘響、節奏、音高、回音等 DSP 鏈。長檔播放時無法走 TrackChain→TrackResampler→DSP→DeviceConverter→Sink 的長駐管線。
+   7: 
+   8: ## User Story
+   9: 作為使用者，播放超過 15 分鐘或長度不明的音檔時，樣本應經 TrackResampler 重取樣到 48kHz 後再進入 DSP 與輸出；DSP 鏈應包含除 EQ/正規化外的音效（殘響、節奏、音高、回音等），長檔與短檔走同一條處理路徑。
+  10: 
+  11: ## To Reproduce
+  12: 不適用（非 bug）。
+  13: 
+  14: ## Expected behavior
+  15: - `TrackResampler` 在長檔串流路徑中被配置（`set_track` 指定原生取樣率/聲道）；
+  16: - `next_playing()` 中串流樣本也經過 `TrackResampler::process()` 重取樣到 48kHz；
+  17: - `apply_dps()` 套用 `FxChain`（殘響、節奏、音高、回音等），不只 EQ 與正規化。
+  18: 
+  19: ## Acceptance Criteria
+  20: - [ ] 長檔串流樣本經 TrackResampler 重取樣到 48kHz；
+  21: - [ ] `apply_dsp()` 套用 FxChain（含殘響、節奏、音高、回音等）；
+  22: - [ ] `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過；
+  23: - [ ] `npx tauri build` 成功。
+  24: 
+  25: ## Additional context
+  26: - 相關檔案：`src-tauri/src/playback_pipeline.rs`、`src-tauri/src/player.rs`、`src-tauri/src/dsp.rs`
+  27: - 審查來源：Review.md Imp#1、Imp#3（Spec 第 3 輪實作審查）；Compacted Summary 中「仍待解決」列表
+  28: - 設計參考：planning/P0-daily-blockers/design.md Imp#1、Imp#3 章節
+SHA256          1DDB64FB700A5AC1A1F176F58F6CFF9831B75923A4C8311D95761AA692499B68       C:\tempDevelopmenyEnviroment\La…
+FILE: planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Review.md
+   1: # [#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈 Review.md
+   2: 
+   3: > 審查紀錄：設計審查（實作前）→ 實作審查（實作後），各分 Spec／Code／Security 三階段。流程見根目錄 `AGENTS.md`。
+   4: 
+   5: ## 設計審查（實作前）
+   6: 
+   7: ### Spec 階段
+   8: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+   9: |---|---|---|---|---|---|---|
+  10: | SC#1 | 重要 | Design.md 測試案例表「速度/節奏/音高參數生效」 | AC2 單元測試僅斷言「輸出樣本數與內容發生變化」，無法分別證明節奏、音高、速度、回音、殘響各自是否生效 | Design.md v1 測試案例表第 4 行（`planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md`） | 將 AC2 測試拆分為分別驗證：`tempo != 1.0`（樣本數變、音高不變）、`pitch != 0.0`（樣本數不變、內容變）、`speed != 1.0`（兩者皆變）、`reverb_on`（殘疊尾音）、`echo_on`（延遲重複） | 已修正（v2：測試案例表拆分為分別驗證） |
+  11: | SC#2 | 次要 | Design.md 設計待確認事項 Q1–Q3 | Q3「重新建立 RateStage、捨棄舊實例」缺乏可追溯依據，可能截斷舊軌尾端 | Design.md v6 Q3 理由欄（`planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md`） | 更正 Q3：上游舊軌尾端先經 EQ，再以 `flush=false` 全部餵入舊 `RateStage`，全部餵完後以空輸入呼叫一次 `flush=true` 排空殘餘（`dsp.rs:550-568`、`dsp.rs:659-669`）；`run` 產出僅經後續音效→正規化→限幅排出，不再重複進入 RateStage 或 EQ，與 `apply_dsp()`（EQ→RateStage→音效→正規化→限幅）於 RateStage 後方階段對齊 | 已修正（v7：Q3 補上先經 EQ＋flush=false 全部餵入＋單次 flush=true 排空，順序與 apply_dsp 對齊） |
+  12: 
+  13: 結論：通過（SC#1、SC#2 皆已關閉，v7 Design Spec 審查通過）
+  14: 
+  15: ### Code 階段
+  16: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+  17: |---|---|---|---|---|---|---|
+  18: | F1 | 阻擋 | Design.md:60-62、151（v7）→ v8 已修正 | `RateStage::new()`、`run()` 為私有方法，僅型別可見 | `src-tauri/src/dsp.rs:540` 為 `pub(crate) struct`，但 547、550 行的 `new()`、`run()` 都是私有方法 | 將 `new()`、`run()` 改為 `pub(crate)`，傳入 `INTERNAL_CHANNELS as usize`；`dsp.rs` 列入變更清單 | 修正中（v8） |
+  19: | F2 | 阻擋 | Design.md:63-69、88、110（v7）→ v8 已修正 | `apply_dsp(&mut [f32; 2]) -> [f32; 2]` 一進一出契約不足以承接 RateStage | `src-tauri/src/dsp.rs:499-527` WSOLA 先累積再成批產出；`550-576` 可變數量樣本追加至 Vec | 改為 `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`；PlaybackCore 保留 `dsp_out` 佇列 | 修正中（v8） |
+  20: | F3 | 阻擋 | Design.md:49-53、69、100（v7）→ v8 已修正 | `process()` 與 `pop_output()` 消耗契約未對齊；把區塊未滿當成靜音會插入額外音訊時間 | `src-tauri/src/playback_pipeline.rs:944-953、985` `process(input)` 已餵入樣本並自行呼叫 `pop_output()` | 先從 `dsp_out` 取樣本，不足再拉上游；`None` 表示未滿區塊而非靜音 | 修正中（v8） |
+  21: | F4 | 阻擋 | Design.md:61-62、129、150（v7）→ v8 已修正 | RateStage 建立時機未涵蓋長檔初次載入 | `src-tauri/src/player.rs:420-435` 長檔使用空 TrackChain；`playback_pipeline.rs:413-417` `sync_identity()` 遇到沒有目前軌就返回 | 軌載入/切換時（初次載入、手動換軌、seek、自然交接）建立 RateStage，依 `FxParams.allow_rate` 設定 | 修正中（v8） |
+  22: | F5 | 阻擋 | Design.md:66、93、110（v7）→ v8 已修正 | 「參數已透過版本號即時套用」不適用於現有 PlaybackCore 的 FxChain | `src-tauri/src/player.rs:159-160` 只建立預設 FxChain；899-900 僅更新 EqShared；`playback_pipeline.rs:494-500` 直接呼叫 `frame()`，沒有刷新參數 | PlaybackCore 新增 `dsp_params` 快照，命令執行緒更新，`apply_dsp_block` 讀取快照供 RateStage 與 FxChain 使用 | 修正中（v8） |
+  23: | F6 | 阻擋 | Design.md:20、50、152（v7）→ v8 已修正 | FFmpeg 長檔與 Symphonia 失敗後備路徑未納入 RateStage 建立 | `src-tauri/src/player.rs:468、471-472` FFmpeg 準備流程；539-549 長檔分支只呼叫 `TrackResampler::new()`，沒有 `set_track` | FFmpeg 長檔分支建立 RateStage 並呼叫 `set_track`；Symphonia 後備路徑納入統一安裝入口 | 修正中（v8） |
+  24: | F7 | 阻擋 | Design.md:75、82、101（v7）→ v8 已修正 | 不能直接沿用現行 EOF 流程保證「排空後進入 WaitingForNext」 | `src-tauri/src/playback_pipeline.rs:358-372` 每次遇到鏈結束都呼叫 `flush_tail()`；rubato `process_partial(None)` 是補零區塊，非查詢是否排空 | 上游只 flush 一次 → 全部尾段經 EQ／舊 RateStage → RateStage 只終結一次 → 排完 `dsp_out` → 進 WaitingForNext；不可重複 `flush_tail` | 修正中（v8） |
+  25: | F8 | 重要 | Design.md:76（v7）→ v8 已修正 | DSP 檢查點映射僅為註解依據，無對應實作 | `src-tauri/src/playback_pipeline.rs:53-55` 是註解；實際 453-455 行直接使用 `current_boundary_out_start()`，初值為 0 | 將映射列為待實作；以舊軌最後一個 DSP 輸出幀位置提交邊界 | 修正中（v8） |
+  26: | F9 | 重要 | Design.md:75、118（v7）→ v8 已修正 | 1024-frame 區塊拉取、天然背壓不足以證明不阻塞回呼 | `src-tauri/src/playback_pipeline.rs:31、1201、1214-1218` 核心鎖內拉取 2048 幀 | 區塊數值改為 2048；尾段用游標或佇列批次消耗；需量測換軌最壞耗時 | 修正中（v8） |
+  27: | Code 審查第 1 輪 | 不通過 | — | — | — | — | F1–F9 皆在 v8 已修正，等 v8 複查確認 |
+  28: 
+  29: ### Security 階段
+  30: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+  31: |---|---|---|---|---|---|---|
+  32: | — | — | — | — | — | — | 待審查 |
+  33: 
+  34: ## 實作審查（實作後）
+  35: 
+  36: ### Spec 階段
+  37: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+  38: |---|---|---|---|---|---|---|
+  39: | — | — | — | — | — | — | — |
+  40: 
+  41: ### Code 階段
+  42: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+  43: |---|---|---|---|---|---|---|
+  44: | — | — | — | — | — | — | — |
+  45: 
+  46: ### Security 階段
+  47: | # | 嚴重度 | 位置 | 問題 | 證據 | 建議 | 結論 |
+  48: |---|---|---|---|---|---|---|
+  49: | — | — | — | — | — | — | — |
+SHA256          9AB0827EE3D4DFECD0E983CE1B6DEAA5AA4C1D8DDC7D1221FD16E8F4EBDB3040       C:\tempDevelopmenyEnviroment\La…
+fatal: detected dubious ownership in repository at 'C:/tempDevelopmenyEnviroment/LaiFlashTune/SonicLedger'
+'C:/tempDevelopmenyEnviroment/LaiFlashTune/SonicLedger' is owned by:
+	'S-1-5-21-244975155-651716992-683226146-1001'
+but the current user is:
+	'S-1-5-21-244975155-651716992-683226146-1006'
+To add an exception for this directory, call:
+
+	git config --global --add safe.directory C:/tempDevelopmenyEnviroment/LaiFlashTune/SonicLedger
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PostToolUse Completed
+codex
+已讀取並套用 `dev-workflow`、`system-documentation-standard`（含完整核心規範）與 `system-architecture-doc`。本輪會區分「修正追蹤表已回應」與「正文契約足以實作」，尤其核對區塊消耗、EOF 排空及 DSP 參數更新。
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md'; "'$n=0; Get-Content -LiteralPath $p | ForEach-Object { $n++; if ($n -le 110) { '"'{0,4}: {1}' -f "'$n,$_ } }; Get-Content -LiteralPath '"'planning/ROADMAP.md'; rg -n 'fn |struct |BLOCK_FRAMES|dsp|fx|resampler|streaming' src-tauri/src/playback_pipeline.rs" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 525ms:
+   1: # [#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈 Design.md
+   2: 
+   3: > 本期的設計與實作步驟都在這份；審查紀錄在同資料夾的 `Review.md`。流程見根目錄 `AGENTS.md`。
+   4: 
+   5: ## 文件資訊表
+   6: 
+   7: | 項目 | 內容 |
+   8: |---|---|
+   9: | 版本 | v8 |
+  10: | 對應 Planning | `planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md` |
+  11: | 設計依據 | Planning Description / User Story / Expected behavior / Acceptance Criteria；`src-tauri/src/playback_pipeline.rs` PipeLine 註解（line 3-10）；`Agents/business-logic.md` 等化器與音效章節（line 99-108）；`Agents/system-architecture.md` 音訊管線圖（line 63-79） |
+  12: | 程式基準 | `src-tauri/src/playback_pipeline.rs`、`src-tauri/src/player.rs`、`src-tauri/src/dsp.rs` |
+  13: | 建立 | 2026-11-24 |
+  14: | 更新 | 2026-11-24（設計審查 Code 第 1 輪回應：v8 修正方法可見性、輸出佇列、process/pop_output 消耗契約、長檔載入入口、FxChain 參數刷新、FFmpeg 長檔後備路徑、EOF 狀態機、DSP 檢查點映射、區塊拉取說明） |
+  15: 
+  16: ## 需求對照表（R1…R4）
+  17: 
+  18: | 編號 | Planning 原文 | 現況 (`path:line`) | 設計決策 |
+  19: |---|---|---|---|
+  20: | R1 | `TrackResampler` 在長檔串流路徑中被配置（`set_track` 指定原生取樣率/聲道） | `player.rs:420-433` 已為長檔建立 `TrackResampler` 並呼叫 `set_track(Some(...))`，指定 `sample_rate`/`channels`；但 `track_chain` 為空 `TrackChain::new()`（line 435），長檔不經 TrackChain；FFmpeg 長檔分支（line 539-549）僅 `TrackResampler::new()`，尚未 `set_track`，且無 `RateStage` 建立 | **修正**：`player.rs` 長檔載入入口需補齊 `set_track` 與 `RateStage` 建立，涵蓋初次載入、手動換軌、seek 與自然交接（見 4.2）。 |
+  21: | R2 | `next_playing()` 中串流樣本也經過 `TrackResampler::process()` 重取樣到 48kHz | `playback_pipeline.rs:328-338` `next_playing()` 呼叫 `next_stream()` 取得串流樣本；若 `track_resampler` 為 `None`（line 337-338），則**繞過重取樣直接 `apply_dsp(sample)`**；且 `next_stream()` 單次回傳單一 `f32`，與立體聲幀處理未對齊 | **修正**：移除 `resampler` 為 `None` 的繞過路徑；長檔串流樣本必須經 `TrackResampler::process()` 重取樣到 48kHz 後再進入 DSP；以立體聲幀（L,R）一次交給 `apply_dsp`。 |
+  22: | R3 | `apply_dsp()` 套用 `FxChain`（含殘響、節奏、音高、回音等），不只 EQ 與正規化 | `playback_pipeline.rs:484-508` `apply_dsp()` 已套用 EQ 處理器 + `FxChain::frame` + 正規化；但 `FxChain`（`dsp.rs:274`）僅含 bass/enhancer/voice_remover/chorus/flanger/echo/reverb，**缺少速度/節奏/音高**（這三者在 `dsp.rs:540` `RateStage`，但只供 `DspSource` 使用，未併入 `PlaybackCore**）；且 `apply_dsp` 以單聲道幀 `[s]` 單一樣本送入 `FxChain`，立體聲右聲道未經音效處理 | **修正**：在 `PlaybackCore` 管線中加入 `RateStage`（速度/節奏/音高）；`apply_dsp()` 改為以立體聲幀 `[L, R]` 一次送入 `FxChain`，兩聲道都經音效；電台串流略過速度/節奏/音高（`allow_rate=false`，與 `Agents/business-logic.md` 第 99 條一致）。 |
+  23: | R4 | 長檔與短檔走同一條處理路徑 | `playback_pipeline.rs:328-393` `next_playing()` 中串流軌（`next_stream`）與 TrackChain 軌（`track_chain.next()`）走不同分支，匯合點僅在 `apply_dsp` | **統一**：串流軌與記憶體軌在 `TrackResampler` 產出 48kHz 立體聲樣本後匯合，同樣經 `apply_dsp()`（EQ → 速度/節奏/音高 → 音效 → 正規化 → 限幅），再進 `DeviceConverter` → `Sink`。 |
+  24: 
+  25: ## 架構變更圖
+  26: 
+  27: ```mermaid
+  28: flowchart LR
+  29:   subgraph LongFile[長檔串流軌（SymStream）]
+  30:     SF[SymStream 逐封包解碼<br/>原生取樣率/聲道] --> TR[TrackResampler<br/>重取樣到 48kHz 立體聲]
+  31:   end
+  32:   subgraph ShortFile[短檔記憶體軌（TrackChain）]
+  33:     TC[TrackChain 輸出原生樣本] --> TR2[TrackResampler<br/>重取樣到 48kHz 立體聲]
+  34:   end
+  35:   TR --> DSP[DSP（48kHz 立體聲）<br/>EQ → 速度/節奏/音高 → 音效 → 正規化 → 限幅]
+  36:   TR2 --> DSP
+  37:   DSP --> DC[DeviceConverter<br/>48kHz → 裝置取樣率]
+  38:   DC --> SK[rodio Sink → 輸出裝置]
+  39: ```
+  40: 
+  41: ## 詳細設計
+  42: 
+  43: ### 4.1 長檔串流必須經 TrackResampler 重取樣（R1、R2）
+  44: 
+  45: `playback_pipeline.rs` `next_playing()`：
+  46: 
+  47: - 現行 `next_stream()`（line 397-400）從 `stream_source` 取得單一 `f32` 原生樣本，線程安全地鎖定 `stream_source` Mutex。
+  48: - `PlaybackCore` 新增 `dsp_out: Mutex<VecDeque<f32>>` 輸出佇列（立體聲交錯），`next_playing()` 先消耗佇列，不足再拉上游。
+  49: - 修改 `next_playing()` 的串流軌分支（line 328-338）：
+  50:   1. 先從 `dsp_out` 佇列取樣本，若不足兩個（一立體聲幀 `[L, R]`），繼續執行步驟 2-4 直到夠兩個或上游結束。
+  51:   2. 呼叫 `next_stream()` 取得原生樣本。
+  52:   3. 鎖定 `track_resampler`，**必須**存在（長檔載入時 `player.rs:420` 已建立）；若為 `None` 回傳錯誤記錄並輸出靜音，不得繞過。
+  53:   4. 呼叫 `TrackResampler::process(&[sample]) -> Option<Vec<f32>>` 累積至 BLOCK_FRAMES（2048）後經 rubato 重取樣到 48kHz 立體聲交錯；回傳 `Some(vec)` 含零到多個聲道樣本，全部追加至 `dsp_out`；`None` 表示尚未累積滿一個輸出區塊（非靜音，非結束），繼續拉取上游。
+  54:   5. 從 `dsp_out` 取兩個樣本組成 `[L, R]`，送入 `apply_dsp_block()`（見 4.2）。
+  55: - 上游結束（`next_stream()` 回傳 `None`）且 `dsp_out` 耗盡後，進入軌結束流程（見 4.3）。
+  56: - 移除 line 337-338 的繞過路徑（`resampler` 為 `None` 時直接 `apply_dsp(sample)`）。
+  57: 
+  58: ### 4.2 apply_dsp_block 改為區塊輸入、零到多幀輸出並併入 RateStage（R3）
+  59: 
+  60: `playback_pipeline.rs`：
+  61: 
+  62: - `PlaybackCore` 新增欄位：
+  63:   - `rate_stage: Mutex<Option<RateStage>>`（`RateStage` 在 `crate::dsp`，`dsp.rs:540`）；
+  64:   - `dsp_out: Mutex<VecDeque<f32>>`（立體聲交錯輸出佇列，供 `next_playing()` 逐樣本消耗）；
+  65:   - `dsp_params: Mutex<Option<FxParams>>`（參數快照，命令執行緒更新，音訊執行緒讀取）。
+  66: - `PlaybackCore::new()`（line 135-162）中初始化 `rate_stage: Mutex::new(None)`、`dsp_out: Mutex::new(VecDeque::new())`、`dsp_params: Mutex::new(None)`。
+  67: - `dsp.rs` 需修正：`RateStage::new(channels: usize, sample_rate: u32)` 與 `RateStage::run(&mut self, input: &[f32], flush: bool, out: &mut Vec<f32>)` 目前為私有（line 547、550），須改為 `pub(crate)`，以便 `playback_pipeline.rs` 跨模組呼叫；`new()` 的 `channels` 參數為 `usize`，呼叫處傳入 `INTERNAL_CHANNELS as usize`。
+  68: - 軌載入/切換時（初次載入、手動換軌、seek、自然交接），建立 `RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE)`，並依 `FxParams` 設定 `allow_rate`（本地檔案 `true`，電台串流 `false`，與 `Agents/business-logic.md` 第 99 條一致）。
+  69: - `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`：餵入一區塊原始樣本（立體聲交錯），輸出零到多個處理後樣本追加至 `out`：
+  70:   1. 取得 `FxParams` 快照（`EqShared` 版本號，即時生效，參數不在區塊中途突變）；
+  71:   2. EQ（每聲道獨立，現有 `eq_processor`）；
+  72:   3. 速度/節奏/音高（`RateStage.run()`，依 `FxParams`；電台略過）；
+  73:   4. `FxChain` 音效（bass/enhancer/voice_remover/chorus/flanger/echo/reverb，立體聲幀 `&mut [f32; 2]`）；
+  74:   5. 正規化（`norm_gain`）；
+  75:   6. 限幅 `clamp(-1.0, 1.0)`。
+  76: - `next_playing()` 從 `dsp_out` 佇列取兩個樣本組成 `[L, R]` 幀；若不足兩個，繼續拉取上游 `next_stream()` → `TrackResampler::process()` → `apply_dsp_block()` 直到夠兩個或上游結束；上游結束且 `dsp_out` 耗盡則進入軌結束流程（見 4.3）。
+  77: - `FxChain::frame(f: &mut [f32])` 已依聲道索引處理（`dsp.rs:332-386`），傳入長度為 2 的切片即可正確處理左右聲道。
+  78: 
+  79: ### 4.3 軌切換與身分/邊界發布
+  80: 
+  81: - `TrackResampler.flush_tail()` / `commit_boundary()` / `set_track()` 在軌切換時已由 `sync_identity()`（line 412-481）序列化：先 flush_tail 舊軌尾端 → commit_boundary 寫入邊界 → set_track 切換到新軌。
+  82: - 軌切換時 `RateStage` 與舊軌尾端的處理順序（參考 `DspSource::fill()` EOF 路徑 `dsp.rs:659-669`）：`sync_identity()` 先以 `TrackResampler.flush_tail()` 將上游舊軌尾端移至 `pending_output`（`playback_pipeline.rs:432-444`）；舊軌尾端樣本先經 EQ（每聲道獨立，與 `apply_dsp()` 第 1 步一致），再以 `flush=false` 逐幀送入舊 `RateStage.run()`，讓 WSOLA / Resampler 正常累積與變速/變調處理；全部餵完後，以空輸入呼叫一次 `RateStage.run(&[], flush=true, ...)`，以 `wsola.drain_raw()` / `rs.drain_raw()` 排空內部殘餘（`dsp.rs:550-568`，與來源結束時 EOF 排空同路徑 `dsp.rs:659-669`）。步驟的 `run` 產出（已過 EQ 與 RateStage）僅經後續音效 → 正規化 → 限幅排出，不再重複進入 RateStage 或 EQ，與正常資料的 `apply_dsp()`（EQ → RateStage → 音效 → 正規化 → 限幅）於 RateStage 後方階段對齊，確保無縫；最後才捨棄舊 `RateStage` 並建立新實例。故重建不會截斷舊軌尾端。
+  83: - `boundary_in_48k` 由 `TrackResampler.boundary_in_48k()` 發布；`boundary_out_48k` 以舊軌最後一個 DSP 輸出幀的位置提交（DSP 檢查點映射列為待實作，`playback_pipeline.rs:53-55` 目前僅為註解，實際 453-455 行直接使用 `current_boundary_out_start()`，初值為 0）。
+  84: 
+  85: ### 4.4 錯誤處理
+  86: 
+  87: - `TrackResampler` 為 `None` 時（長檔載入失敗）：記錄 `log_line`，`next_playing()` 輸出靜音幀，不 panic。
+  88: - `RateStage` / `FxChain` 處理錯誤：現有 `log_line` 記錄，輸出靜音幀，不中斷播放。
+  89: - `next_stream()` 回傳 `None`（串流來源結束）：上游只 flush 一次（`flush_tail`）→ 全部尾端樣本先經 EQ → 舊 `RateStage`（`flush=false` 全部餵入，最後單次 `flush=true` 排空殘餘）→ 音效 → 正規化 → 限幅 → 進 `dsp_out`；`dsp_out` 耗盡後進入 `WaitingForNext`。`RateStage` 只終結一次，不可重複呼叫 `flush_tail()` 或再次 flush 上游（rubato `process_partial(None)` 是補零區塊，非「是否已排空」的查詢，重複呼叫會反覆產生輸出，無法穩定進入等待分支）。
+  90: 
+  91: ## IPC 指令契約變更
+  92: 
+  93: 本任務不新增或修改 Tauri IPC 指令；所有變更皆在 `PlaybackCore` 內部處理，對前端透明。
+  94: - 公開 Tauri command：無變更。
+  95: - 內部函式：`PlaybackCore::apply_dsp()` 簽名由 `apply_dsp(&self, sample: f32) -> f32` 變更為 `apply_dsp(&self, frame: &mut [f32; 2]) -> [f32; 2]`；`next_playing()` 內部調用方式相應調整。
+  96: - 事件：無變更。
+  97: 
+  98: ## 前端狀態與 UI 變更
+  99: 
+ 100: 無前端變更。速度/節奏/音高等音效參數已透過現有 `EqShared` 版本號即時套用（`Agents/business-logic.md` 第 104 條：改參數時不重開音源）。
+ 101: 
+ 102: ## 設計待確認事項
+ 103: 
+ 104: | 編號 | 事項 | 決定 | 理由 |
+ 105: |---|---|---|---|
+ 106: | Q1 | 速度/節奏/音高（`RateStage`）對本地長檔是否啟用？電台串流呢？ | **已決定：本地長檔啟用；電台串流 `allow_rate=false` 略過**。 | `Agents/business-logic.md` 第 99 條：「速度、節奏、音高不作用於電台。」長檔為本地檔案，應套用完整音效。 |
+ 107: | Q2 | `apply_dsp` 收到的 48kHz 樣本為立體聲交錯（`INTERNAL_CHANNELS=2`），`next_stream()` 單次回傳單一 `f32`，兩次呼叫組成一幀 `[L, R]` 是否正確？ | **已決定：正確**。`TrackResampler.process()` 輸出立體聲交錯樣本，`pop_output()` 依序回傳 L, R, L, R…；`next_playing()` 取兩次組成一幀。 | `playback_pipeline.rs:29` `INTERNAL_CHANNELS: u16 = 2`；`TrackResampler` `process()`/`pop_output()` 輸出交錯立體聲。 |
+ 108: | Q3 | 軌切換時 `RateStage` 的 WSOLA tail / Resampler 緩衝需 flush 否？ | **已決定：上游舊軌尾端先經 EQ，再以 `flush=false` 全部餵入舊 `RateStage`，全部餵完後以空輸入呼叫一次 `flush=true` 排空殘餘，保留輸出後再捨棄並重建。** | 軌切換順序：`sync_identity()` 先以 `TrackResampler.flush_tail()` 將上游舊軌尾端移至 `pending_output`（`playback_pipeline.rs:432-444`）；舊軌尾端樣本先經 EQ（每聲道獨立，與 `apply_dsp()` 第 1 步一致），再以 `flush=false` 逐幀送入舊 `RateStage.run()`，全部餵完後以空輸入呼叫一次 `RateStage.run(&[], flush=true, ...)`，以 `wsola.drain_raw()` / `rs.drain_raw()` 排空內部殘餘（`dsp.rs:550-568`，與來源結束時 EOF 排空同路徑 `dsp.rs:659-669`）；`run` 產出僅經後續音效 → 正規化 → 限幅排出，不再重複進入 RateStage 或 EQ，與正常資料 `apply_dsp()`（EQ → RateStage → 音效 → 正規化 → 限幅）於 RateStage 後方階段對齊，確保無縫；最後才捨棄舊 `RateStage` 並建立新實例。故重建不會截斷舊軌尾端。 |
+ 109: 
+ 110: Q1-Q3 均已決定，可送審。
+# SonicLedger 功能路線圖
+
+這份取代原本的差距清單。比對對象一律稱「參考播放器」，**repo 內的文件、程式註解、畫面文字都不寫參考播放器的名稱**（規則見 P0 第 0 項）。要串接的服務（例如聽歌紀錄網站）照實寫名稱。
+
+## 範圍
+
+- 參考播放器有、SonicLedger 沒有的功能都要做（使用者 2026-11-22 決定）。
+- 仍不做：內建電台目錄。電台只收使用者自己貼的網址，參考播放器也沒有官方目錄。
+- 連網功能一律**預設關閉**，帳號、權杖、快取都寫在執行檔旁的 `data/`，不寫 `%APPDATA%`。
+- 舊規則照舊：控制項必須接到引擎才畫；沒有的能力明說沒有；SQLite `journal_mode=DELETE`；介面繁體中文；10 萬首要虛擬捲動。
+
+## 分期
+
+| 期 | 資料夾 | 主題 | 狀態 |
+|---|---|---|---|
+| P0 | `P0-daily-blockers/` | 名稱中性化、搜尋、格式、無縫播放 | `[#2]P0-SE7-lofty解析器限制` 已完成（Design v8 審查通過，實作 + cargo test 全過），其餘待做 |
+| P1 | `P1-playback-quality/` | ReplayGain、音量曲線、淡入淡出、CUE、獨佔輸出、20 段等化器 | 待做 |
+| P2 | `P2-library-playlists/` | 歌單分組與顯示、歌單工具、書籤、評分、智慧歌單編輯、快捷鍵 | 待做 |
+| P3 | `P3-tools/` | 標籤編輯補齊、批次轉檔、電台錄音、鬧鐘排程、頻譜視覺化、延伸格式 | 待做 |
+| P4 | （尚未開資料夾） | 連網與架構項目 | 排在 P3 之後 |
+
+每期資料夾內有 `Design.md`（設計與實作步驟、圖、完成條件）與 `Review.md`（分階段審查紀錄），流程見根目錄 `AGENTS.md`。期內順序以各 Design.md 開頭寫的為準；跨期依賴寫在項目裡。
+
+## P4 待辦（尚未展開）
+
+| 項目 | 備註 |
+|---|---|
+| 聽歌紀錄上傳 | Last.fm、Libre.fm、ListenBrainz；離線先排隊，上線再送 |
+| 雲端與網路磁碟 | 先做 WebDAV 與網路路徑，各家 OAuth 之後再說 |
+| Podcast | 只收使用者貼的 RSS，不做目錄 |
+| 外掛 | 要先定介面 |
+| 換膚 | 封底曲目維持預設，換膚是額外主題 |
+| 多語系 | 字串抽成語系檔，繁中為預設 |
+| 多使用者 | `data/` 底下分使用者資料夾 |
+| 高 DPI 縮放選項 | 檢查 900×600 最小尺寸在 200% 下還能用 |
+
+桌面歌詞不在參考播放器的官方功能清單，所以沒列。
+
+## 每期都要做完的事
+
+1. 關掉正在跑的 `src-tauri/target/release/sonicledger.exe`，執行 `npx tauri build`，確認新的 `dist/assets/index-*.js` 檔名在 exe 裡。
+2. `cargo test --release --manifest-path src-tauri/Cargo.toml`、`node --test "src/player/*.test.mjs"` 全過。
+3. 更新 README 的功能與格式表，不寫做不到的事。
+4. `git grep -n -i -e 'a[i]mp'` 結果必須是空的。
+12:use crate::dsp::{DspSource, FxChain, FxParams};
+31:pub const BLOCK_FRAMES: usize = 2048;
+33:pub const BLOCK_BYTES: usize = BLOCK_FRAMES * INTERNAL_CHANNELS as usize * 4;
+59:pub struct BoundaryRecord {
+81:pub struct PlaybackCore {
+85:    pub(crate) track_resampler: Arc<Mutex<Option<TrackResampler>>>,
+87:    pub(crate) dsp_state: Arc<Mutex<Option<DspStateSnapshot>>>,
+121:    pub(crate) fx_chain: Mutex<Option<FxChain>>,
+135:    pub fn new(eq_shared: Arc<EqShared>) -> Self {
+138:            track_resampler: Arc::new(Mutex::new(None)),
+139:            dsp_state: Arc::new(Mutex::new(None)),
+156:            fx_chain: Mutex::new(None),
+166:    pub fn next_coordinator(&self) -> Arc<NextCoordinator> {
+171:    pub fn next_proxy_id(&self) -> u64 {
+176:    pub fn set_active_id(&self, id: u64) {
+181:    pub fn active_id(&self) -> u64 {
+186:    pub fn playback_state(&self) -> PlaybackState {
+191:    pub fn set_playback_state(&self, state: PlaybackState) {
+196:    pub fn next_token(&self) -> u64 {
+201:    pub fn set_next_token(&self, token: u64) {
+206:    pub fn next_clear_epoch(&self) -> u64 {
+211:    pub fn increment_next_clear_epoch(&self) -> u64 {
+216:    pub fn now_seq(&self) -> u64 {
+221:    pub fn now_token(&self) -> u64 {
+226:    pub fn set_now_identity(&self, seq: u64, token: u64) {
+232:    pub fn seek_origin_ms(&self) -> u64 {
+237:    pub fn set_seek_origin_ms(&self, ms: u64) {
+242:    pub fn played_out_frames(&self) -> u64 {
+247:    pub fn add_played_out_frames(&self, frames: u64) {
+252:    pub fn reset_played_out_frames(&self) {
+257:    pub fn current_boundary_in_start(&self) -> u64 {
+262:    pub fn set_current_boundary_in_start(&self, v: u64) {
+267:    pub fn current_boundary_out_start(&self) -> u64 {
+272:    pub fn set_current_boundary_out_start(&self, v: u64) {
+277:    pub fn push_boundary(&self, record: BoundaryRecord) {
+282:    pub fn boundaries(&self) -> Vec<BoundaryRecord> {
+287:    pub fn clear_expired_boundaries(&self, current_seq: u64) {
+292:    pub fn crossfade_ms(&self) -> u64 {
+297:    pub fn set_crossfade_ms(&self, ms: u64) {
+302:    pub fn normalize(&self) -> bool {
+307:    pub fn set_normalize(&self, enabled: bool) {
+313:    pub fn next(&self) -> Option<f32> {
+328:    fn next_playing(&self) -> Option<f32> {
+331:            let mut resampler = self.track_resampler.lock().unwrap();
+332:            if let Some(r) = resampler.as_mut() {
+334:                    Some(s) => return Some(self.apply_dsp(s)),
+338:            return Some(self.apply_dsp(sample));
+343:                let mut resampler = self.track_resampler.lock().unwrap();
+344:                if let Some(r) = resampler.as_mut() {
+346:                        return Some(self.apply_dsp(s));
+360:                            let mut resampler = self.track_resampler.lock().unwrap();
+361:                            resampler.as_mut().map(|r| r.flush_tail());
+364:                            let mut resampler = self.track_resampler.lock().unwrap();
+365:                            if let Some(r) = resampler.as_mut() {
+367:                                    return Some(self.apply_dsp(s));
+383:                let mut resampler = self.track_resampler.lock().unwrap();
+384:                match resampler.as_mut() {
+390:                Some(s) => return Some(self.apply_dsp(s)),
+397:    fn next_stream(&self) -> Option<f32> {
+403:    pub fn set_stream_source(&self, src: Option<Box<dyn Iterator<Item = f32> + Send>>) {
+412:    fn sync_identity(&self) {
+434:            let mut resampler = self.track_resampler.lock().unwrap();
+435:            resampler.as_mut().map(|r| r.flush_tail());
+436:            resampler.as_mut().map(|r| r.commit_boundary());
+443:                let mut resampler = self.track_resampler.lock().unwrap();
+444:                resampler.as_mut().map(|r| r.set_track(Some(item)));
+447:        let boundary_in_48k = self.track_resampler.lock().unwrap().as_ref().unwrap().boundary_in_48k();
+467:            let resampler = self.track_resampler.lock().unwrap();
+468:            if let Some(r) = resampler.as_ref() {
+484:    fn apply_dsp(&self, sample: f32) -> f32 {
+494:        let mut fx = self.fx_chain.lock().unwrap();
+495:        if let Some(mut p) = fx.as_mut() {
+501:        drop(fx);
+513:pub struct DspStateSnapshot {
+523:    pub fx_params: FxParams,
+527:pub struct ReverbState {
+533:pub struct CombState {
+540:pub struct AllpassState {
+546:pub struct WsolaState {
+558:pub struct FxChainState {
+572:pub struct BqState {
+578:pub struct DelayLineState {
+584:pub struct TrackChain {
+593:pub(crate) struct TrackChainItem {
+619:    pub fn new() -> Self {
+629:    pub fn set_coordinator(&mut self, coordinator: Arc<NextCoordinator>) {
+634:    pub fn append(&mut self, item: TrackChainItem) {
+640:    pub fn take_next(&mut self, next: Option<TrackChainItem>) -> Option<BoundaryRecord> {
+658:    fn record_boundary(&mut self) -> Option<BoundaryRecord> {
+684:    pub fn current(&self) -> Option<&TrackChainItem> {
+693:    pub fn is_finished(&self) -> bool {
+701:    fn next(&mut self) -> Option<f32> {
+744:fn prepared_to_trackchain_item(prepared: &PreparedTrack) -> Option<TrackChainItem> {
+764:pub struct TrackResampler {
+766:    resampler: Option<SincFixedIn<f32>>,
+769:    /// 輸入緩衝（交錯的原生樣本，累積到 BLOCK_FRAMES 個 native frame 再送 rubato）
+784:    resampler_delay_frames: usize,
+792:struct TrackResamplerTrack {
+803:    pub fn new() -> Self {
+805:            resampler: None,
+814:            resampler_delay_frames: 0,
+821:    pub fn set_track(&mut self, track: Option<TrackChainItem>) {
+832:        self.resampler = None;
+851:            let resampler = SincFixedIn::<f32>::new(
+855:                BLOCK_FRAMES,
+857:            ).expect("Failed to create resampler");
+859:            self.resampler_delay_frames = resampler.output_delay();
+860:            self.resampler = Some(resampler);
+865:    /// 在換軌或鏈結束前呼叫，避免丟失最後一段不足 BLOCK_FRAMES 的資料。
+866:    pub fn flush_tail(&mut self) {
+868:        let Some(resampler) = self.resampler.as_mut() else { return };
+892:        match resampler.process_partial(input_ref, None) {
+903:                log_line(&format!("track resampler flush_tail error: {e}"));
+914:    pub fn pop_output(&mut self) -> Option<f32> {
+934:    /// 處理輸入樣本，累積完整 BLOCK_FRAMES 區塊後才呼叫 rubato 重取樣，
+936:    pub fn process(&mut self, input: f32) -> Option<f32> {
+952:        if self.frames_in_buffer < BLOCK_FRAMES {
+956:        // 取出 BLOCK_FRAMES 個 native frame，轉成 rubato 非交錯格式（內建 internal_ch 聲道）
+960:                (0..BLOCK_FRAMES).map(|i| {
+966:        if let Some(ref mut resampler) = self.resampler {
+967:            match resampler.process(&block, None) {
+978:                    log_line(&format!("track resampler process error: {e}"));
+983:        self.input_frames += BLOCK_FRAMES as u64;
+989:    pub fn process_batch(&mut self, input: &[f32], output: &mut Vec<f32>) {
+997:        if let Some(ref mut resampler) = self.resampler {
+1009:            match resampler.process(&input_chan, None) {
+1020:                    log_line("track resampler process_batch error");
+1028:    pub fn boundary_in_48k(&self) -> u64 {
+1033:    pub fn commit_boundary(&mut self) {
+1039:    pub fn current_track(&self) -> Option<&TrackResamplerTrack> {
+1044:    pub fn pending_output_is_empty(&self) -> bool {
+1049:    pub fn has_track(&self) -> bool {
+1055:pub struct DeviceConverter {
+1056:    resampler: Option<SincFixedIn<f32>>,
+1063:    pub fn new(device_sample_rate: u32) -> Self {
+1065:            resampler: None,
+1078:            s.resampler = Some(
+1083:                    BLOCK_FRAMES,
+1085:                ).expect("Failed to create device resampler"),
+1092:    pub fn rebuild(&mut self, device_sample_rate: u32) {
+1093:        if device_sample_rate != self.device_sample_rate || self.resampler.is_none() {
+1104:                self.resampler = Some(
+1109:                        BLOCK_FRAMES,
+1111:                    ).expect("Failed to create device resampler")
+1114:                self.resampler = None;
+1122:    pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+1131:        if let Some(ref mut resampler) = self.resampler {
+1136:            match resampler.process(&input_chan, None) {
+1153:    pub fn device_sample_rate(&self) -> u32 {
+1159:pub struct OutputProxy {
+1169:    pub fn new(core: Arc<PlaybackCore>, device_sample_rate: u32, id: u64) -> Self {
+1180:    pub fn id(&self) -> u64 {
+1185:    pub fn rebuild_device(&mut self, device_sample_rate: u32) {
+1195:    fn next(&mut self) -> Option<f32> {
+1214:            let capacity = BLOCK_FRAMES * INTERNAL_CHANNELS as usize;
+1239:    fn current_frame_len(&self) -> Option<usize> {
+1243:    fn channels(&self) -> u16 {
+1247:    fn sample_rate(&self) -> u32 {
+1251:    fn total_duration(&self) -> Option<Duration> {
+1258:pub struct PreparedTrack {
+1285:pub struct FfmpegStreamHandle {
+1296:    pub fn open_with_seek(&self, start_ms: i64) -> Result<Box<dyn Iterator<Item = f32> + Send>, String> {
+1304:pub struct CancelHandle {
+1311:    pub fn new(stall_wait_limit: Duration) -> Self {
+1319:    pub fn cancel(&self) {
+1354:    pub fn is_cancelled(&self) -> bool {
+1358:    pub fn set_child(&self, child: std::process::Child) {
+1364:    pub fn take_child(&self) -> Option<std::process::Child> {
+1374:    fn is_cancelled(&self) -> bool {
+1380:pub struct NextCoordinator {
+1395:struct PrepareRequest {
+1404:    pub fn new() -> Self {
+1427:    fn spawn_worker(&self, cancel_flag: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+1459:    pub fn set_next(&self, path: String, song_id: i64, token: u64) -> u64 {
+1500:    pub fn clear_next(&self) -> u64 {
+1514:    pub fn poll_completion(&self, current_gen: u64) -> Option<Result<PreparedTrack, String>> {
+1534:    pub fn take_next(&self) -> Option<PreparedTrack> {
+1542:    pub fn current_generation(&self) -> u64 {
+1546:    pub fn has_next(&self) -> bool {
+1551:    pub fn set_preparing_frozen(&self, frozen: bool) {
+1555:    pub fn is_preparing_frozen(&self) -> bool {
+1561:    fn drop(&mut self) {
+1574:fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+1648:fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+1752:    fn sine_track(rate: u32, ch: u16, secs: f32, seq: u64, token: u64, song_id: i64) -> TrackChainItem {
+1773:    fn prepared_memory(rate: u32, ch: u16, secs: f32, seq: u64, token: u64, song_id: i64) -> PreparedTrack {
+1789:    fn core_with_eq() -> PlaybackCore {
+1799:    fn test_playback_core_seamless_handoff() {
+1803:        // 使用足夠長的軌（> BLOCK_FRAMES=2048 原生樣本）確保重取樣器能產出
+1818:        let mut resampler = TrackResampler::new();
+1819:        resampler.set_track(Some(sine_track(44100, 2, 0.1, 1, 10, 1)));
+1820:        core.track_resampler.lock().unwrap().replace(resampler);
+1875:    fn test_playback_core_handoff_full_completion_channel() {
+1890:    fn test_playback_core_waiting_for_next_silence() {
+1898:        let mut resampler = TrackResampler::new();
+1899:        resampler.set_track(Some(sine_track(44100, 2, 0.01, 1, 10, 1)));
+1900:        core.track_resampler.lock().unwrap().replace(resampler);
+1915:    fn test_next_coordinator_generation_and_clear() {
+1929:    fn test_next_coordinator_set_next_replaces_latest() {
+1940:    fn test_next_coordinator_poll_completion_discards_stale() {
+1957:    fn write_temp_wav(dir: &tempfile::TempDir) -> std::path::PathBuf {
+1986:    fn test_next_coordinator_drop_with_full_completion_channel() {
+1998:    fn test_next_coordinator_drop_does_not_deadlock() {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'src-tauri/src/playback_pipeline.rs'; "'$lines=Get-Content -LiteralPath $p; foreach ($r in @(@(313,510),@(764,1047),@(1190,1235))) { for($n=$r[0];$n -le $r[1];$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] } }' in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 503ms:
+ 313:     pub fn next(&self) -> Option<f32> {
+ 314:         let state = self.playback_state.lock().unwrap().clone();
+ 315:         match state {
+ 316:             PlaybackState::Playing => {
+ 317:                 let s = self.next_playing();
+ 318:                 if s.is_some() {
+ 319:                     self.add_played_out_frames(1);
+ 320:                 }
+ 321:                 s
+ 322:             }
+ 323:             PlaybackState::WaitingForNext | PlaybackState::Paused | PlaybackState::Finished => Some(0.0),
+ 324:         }
+ 325:     }
+ 326: 
+ 327:     /// Playing 狀態下的取樣：串流軌直接來源 → 原生樣本 → 重取樣 → EQ/正規化。
+ 328:     fn next_playing(&self) -> Option<f32> {
+ 329:         // 串流軌直接來源（適用長檔與 ffmpeg 串流），需經 TrackResampler 重取樣到 48kHz
+ 330:         if let Some(sample) = self.next_stream() {
+ 331:             let mut resampler = self.track_resampler.lock().unwrap();
+ 332:             if let Some(r) = resampler.as_mut() {
+ 333:                 match r.process(sample) {
+ 334:                     Some(s) => return Some(self.apply_dsp(s)),
+ 335:                     None => return Some(0.0), // 重取樣器仍在累積區塊，回靜音
+ 336:                 }
+ 337:             }
+ 338:             return Some(self.apply_dsp(sample));
+ 339:         }
+ 340:         loop {
+ 341:             // 優先排出重取樣器已緩衝的 48kHz 輸出（含軌切換時的尾端資料）
+ 342:             {
+ 343:                 let mut resampler = self.track_resampler.lock().unwrap();
+ 344:                 if let Some(r) = resampler.as_mut() {
+ 345:                     if let Some(s) = r.pop_output() {
+ 346:                         return Some(self.apply_dsp(s));
+ 347:                     }
+ 348:                 }
+ 349:             }
+ 350: 
+ 351:             // 從 TrackChain 拿一個原生樣本；軌結束時 TrackChain 自行從待播槽 take 下一軌，
+ 352:             // 若槽也為空則回傳 None，代表這條鏈結束。
+ 353:             let sample = {
+ 354:                 let mut chain = self.track_chain.lock().unwrap();
+ 355:                 match chain.as_mut().and_then(|c| c.next()) {
+ 356:                     Some(s) => s,
+ 357:                     None => {
+ 358:                         // 鏈結束：先排出舊軌的重取樣器尾端資料，再進入 WaitingForNext
+ 359:                         {
+ 360:                             let mut resampler = self.track_resampler.lock().unwrap();
+ 361:                             resampler.as_mut().map(|r| r.flush_tail());
+ 362:                         }
+ 363:                         {
+ 364:                             let mut resampler = self.track_resampler.lock().unwrap();
+ 365:                             if let Some(r) = resampler.as_mut() {
+ 366:                                 if let Some(s) = r.pop_output() {
+ 367:                                     return Some(self.apply_dsp(s));
+ 368:                                 }
+ 369:                             }
+ 370:                         }
+ 371:                         *self.playback_state.lock().unwrap() = PlaybackState::WaitingForNext;
+ 372:                         return Some(0.0);
+ 373:                     }
+ 374:                 }
+ 375:             };
+ 376: 
+ 377:             // 同步身分（seq / token / 正規化增益）：只有軌切換時會變動。
+ 378:             // 軌切換時會 flush_tail 舊軌、commit_boundary、再切換重取樣器到新軌。
+ 379:             self.sync_identity();
+ 380: 
+ 381:             // 重取樣到 48kHz 雙聲道；若回傳 None 代表重取樣器仍在累積區塊，繼續餵入
+ 382:             let out = {
+ 383:                 let mut resampler = self.track_resampler.lock().unwrap();
+ 384:                 match resampler.as_mut() {
+ 385:                     Some(r) => r.process(sample),
+ 386:                     None => None,
+ 387:                 }
+ 388:             };
+ 389:             match out {
+ 390:                 Some(s) => return Some(self.apply_dsp(s)),
+ 391:                 None => continue,
+ 392:             }
+ 393:         }
+ 394:     }
+ 395: 
+ 396:     /// 從串流軌來源取一個 48kHz（原生）樣本；無來源或來源結束回傳 None。
+ 397:     fn next_stream(&self) -> Option<f32> {
+ 398:         let mut src = self.stream_source.lock().unwrap();
+ 399:         src.as_mut().and_then(|s| s.next())
+ 400:     }
+ 401: 
+ 402:     /// 設定串流軌來源（換軌時由引擎呼叫）。
+ 403:     pub fn set_stream_source(&self, src: Option<Box<dyn Iterator<Item = f32> + Send>>) {
+ 404:         *self.stream_source.lock().unwrap() = src;
+ 405:     }
+ 406: 
+ 407:     /// 檢查 TrackChain 目前軌的身分，若與 now_seq/now_token 不同則發布新身分。
+ 408:     /// 軌交接發生在 TrackChain 讀完目前軌並從待播槽 take 新軌時。
+ 409:     ///
+ 410:     /// 順序：flush_tail 舊軌尾端 → commit_boundary 寫入邊界 → set_track 切換重取樣器。
+ 411:     /// 兩把鎖不同時持有，避免鎖序倒置。
+ 412:     fn sync_identity(&self) {
+ 413:         let (seq, token, song_id, norm_gain, duration_ms, native_sample_rate, native_channels, path, decoder) = {
+ 414:             let chain = self.track_chain.lock().unwrap();
+ 415:             let Some(cur) = chain.as_ref().and_then(|c| c.current()) else { return };
+ 416:             if cur.seq == self.now_seq() && cur.token == self.now_token() {
+ 417:                 return;
+ 418:             }
+ 419:             (
+ 420:                 cur.seq,
+ 421:                 cur.token,
+ 422:                 cur.song_id,
+ 423:                 cur.norm_gain,
+ 424:                 cur.duration_ms,
+ 425:                 cur.sample_rate,
+ 426:                 cur.channels,
+ 427:                 cur.path.clone(),
+ 428:                 cur.decoder.clone(),
+ 429:             )
+ 430:         };
+ 431: 
+ 432:         // 先把舊軌殘餘輸入排成尾端，再提交邊界（output_frames 含尾端會累進到 accum）
+ 433:         {
+ 434:             let mut resampler = self.track_resampler.lock().unwrap();
+ 435:             resampler.as_mut().map(|r| r.flush_tail());
+ 436:             resampler.as_mut().map(|r| r.commit_boundary());
+ 437:         }
+ 438:         // 軌切換時的尾端樣本已由 flush_tail 移至 pending_output，不在此丟棄；
+ 439:         // 下次 next_playing() 會優先從 pending_output 彈出，確保無縫輸出。
+ 440:         {
+ 441:             let chain = self.track_chain.lock().unwrap();
+ 442:             if let Some(item) = chain.as_ref().and_then(|c| c.current()).cloned() {
+ 443:                 let mut resampler = self.track_resampler.lock().unwrap();
+ 444:                 resampler.as_mut().map(|r| r.set_track(Some(item)));
+ 445:             }
+ 446:         }
+ 447:         let boundary_in_48k = self.track_resampler.lock().unwrap().as_ref().unwrap().boundary_in_48k();
+ 448: 
+ 449:         // 身分（seq/token）在軌切換時立即發布；進度與邊界則在舊軌尾端（pending_output）完全輸出後再重置，
+ 450:         // 避免身分提前切換卻進度歸零，導致交界處的位置錯誤。
+ 451:         self.set_now_identity(seq, token);
+ 452:         self.current_norm_gain_bits.store(norm_gain.to_bits() as u64, Ordering::Release);
+ 453:         self.push_boundary(BoundaryRecord {
+ 454:             boundary_in_48k,
+ 455:             boundary_out_48k: self.current_boundary_out_start(),
+ 456:             seq,
+ 457:             token,
+ 458:             song_id,
+ 459:             norm_gain,
+ 460:             duration_ms,
+ 461:             native_sample_rate,
+ 462:             native_channels,
+ 463:         });
+ 464: 
+ 465:         // 只有在舊軌尾端完全輸出後，才重置進度與邊界起點
+ 466:         {
+ 467:             let resampler = self.track_resampler.lock().unwrap();
+ 468:             if let Some(r) = resampler.as_ref() {
+ 469:                 if !r.pending_output_is_empty() {
+ 470:                     return;
+ 471:                 }
+ 472:             }
+ 473:         }
+ 474:         self.reset_played_out_frames();
+ 475:         self.set_current_boundary_in_start(boundary_in_48k);
+ 476:         // 交接回呼：通知引擎更新 current_path/current_decoder（交接後 seek 需用正確路徑）
+ 477:         if let Some(cb) = self.on_track_change.lock().unwrap().as_ref() {
+ 478:             cb(seq, token, &path, &decoder);
+ 479:         }
+ 480:         log_line(&format!("TRACK_HANDOFF seq={} token={} song_id={}", seq, token, song_id));
+ 481:     }
+ 482: 
+ 483:     /// 套用 EQ、音效鏈與峰值正規化（48kHz 單一樣本）。
+ 484:     fn apply_dsp(&self, sample: f32) -> f32 {
+ 485:         // 先套用 EQ
+ 486:         let mut eq = self.eq_processor.lock().unwrap();
+ 487:         let mut s = match eq.as_mut() {
+ 488:             Some(p) => p.process(sample),
+ 489:             None => sample,
+ 490:         };
+ 491:         drop(eq);
+ 492: 
+ 493:         // 再套用音效鏈（殘響、節奏、音高、回音等）
+ 494:         let mut fx = self.fx_chain.lock().unwrap();
+ 495:         if let Some(mut p) = fx.as_mut() {
+ 496:             // FxChain::frame 期望一幀（所有聲道），這裡以單聲道幀處理
+ 497:             let mut frame = [s];
+ 498:             p.frame(&mut frame);
+ 499:             s = frame[0];
+ 500:         }
+ 501:         drop(fx);
+ 502: 
+ 503:         if self.normalize() {
+ 504:             let norm = f32::from_bits(self.current_norm_gain_bits.load(Ordering::Acquire) as u32);
+ 505:             s = s * norm.clamp(0.0, 8.0);
+ 506:         }
+ 507:         s.clamp(-1.0, 1.0)
+ 508:     }
+ 509: }
+ 510: 
+ 764: pub struct TrackResampler {
+ 765:     /// 當前軌的重取樣器
+ 766:     resampler: Option<SincFixedIn<f32>>,
+ 767:     /// 當前軌資訊
+ 768:     current_track: Option<TrackResamplerTrack>,
+ 769:     /// 輸入緩衝（交錯的原生樣本，累積到 BLOCK_FRAMES 個 native frame 再送 rubato）
+ 770:     input_buffer: Vec<f32>,
+ 771:     /// 緩衝內已滿的 native frame 數
+ 772:     frames_in_buffer: usize,
+ 773:     /// 輸出緩衝（48kHz 雙聲道）
+ 774:     output_buffer: Vec<f32>,
+ 775:     /// 輸出緩衝的讀取游標
+ 776:     output_pos: usize,
+ 777:     /// 軌切換時保留的尾端樣本（flush_tail 產出，不被 set_track 清除，確保無縫輸出）
+ 778:     pending_output: Vec<f32>,
+ 779:     /// 輸入 frame 計數（原生）
+ 780:     input_frames: u64,
+ 781:     /// 輸出 frame 計數（48kHz）
+ 782:     output_frames: u64,
+ 783:     /// 重取樣器延遲（輸出 frame）
+ 784:     resampler_delay_frames: usize,
+ 785:     /// 邊界輸入累計
+ 786:     boundary_in_48k_accum: u64,
+ 787:     /// flush_tail 是否已經執行過（避免 EOF 後持續補零產出）
+ 788:     tail_flushed: bool,
+ 789: }
+ 790: 
+ 791: #[derive(Debug)]
+ 792: struct TrackResamplerTrack {
+ 793:     sample_rate: u32,
+ 794:     channels: u16,
+ 795:     duration_ms: i64,
+ 796:     song_id: i64,
+ 797:     norm_gain: f32,
+ 798:     token: u64,
+ 799:     seq: u64,
+ 800: }
+ 801: 
+ 802: impl TrackResampler {
+ 803:     pub fn new() -> Self {
+ 804:         Self {
+ 805:             resampler: None,
+ 806:             current_track: None,
+ 807:             input_buffer: Vec::new(),
+ 808:             frames_in_buffer: 0,
+ 809:             output_buffer: Vec::new(),
+ 810:             output_pos: 0,
+ 811:             pending_output: Vec::new(),
+ 812:             input_frames: 0,
+ 813:             output_frames: 0,
+ 814:             resampler_delay_frames: 0,
+ 815:             boundary_in_48k_accum: 0,
+ 816:             tail_flushed: false,
+ 817:         }
+ 818:     }
+ 819: 
+ 820:     /// 切換到新軌（由 TrackChain 呼叫）。呼叫者應在切換前先自行 `flush_tail()` 排出舊軌尾端。
+ 821:     pub fn set_track(&mut self, track: Option<TrackChainItem>) {
+ 822:         self.current_track = track.map(|t| TrackResamplerTrack {
+ 823:             sample_rate: t.sample_rate,
+ 824:             channels: t.channels,
+ 825:             duration_ms: t.duration_ms,
+ 826:             song_id: t.song_id,
+ 827:             norm_gain: t.norm_gain,
+ 828:             token: t.token,
+ 829:             seq: t.seq,
+ 830:         });
+ 831: 
+ 832:         self.resampler = None;
+ 833:         self.input_buffer.clear();
+ 834:         self.frames_in_buffer = 0;
+ 835:         self.output_buffer.clear();
+ 836:         self.output_pos = 0;
+ 837:         self.input_frames = 0;
+ 838:         self.output_frames = 0;
+ 839:         self.tail_flushed = false;
+ 840: 
+ 841:         if let Some(ref ct) = self.current_track {
+ 842:             // 建立新的重取樣器
+ 843:             let params = SincInterpolationParameters {
+ 844:                 sinc_len: 256,
+ 845:                 f_cutoff: 0.95,
+ 846:                 interpolation: SincInterpolationType::Linear,
+ 847:                 oversampling_factor: 256,
+ 848:                 window: WindowFunction::BlackmanHarris2,
+ 849:             };
+ 850: 
+ 851:             let resampler = SincFixedIn::<f32>::new(
+ 852:                 INTERNAL_SAMPLE_RATE as f64 / ct.sample_rate as f64,
+ 853:                 2.0,
+ 854:                 params,
+ 855:                 BLOCK_FRAMES,
+ 856:                 INTERNAL_CHANNELS as usize,
+ 857:             ).expect("Failed to create resampler");
+ 858: 
+ 859:             self.resampler_delay_frames = resampler.output_delay();
+ 860:             self.resampler = Some(resampler);
+ 861:         }
+ 862:     }
+ 863: 
+ 864:     /// 排出舊軌殘餘的輸入與重取樣器延遲，產出尾端資料到 output_buffer。
+ 865:     /// 在換軌或鏈結束前呼叫，避免丟失最後一段不足 BLOCK_FRAMES 的資料。
+ 866:     pub fn flush_tail(&mut self) {
+ 867:         let internal_ch = INTERNAL_CHANNELS as usize;
+ 868:         let Some(resampler) = self.resampler.as_mut() else { return };
+ 869:         let Some(ct) = self.current_track.as_ref() else { return };
+ 870:         let ch = ct.channels as usize;
+ 871:         let remaining = self.frames_in_buffer;
+ 872: 
+ 873:         // 即使 input_buffer 為空，也要排空 rubato 內部的延遲緩衝（尾端補樣）
+ 874:         let block_samples: Vec<f32> = if remaining > 0 {
+ 875:             self.input_buffer.drain(..).collect()
+ 876:         } else {
+ 877:             Vec::new()
+ 878:         };
+ 879:         let block: Vec<Vec<f32>> = (0..internal_ch)
+ 880:             .map(|c| {
+ 881:                 (0..remaining)
+ 882:                     .map(|i| {
+ 883:                         let native_idx = i * ch + if c < ch { c } else { 0 };
+ 884:                         block_samples[native_idx]
+ 885:                     })
+ 886:                     .collect()
+ 887:             })
+ 888:             .collect();
+ 889:         // 傳入 None 當 input 表示 flush 處理（rubato 會把內部殘餘輸出）
+ 890:         // 使用 process（而非 process_partial）以避免類型轉換問題，partial 區塊由 rubato 直接處理
+ 891:         let input_ref: Option<&[Vec<f32>]> = if remaining > 0 { Some(&block) } else { None };
+ 892:         match resampler.process_partial(input_ref, None) {
+ 893:             Ok(out) => {
+ 894:                 let n = out.first().map(|v| v.len()).unwrap_or(0);
+ 895:                 for f in 0..n {
+ 896:                     for c in 0..internal_ch {
+ 897:                         self.output_buffer.push(out[c][f]);
+ 898:                     }
+ 899:                 }
+ 900:                 self.output_frames += n as u64;
+ 901:             }
+ 902:             Err(e) => {
+ 903:                 log_line(&format!("track resampler flush_tail error: {e}"));
+ 904:             }
+ 905:         }
+ 906:         self.frames_in_buffer = 0;
+ 907:         self.input_frames += remaining as u64;
+ 908:         // 將 output_buffer 中已產出的尾端樣本移到 pending_output，確保不被 set_track 清除
+ 909:         self.pending_output.extend(self.output_buffer.drain(..));
+ 910:         self.tail_flushed = true;
+ 911:     }
+ 912: 
+ 913:     /// 取出一個已緩衝的 48kHz 輸出樣本。
+ 914:     pub fn pop_output(&mut self) -> Option<f32> {
+ 915:         // 優先回傳軌切換時保留的尾端樣本
+ 916:         if !self.pending_output.is_empty() {
+ 917:             return Some(self.pending_output.remove(0));
+ 918:         }
+ 919:         if self.tail_flushed && self.output_pos >= self.output_buffer.len() {
+ 920:             return None;
+ 921:         }
+ 922:         if self.output_pos >= self.output_buffer.len() {
+ 923:             if !self.output_buffer.is_empty() {
+ 924:                 self.output_buffer.clear();
+ 925:                 self.output_pos = 0;
+ 926:             }
+ 927:             return None;
+ 928:         }
+ 929:         let s = self.output_buffer[self.output_pos];
+ 930:         self.output_pos += 1;
+ 931:         Some(s)
+ 932:     }
+ 933: 
+ 934:     /// 處理輸入樣本，累積完整 BLOCK_FRAMES 區塊後才呼叫 rubato 重取樣，
+ 935:     /// 並從 output_buffer 產出 48kHz 雙聲道樣本。
+ 936:     pub fn process(&mut self, input: f32) -> Option<f32> {
+ 937:         if self.current_track.is_none() {
+ 938:             return None;
+ 939:         }
+ 940: 
+ 941:         let ch = self.current_track.as_ref().unwrap().channels as usize;
+ 942:         let internal_ch = INTERNAL_CHANNELS as usize;
+ 943: 
+ 944:         self.input_buffer.push(input);
+ 945:         // 只有湊齊一個 native frame（ch 個樣本）才計入框計數
+ 946:         if self.input_buffer.len() % ch != 0 {
+ 947:             return self.pop_output();
+ 948:         }
+ 949:         self.frames_in_buffer += 1;
+ 950: 
+ 951:         // 累積到滿一個 rubato 區塊再處理；不足時回傳已緩衝的輸出（若有）
+ 952:         if self.frames_in_buffer < BLOCK_FRAMES {
+ 953:             return self.pop_output();
+ 954:         }
+ 955: 
+ 956:         // 取出 BLOCK_FRAMES 個 native frame，轉成 rubato 非交錯格式（內建 internal_ch 聲道）
+ 957:         let block_samples: Vec<f32> = self.input_buffer.drain(..).collect();
+ 958:         let block: Vec<Vec<f32>> = (0..internal_ch)
+ 959:             .map(|c| {
+ 960:                 (0..BLOCK_FRAMES).map(|i| {
+ 961:                     let native_idx = i * ch + if c < ch { c } else { 0 };
+ 962:                     block_samples[native_idx]
+ 963:                 }).collect()
+ 964:             })
+ 965:             .collect();
+ 966:         if let Some(ref mut resampler) = self.resampler {
+ 967:             match resampler.process(&block, None) {
+ 968:                 Ok(out) => {
+ 969:                     let n = out.first().map(|v| v.len()).unwrap_or(0);
+ 970:                     for f in 0..n {
+ 971:                         for c in 0..internal_ch {
+ 972:                             self.output_buffer.push(out[c][f]);
+ 973:                         }
+ 974:                     }
+ 975:                     self.output_frames += n as u64;
+ 976:                 }
+ 977:                 Err(e) => {
+ 978:                     log_line(&format!("track resampler process error: {e}"));
+ 979:                 }
+ 980:             }
+ 981:         }
+ 982:         self.frames_in_buffer = 0;
+ 983:         self.input_frames += BLOCK_FRAMES as u64;
+ 984: 
+ 985:         self.pop_output()
+ 986:     }
+ 987: 
+ 988:     /// 處理一批輸入（用於高效處理）
+ 989:     pub fn process_batch(&mut self, input: &[f32], output: &mut Vec<f32>) {
+ 990:         if self.current_track.is_none() {
+ 991:             return;
+ 992:         }
+ 993: 
+ 994:         let ch = self.current_track.as_ref().unwrap().channels as usize;
+ 995:         let frames = input.len() / ch;
+ 996:         let internal_ch = INTERNAL_CHANNELS as usize;
+ 997:         if let Some(ref mut resampler) = self.resampler {
+ 998:             // 把交錯輸入轉成 rubato 的非交錯格式（一個 Vec per 聲道）。
+ 999:             let input_chan: Vec<Vec<f32>> = (0..internal_ch)
+1000:                 .map(|c| {
+1001:                     (0..frames)
+1002:                         .map(|i| {
+1003:                             let idx = i * ch + if c < ch { c } else { 0 };
+1004:                             input[idx]
+1005:                         })
+1006:                         .collect()
+1007:                 })
+1008:                 .collect();
+1009:             match resampler.process(&input_chan, None) {
+1010:                 Ok(out) => {
+1011:                     let n = out.first().map(|v| v.len()).unwrap_or(0);
+1012:                     for f in 0..n {
+1013:                         for c in 0..internal_ch {
+1014:                             output.push(out[c][f]);
+1015:                         }
+1016:                     }
+1017:                     self.output_frames += n as u64;
+1018:                 }
+1019:                 Err(_) => {
+1020:                     log_line("track resampler process_batch error");
+1021:                 }
+1022:             }
+1023:         }
+1024:         self.input_frames += frames as u64;
+1025:     }
+1026: 
+1027:     /// 取得 boundary_in_48k（DSP 輸入端 48kHz frame 邊界）
+1028:     pub fn boundary_in_48k(&self) -> u64 {
+1029:         self.boundary_in_48k_accum + self.output_frames
+1030:     }
+1031: 
+1032:     /// 更新邊界累計（當軌切換時呼叫）
+1033:     pub fn commit_boundary(&mut self) {
+1034:         self.boundary_in_48k_accum += self.output_frames;
+1035:         self.output_frames = 0;
+1036:     }
+1037: 
+1038:     /// 取得當前軌資訊
+1039:     pub fn current_track(&self) -> Option<&TrackResamplerTrack> {
+1040:         self.current_track.as_ref()
+1041:     }
+1042: 
+1043:     /// pending_output 是否為空（供 sync_identity 判斷舊軌尾端是否已全部輸出）
+1044:     pub fn pending_output_is_empty(&self) -> bool {
+1045:         self.pending_output.is_empty()
+1046:     }
+1047: 
+1190: }
+1191: 
+1192: impl Iterator for OutputProxy {
+1193:     type Item = f32;
+1194: 
+1195:     fn next(&mut self) -> Option<f32> {
+1196:         let core = &self.core;
+1197:         let my_id = self.id;
+1198: 
+1199:         // 核心鎖內取樣並再次驗證 active_id：切換裝置與取樣序列化，
+1200:         // 舊 proxy 的 next() 在核心鎖內發現 ID 已過期直接回傳 None，不消耗核心。
+1201:         let _guard = core.core_lock.lock().unwrap();
+1202:         if core.active_id() != my_id {
+1203:             return None;
+1204:         }
+1205: 
+1206:         loop {
+1207:             if self.out_pos < self.out_buffer.len() {
+1208:                 let s = self.out_buffer[self.out_pos];
+1209:                 self.out_pos += 1;
+1210:                 return Some(s);
+1211:             }
+1212: 
+1213:             // 從核心拉一批 48kHz 樣本，經 DeviceConverter 轉成裝置格式
+1214:             let capacity = BLOCK_FRAMES * INTERNAL_CHANNELS as usize;
+1215:             let mut batch: Vec<f32> = Vec::with_capacity(capacity);
+1216:             let mut filled = 0usize;
+1217:             for _ in 0..capacity {
+1218:                 match core.next() {
+1219:                     Some(s) => {
+1220:                         batch.push(s);
+1221:                         filled += 1;
+1222:                     }
+1223:                     None => break,
+1224:                 }
+1225:             }
+1226:             if filled == 0 {
+1227:                 return None;
+1228:             }
+1229: 
+1230:             let mut out = Vec::new();
+1231:             self.device_converter.process(&batch, &mut out);
+1232:             self.out_buffer = out;
+1233:             self.out_pos = 0;
+1234:         }
+1235:     }
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'src-tauri/src/dsp.rs'; "'$lines=Get-Content -LiteralPath $p; foreach ($r in @(@(1,88),@(274,334),@(390,418),@(490,690))) { for($n=$r[0];$n -le $r[1];$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] } }; rg -n '"'fn |EqShared|fx_params' src-tauri/src/eq.rs" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 474ms:
+   1: //! 音效：對標 參考播放器 的十種內建效果（殘響、鑲邊、合唱、音高、節奏、回音、速度、低音、高音增強、人聲消除）。
+   2: //!
+   3: //! 參數跟等化器一起放在 `EqShared`，播放中每個區塊（1024 frame）讀版本號即時套用。
+   4: //! 速度／節奏／音高會改變輸出樣本數：節奏用 WSOLA（與 SoundTouch 同一類演算法）伸縮時間不改音高，
+   5: //! 速度與音高用三次內插重取樣。三者都在原值時整段旁路，輸出與輸入逐樣本相同。
+   6: //! 播放位置以「已消耗的輸入 frame」計算，改速度時進度條仍對應歌曲時間。
+   7: 
+   8: use crate::eq::{EqProcessor, EqShared};
+   9: use rodio::Source;
+  10: use serde::{Deserialize, Serialize};
+  11: use std::f32::consts::PI;
+  12: use std::sync::atomic::{AtomicU64, Ordering};
+  13: use std::sync::Arc;
+  14: use std::time::Duration;
+  15: 
+  16: #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+  17: #[serde(rename_all = "camelCase", default)]
+  18: pub struct FxParams {
+  19:     /// 0.5–2.0，像磁帶變速：音高與節奏一起變。
+  20:     pub speed: f32,
+  21:     /// 0.5–2.0，只改節奏不改音高。
+  22:     pub tempo: f32,
+  23:     /// 半音，−12 到 +12，不改節奏。
+  24:     pub pitch: f32,
+  25:     pub bass_on: bool,
+  26:     pub bass_db: f32,
+  27:     pub bass_hz: f32,
+  28:     pub enhancer_on: bool,
+  29:     pub enhancer: f32,
+  30:     pub voice_remover: bool,
+  31:     pub chorus_on: bool,
+  32:     pub chorus_depth: f32,
+  33:     pub chorus_rate: f32,
+  34:     pub chorus_mix: f32,
+  35:     pub flanger_on: bool,
+  36:     pub flanger_depth: f32,
+  37:     pub flanger_rate: f32,
+  38:     pub flanger_feedback: f32,
+  39:     pub flanger_mix: f32,
+  40:     pub echo_on: bool,
+  41:     pub echo_ms: f32,
+  42:     pub echo_feedback: f32,
+  43:     pub echo_mix: f32,
+  44:     pub reverb_on: bool,
+  45:     pub reverb_room: f32,
+  46:     pub reverb_damp: f32,
+  47:     pub reverb_mix: f32,
+  48: }
+  49: 
+  50: impl Default for FxParams {
+  51:     fn default() -> Self {
+  52:         Self {
+  53:             speed: 1.0,
+  54:             tempo: 1.0,
+  55:             pitch: 0.0,
+  56:             bass_on: false,
+  57:             bass_db: 6.0,
+  58:             bass_hz: 100.0,
+  59:             enhancer_on: false,
+  60:             enhancer: 0.3,
+  61:             voice_remover: false,
+  62:             chorus_on: false,
+  63:             chorus_depth: 0.5,
+  64:             chorus_rate: 1.0,
+  65:             chorus_mix: 0.5,
+  66:             flanger_on: false,
+  67:             flanger_depth: 0.6,
+  68:             flanger_rate: 0.3,
+  69:             flanger_feedback: 0.5,
+  70:             flanger_mix: 0.5,
+  71:             echo_on: false,
+  72:             echo_ms: 300.0,
+  73:             echo_feedback: 0.35,
+  74:             echo_mix: 0.35,
+  75:             reverb_on: false,
+  76:             reverb_room: 0.5,
+  77:             reverb_damp: 0.5,
+  78:             reverb_mix: 0.3,
+  79:         }
+  80:     }
+  81: }
+  82: 
+  83: fn fin(v: f32, default: f32, lo: f32, hi: f32) -> f32 {
+  84:     if v.is_finite() { v.clamp(lo, hi) } else { default }
+  85: }
+  86: 
+  87: impl FxParams {
+  88:     pub fn sanitized(self) -> Self {
+ 274: pub(crate) struct FxChain {
+ 275:     ch: usize,
+ 276:     sr: f32,
+ 277:     pub(crate) p: FxParams,
+ 278:     bass: Vec<Bq>,
+ 279:     voice_lp: Bq,
+ 280:     enh_hp: Vec<Bq>,
+ 281:     chorus: Vec<DelayLine>,
+ 282:     chorus_phase: f32,
+ 283:     flanger: Vec<DelayLine>,
+ 284:     flanger_phase: f32,
+ 285:     echo: Vec<DelayLine>,
+ 286:     reverb: Option<Reverb>,
+ 287:     sr_u: u32,
+ 288: }
+ 289: 
+ 290: impl FxChain {
+ 291:     pub(crate) fn new(sr: u32, channels: usize) -> Self {
+ 292:         let srf = sr.max(1) as f32;
+ 293:         let ch = channels.max(1);
+ 294:         Self {
+ 295:             ch,
+ 296:             sr: srf,
+ 297:             p: FxParams::default(),
+ 298:             bass: vec![Bq::lowshelf(srf, 100.0, 0.0); ch],
+ 299:             voice_lp: Bq::lowpass(srf, 160.0),
+ 300:             enh_hp: vec![Bq::highpass(srf, 2500.0); ch],
+ 301:             chorus: (0..ch).map(|_| DelayLine::new((srf * 0.05) as usize)).collect(),
+ 302:             chorus_phase: 0.0,
+ 303:             flanger: (0..ch).map(|_| DelayLine::new((srf * 0.012) as usize)).collect(),
+ 304:             flanger_phase: 0.0,
+ 305:             echo: Vec::new(),
+ 306:             reverb: None,
+ 307:             sr_u: sr.max(1),
+ 308:         }
+ 309:     }
+ 310: 
+ 311:     pub(crate) fn set(&mut self, p: &FxParams) {
+ 312:         if p.bass_hz != self.p.bass_hz || p.bass_db != self.p.bass_db || self.bass.is_empty() {
+ 313:             let n = Bq::lowshelf(self.sr, p.bass_hz, p.bass_db);
+ 314:             for b in self.bass.iter_mut() {
+ 315:                 b.retune(n);
+ 316:             }
+ 317:         }
+ 318:         if p.echo_on && self.echo.is_empty() {
+ 319:             self.echo = (0..self.ch).map(|_| DelayLine::new((self.sr * 2.05) as usize)).collect();
+ 320:         }
+ 321:         if p.reverb_on && self.reverb.is_none() {
+ 322:             self.reverb = Some(Reverb::new(self.sr_u, self.ch));
+ 323:         }
+ 324:         self.p = p.clone();
+ 325:     }
+ 326: 
+ 327:     fn active(&self) -> bool {
+ 328:         let p = &self.p;
+ 329:         p.bass_on || p.enhancer_on || p.voice_remover || p.chorus_on || p.flanger_on || p.echo_on || p.reverb_on
+ 330:     }
+ 331: 
+ 332:     pub fn frame(&mut self, f: &mut [f32]) {
+ 333:         let p = &self.p;
+ 334:         if p.voice_remover && f.len() >= 2 {
+ 390: 
+ 391: struct Resampler {
+ 392:     ch: usize,
+ 393:     buf: Vec<f32>,
+ 394:     t: f64,
+ 395: }
+ 396: 
+ 397: impl Resampler {
+ 398:     fn new(ch: usize) -> Self {
+ 399:         Self { ch, buf: vec![0.0; ch], t: 1.0 }
+ 400:     }
+ 401:     fn frames(&self) -> usize {
+ 402:         self.buf.len() / self.ch
+ 403:     }
+ 404:     fn has_data(&self) -> bool {
+ 405:         self.frames() > 1
+ 406:     }
+ 407:     fn buffered(&self) -> f64 {
+ 408:         (self.frames() as f64 - self.t).max(0.0)
+ 409:     }
+ 410:     fn run(&mut self, input: &[f32], ratio: f64, out: &mut Vec<f32>) {
+ 411:         self.buf.extend_from_slice(input);
+ 412:         let ch = self.ch;
+ 413:         let n = self.frames();
+ 414:         while (self.t.floor() as usize) + 2 < n {
+ 415:             let i = self.t.floor() as usize;
+ 416:             let f = (self.t - i as f64) as f32;
+ 417:             for c in 0..ch {
+ 418:                 let y0 = self.buf[(i - 1) * ch + c];
+ 490:             let bias = 1.0 - 0.25 * ((o as f32 / self.seek as f32) - 0.5).abs();
+ 491:             let score = if score > 0.0 { score * bias } else { score / bias };
+ 492:             if score > best.1 {
+ 493:                 best = (o, score);
+ 494:             }
+ 495:             norm += m[o + self.ovl] * m[o + self.ovl] - m[o] * m[o];
+ 496:         }
+ 497:         best.0
+ 498:     }
+ 499:     fn run(&mut self, input: &[f32], tempo: f64, out: &mut Vec<f32>) {
+ 500:         self.input.extend_from_slice(input);
+ 501:         let ch = self.ch;
+ 502:         loop {
+ 503:             let frames = self.input.len() / ch;
+ 504:             let nominal = tempo * (self.seq - self.ovl) as f64;
+ 505:             let need = (nominal.ceil() as usize + self.ovl).max(self.seq) + self.seek;
+ 506:             if frames < need {
+ 507:                 break;
+ 508:             }
+ 509:             let o = if self.have_tail { self.best_offset() } else { 0 };
+ 510:             if self.have_tail {
+ 511:                 for k in 0..self.ovl {
+ 512:                     let w = k as f32 / self.ovl as f32;
+ 513:                     for c in 0..ch {
+ 514:                         out.push(self.tail[k * ch + c] * (1.0 - w) + self.input[(o + k) * ch + c] * w);
+ 515:                     }
+ 516:                 }
+ 517:             } else {
+ 518:                 out.extend_from_slice(&self.input[o * ch..(o + self.ovl) * ch]);
+ 519:             }
+ 520:             out.extend_from_slice(&self.input[(o + self.ovl) * ch..(o + self.seq - self.ovl) * ch]);
+ 521:             self.tail = self.input[(o + self.seq - self.ovl) * ch..(o + self.seq) * ch].to_vec();
+ 522:             self.have_tail = true;
+ 523:             self.skip_fract += nominal;
+ 524:             let s = self.skip_fract.floor() as usize;
+ 525:             self.skip_fract -= s as f64;
+ 526:             self.input.drain(..s * ch);
+ 527:         }
+ 528:     }
+ 529:     fn drain_raw(&mut self, out: &mut Vec<f32>) {
+ 530:         if self.have_tail {
+ 531:             out.extend_from_slice(&self.tail);
+ 532:         }
+ 533:         out.append(&mut self.input);
+ 534:         self.tail.clear();
+ 535:         self.have_tail = false;
+ 536:         self.skip_fract = 0.0;
+ 537:     }
+ 538: }
+ 539: 
+ 540: pub(crate) struct RateStage {
+ 541:     wsola: Wsola,
+ 542:     rs: Resampler,
+ 543:     mid: Vec<f32>,
+ 544: }
+ 545: 
+ 546: impl RateStage {
+ 547:     fn new(ch: usize, sr: u32) -> Self {
+ 548:         Self { wsola: Wsola::new(ch, sr), rs: Resampler::new(ch), mid: Vec::new() }
+ 549:     }
+ 550:     fn run(&mut self, input: &[f32], p: &FxParams, flush: bool, out: &mut Vec<f32>) {
+ 551:         let (r, sw) = p.rates();
+ 552:         let mut mid = std::mem::take(&mut self.mid);
+ 553:         mid.clear();
+ 554:         if (sw - 1.0).abs() > 1e-3 {
+ 555:             self.wsola.run(input, sw, &mut mid);
+ 556:             if flush {
+ 557:                 self.wsola.drain_raw(&mut mid);
+ 558:             }
+ 559:         } else {
+ 560:             if self.wsola.has_data() {
+ 561:                 self.wsola.drain_raw(&mut mid);
+ 562:             }
+ 563:             mid.extend_from_slice(input);
+ 564:         }
+ 565:         if (r - 1.0).abs() > 1e-4 {
+ 566:             self.rs.run(&mid, r, out);
+ 567:             if flush {
+ 568:                 self.rs.drain_raw(out);
+ 569:             }
+ 570:         } else {
+ 571:             if self.rs.has_data() {
+ 572:                 self.rs.drain_raw(out);
+ 573:             }
+ 574:             out.extend_from_slice(&mid);
+ 575:         }
+ 576:         self.mid = mid;
+ 577:     }
+ 578:     fn buffered(&self, p: &FxParams) -> f64 {
+ 579:         let (_, sw) = p.rates();
+ 580:         self.wsola.buffered() + self.rs.buffered() * sw
+ 581:     }
+ 582: }
+ 583: 
+ 584: /* ---------- 音源 ---------- */
+ 585: 
+ 586: pub(crate) const BLOCK: usize = 1024;
+ 587: 
+ 588: /// 解碼後的音訊經過：速度/節奏/音高 → 正規化 + 前級 + 18 段等化器 → 音效 → 限幅。
+ 589: pub struct DspSource<S: Iterator<Item = f32>> {
+ 590:     inner: S,
+ 591:     channels: u16,
+ 592:     sample_rate: u32,
+ 593:     shared: Arc<EqShared>,
+ 594:     seen: u64,
+ 595:     p: FxParams,
+ 596:     eq: EqProcessor,
+ 597:     fx: FxChain,
+ 598:     rate: Option<RateStage>,
+ 599:     block: Vec<f32>,
+ 600:     out: Vec<f32>,
+ 601:     pos: usize,
+ 602:     ended: bool,
+ 603:     consumed: u64,
+ 604:     played_ms: Arc<AtomicU64>,
+ 605:     total: Option<Duration>,
+ 606: }
+ 607: 
+ 608: impl<S: Iterator<Item = f32>> DspSource<S> {
+ 609:     /// `allow_rate` 為 false 時（電台）不做速度/節奏/音高：即時串流不能比網路快或慢。
+ 610:     pub fn new(
+ 611:         inner: S,
+ 612:         channels: u16,
+ 613:         sample_rate: u32,
+ 614:         shared: &Arc<EqShared>,
+ 615:         norm_gain: f32,
+ 616:         total: Option<Duration>,
+ 617:         allow_rate: bool,
+ 618:     ) -> (Self, Arc<AtomicU64>) {
+ 619:         let ch = channels.max(1) as usize;
+ 620:         let played = Arc::new(AtomicU64::new(0));
+ 621:         let mut s = Self {
+ 622:             inner,
+ 623:             channels,
+ 624:             sample_rate,
+ 625:             shared: shared.clone(),
+ 626:             seen: 0,
+ 627:             p: FxParams::default(),
+ 628:             eq: EqProcessor::new(shared.clone(), sample_rate, channels, norm_gain),
+ 629:             fx: FxChain::new(sample_rate, ch),
+ 630:             rate: allow_rate.then(|| RateStage::new(ch, sample_rate)),
+ 631:             block: Vec::with_capacity(BLOCK * ch),
+ 632:             out: Vec::with_capacity(BLOCK * ch * 2),
+ 633:             pos: 0,
+ 634:             ended: false,
+ 635:             consumed: 0,
+ 636:             played_ms: played.clone(),
+ 637:             total,
+ 638:         };
+ 639:         s.refresh();
+ 640:         (s, played)
+ 641:     }
+ 642: 
+ 643:     fn refresh(&mut self) {
+ 644:         let v = self.shared.version();
+ 645:         if v != self.seen {
+ 646:             self.seen = v;
+ 647:             self.p = self.shared.get().fx;
+ 648:             self.fx.set(&self.p);
+ 649:         }
+ 650:     }
+ 651: 
+ 652:     fn fill(&mut self) -> bool {
+ 653:         self.refresh();
+ 654:         let ch = self.channels.max(1) as usize;
+ 655:         self.out.clear();
+ 656:         self.pos = 0;
+ 657:         loop {
+ 658:             self.block.clear();
+ 659:             while !self.ended && self.block.len() < BLOCK * ch {
+ 660:                 match self.inner.next() {
+ 661:                     Some(s) => self.block.push(s),
+ 662:                     None => self.ended = true,
+ 663:                 }
+ 664:             }
+ 665:             let frames = self.block.len() / ch;
+ 666:             self.block.truncate(frames * ch);
+ 667:             self.consumed += frames as u64;
+ 668:             match self.rate.as_mut() {
+ 669:                 Some(r) => r.run(&self.block, &self.p, self.ended, &mut self.out),
+ 670:                 None => self.out.extend_from_slice(&self.block),
+ 671:             }
+ 672:             if !self.out.is_empty() || self.ended {
+ 673:                 break;
+ 674:             }
+ 675:         }
+ 676:         let fx_on = self.fx.active();
+ 677:         for frame in self.out.chunks_mut(ch) {
+ 678:             for s in frame.iter_mut() {
+ 679:                 *s = self.eq.process(*s);
+ 680:             }
+ 681:             if fx_on {
+ 682:                 self.fx.frame(frame);
+ 683:             }
+ 684:             for s in frame.iter_mut() {
+ 685:                 *s = if s.is_finite() { s.clamp(-1.0, 1.0) } else { 0.0 };
+ 686:             }
+ 687:         }
+ 688:         let buffered = self.rate.as_ref().map(|r| r.buffered(&self.p)).unwrap_or(0.0);
+ 689:         let frames = (self.consumed as f64 - buffered).max(0.0);
+ 690:         self.played_ms.store((frames * 1000.0 / self.sample_rate.max(1) as f64) as u64, Ordering::Relaxed);
+3://! 參數放在共享的 `EqShared`，播放中的音源每個 frame 檢查版本號，
+35:    fn default() -> Self {
+40:pub struct EqShared {
+45:impl EqShared {
+46:    pub fn new() -> Self {
+50:    pub fn get(&self) -> EqParams {
+54:    pub fn version(&self) -> u64 {
+58:    pub fn update(&self, f: impl FnOnce(&mut EqParams)) {
+91:fn peaking(sample_rate: f64, freq: f64, gain_db: f64) -> Option<Coef> {
+109:fn coef_db(c: &Coef, sample_rate: f64, freq: f64) -> f64 {
+119:fn chain_db(internal: &[f64; BANDS], sample_rate: f64, freq: f64) -> f64 {
+128:fn solve(mut m: [[f64; BANDS]; BANDS], mut y: [f64; BANDS]) -> Option<[f64; BANDS]> {
+154:pub fn design_gains(bands: &[f32; BANDS], sample_rate: f64) -> [f64; BANDS] {
+191:pub fn make_chain(bands: &[f32; BANDS], sample_rate: u32) -> Vec<Biquad> {
+203:    pub fn process(&mut self, x: f32) -> f32 {
+211:    fn retune(&mut self, next: &Biquad) {
+220:pub fn db_to_linear(db: f32) -> f32 {
+224:/// 每個聲道一條濾波鏈，跟著 EqShared 的版本即時換係數。
+226:    shared: std::sync::Arc<EqShared>,
+239:    pub fn new(shared: std::sync::Arc<EqShared>, sample_rate: u32, channels: u16, norm_gain: f32) -> Self {
+257:    fn refresh(&mut self) {
+282:    pub fn process(&mut self, x: f32) -> f32 {
+302:pub fn response_curve(params: &EqParams, sample_rate: u32, points: usize) -> Vec<[f32; 2]> {
+320:    fn at(bands: &[f32; BANDS], fs: u32, f: f64) -> f64 {
+325:    fn center_response_matches_sliders() {
+343:    fn flat_is_bypass() {
+348:    fn live_update_changes_output_without_new_processor() {
+349:        let shared = std::sync::Arc::new(EqShared::new());
+373:    fn preamp_applies() {
+374:        let shared = std::sync::Arc::new(EqShared::new());
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'src-tauri/src/player.rs'; "'$lines=Get-Content -LiteralPath $p; foreach ($r in @(@(140,173),@(350,564),@(880,909))) { for($n=$r[0];$n -le $r[1];$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] } }; rg -n '"'fn restart|fn load|EqProcessor|set_stream_source|track_chain|DspSource|core_lock|FxParams|SetFx' src-tauri/src/player.rs" in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 481ms:
+ 140:     fn get_default_device_sample_rate() -> Option<u32> {
+ 141:         use rodio::cpal::traits::{DeviceTrait, HostTrait};
+ 142:         let host = rodio::cpal::default_host();
+ 143:         let device = host.default_output_device()?;
+ 144:         let config = device.default_output_config().ok()?;
+ 145:         Some(config.sample_rate().0)
+ 146:     }
+ 147: 
+ 148:     fn init_dsp(&mut self) {
+ 149:         // 初始化 EQ processor
+ 150:         let mut eq_proc = self.core.eq_processor.lock().unwrap();
+ 151:         *eq_proc = Some(EqProcessor::new(
+ 152:             self.core.eq_shared.clone(),
+ 153:             INTERNAL_SAMPLE_RATE,
+ 154:             INTERNAL_CHANNELS,
+ 155:             1.0,
+ 156:         ));
+ 157: 
+ 158:         // 初始化 FX chain
+ 159:         let mut fx_chain = self.core.fx_chain.lock().unwrap();
+ 160:         *fx_chain = Some(FxChain::new(INTERNAL_SAMPLE_RATE, INTERNAL_CHANNELS as usize));
+ 161:     }
+ 162: 
+ 163:     fn spawn_recycle_thread(rx: Receiver<RecycleItem>, cancel_flag: Arc<AtomicBool>, coordinator: Arc<crate::playback_pipeline::NextCoordinator>) -> thread::JoinHandle<()> {
+ 164:         thread::spawn(move || {
+ 165:             // SE9：回收期間凍結新準備工作（quota freeze），超過 30 秒仍未結束標記孤兒
+ 166:             while !cancel_flag.load(Ordering::Relaxed) {
+ 167:                 match rx.recv_timeout(Duration::from_millis(100)) {
+ 168:                     Ok(item) => {
+ 169:                         coordinator.set_preparing_frozen(true); // 回收中凍結新準備工作
+ 170:                         let deadline = Instant::now() + Duration::from_secs(10);
+ 171:                         let mut finished = false;
+ 172:                         match item {
+ 173:                             RecycleItem::FfmpegStream(stream) => {
+ 350:         self.sink = Some(sink);
+ 351:         self.proxy_id = new_proxy_id;
+ 352:         self.device_sample_rate = new_sample_rate;
+ 353: 
+ 354:         if self.is_playing {
+ 355:             if let Some(ref sink) = self.sink {
+ 356:                 sink.play();
+ 357:             }
+ 358:         }
+ 359: 
+ 360:         log_line(&format!("Switched output device to {} ({} Hz)", name, new_sample_rate));
+ 361:         Ok(())
+ 362:     }
+ 363: 
+ 364:     fn load(&mut self, path: &str, song_id: i64) -> Result<(), String> {
+ 365:         self.load_at(path, song_id, 0, true)
+ 366:     }
+ 367: 
+ 368:     fn load_at(&mut self, path: &str, song_id: i64, position_ms: i64, play: bool) -> Result<(), String> {
+ 369:         self.halt_radio();
+ 370:         validate_local_path(Path::new(path))?;
+ 371: 
+ 372:         if let Some(ref sink) = self.sink {
+ 373:             sink.stop();
+ 374:             sink.clear();
+ 375:         }
+ 376: 
+ 377:         // 播放序號與 token（C1：Load/Prepare 都傳入 token、publish 更新序號/token/播放狀態）
+ 378:         let seq = self.seq_counter.fetch_add(1, Ordering::AcqRel);
+ 379:         let token = self.next_token_counter.fetch_add(1, Ordering::AcqRel);
+ 380:         self.core.set_now_identity(seq, token);
+ 381:         self.core.reset_played_out_frames();
+ 382:         self.core.set_seek_origin_ms(position_ms.max(0) as u64);
+ 383:         self.core.clear_expired_boundaries(seq + 1);
+ 384:         self.core.set_playback_state(PlaybackState::Playing);
+ 385:         // 載入/跳轉會清掉先前排入的下一首，遞增 epoch 讓前端知道需重新排入
+ 386:         if play {
+ 387:             self.core.increment_next_clear_epoch();
+ 388:         }
+ 389:         // C5取消：Load/Seek 會清除協調器待播槽，避免舊準備結果誤入新軌後
+ 390:         self.core.next_coordinator().clear_next();
+ 391:         self.next_coord_gen = self.core.next_coordinator().current_generation();
+ 392:         self.core.set_stream_source(None); // 串流軌與記憶體軌切換時先清掉舊來源
+ 393: 
+ 394:         let ext = Path::new(path)
+ 395:             .extension()
+ 396:             .and_then(|e| e.to_str())
+ 397:             .map(|e| e.to_lowercase())
+ 398:             .unwrap_or_default();
+ 399: 
+ 400:         let backend = playback_backend_for(&ext);
+ 401: 
+ 402:         // (TrackChain, TrackResampler, 串流來源（長檔/ffmpeg 串流）, decoder 標記)
+ 403:         let (track_chain, track_resampler, stream_source, decoder) = match backend {
+ 404:             Some(crate::scanner::Backend::Symphonia) => {
+ 405:                 // SE7：配置前封包上限預檢，超標則拒絕，不呼叫 open()
+ 406:                 if let Err(reason) = precheck_packet_budget(Path::new(path)) {
+ 407:                     return Err(format!("封包上限預檢失敗：{reason}"));
+ 408:                 }
+ 409:                 match SymStream::open(Path::new(path), position_ms) {
+ 410:                     Ok(mut stream) => {
+ 411:                         let duration_ms = stream.duration_ms().filter(|d| *d > 0).unwrap_or(0);
+ 412:                         let is_long = duration_ms > STREAM_OVER_MS || duration_ms == 0;
+ 413:                         let sample_rate = stream.sample_rate().max(1);
+ 414:                         let channels = stream.channels().max(1);
+ 415: 
+ 416:                         if is_long {
+ 417:                             // 長檔直接串流，但需經 TrackResampler 重取樣到 48kHz
+ 418:                             let stream_source: Option<Box<dyn Iterator<Item = f32> + Send>> =
+ 419:                                 Some(Box::new(stream));
+ 420:                             let mut resampler = TrackResampler::new();
+ 421:                             resampler.set_track(Some(TrackChainItem {
+ 422:                                 samples: Arc::new(Vec::new()),
+ 423:                                 sample_rate,
+ 424:                                 channels,
+ 425:                                 duration_ms,
+ 426:                                 song_id,
+ 427:                                 norm_gain: 1.0,
+ 428:                                 token,
+ 429:                                 seq,
+ 430:                                 native_frame_pos: 0,
+ 431:                                 path: path.to_string(),
+ 432:                                 decoder: "stream".to_string(),
+ 433:                             }));
+ 434:                             (
+ 435:                                 TrackChain::new(),
+ 436:                                 resampler,
+ 437:                                 stream_source,
+ 438:                                 "stream".to_string(),
+ 439:                             )
+ 440:                         } else {
+ 441:                             let samples = collect_pcm_limit(stream.by_ref())?;
+ 442:                             let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
+ 443:                             let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
+ 444:                             let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
+ 445: 
+ 446:                             let mut chain = TrackChain::new();
+ 447:                             chain.append(TrackChainItem {
+ 448:                                 samples: Arc::new(samples),
+ 449:                                 sample_rate,
+ 450:                                 channels,
+ 451:                                 duration_ms,
+ 452:                                 song_id,
+ 453:                                 norm_gain,
+ 454:                                 token,
+ 455:                                 seq,
+ 456:                                 native_frame_pos: 0,
+ 457:                                 path: path.to_string(),
+ 458:                                 decoder: "symphonia".to_string(),
+ 459:                             });
+ 460:                             chain.set_coordinator(self.core.next_coordinator());
+ 461: 
+ 462:                             let mut resampler = TrackResampler::new();
+ 463:                             resampler.set_track(Some(chain.current().unwrap().clone()));
+ 464: 
+ 465:                             (chain, resampler, None, "symphonia".to_string())
+ 466:                         }
+ 467:                     }
+ 468:                     Err(_e) => self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token)?,
+ 469:                 }
+ 470:             }
+ 471:             Some(crate::scanner::Backend::Ffmpeg) => {
+ 472:                 self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token)?
+ 473:             }
+ 474:             None => {
+ 475:                 return Err(format!("這個格式尚未支援: {}", ext));
+ 476:             }
+ 477:         };
+ 478: 
+ 479:         *self.core.track_chain.lock().unwrap() = Some(track_chain);
+ 480:         *self.core.track_resampler.lock().unwrap() = Some(track_resampler);
+ 481:         self.core.set_stream_source(stream_source);
+ 482: 
+ 483:         // 換軌時重新串接一個新的 OutputProxy 到長駐 Sink（同一 proxy_id，active_id 不變）
+ 484:         if let Some(ref sink) = self.sink {
+ 485:             sink.append(OutputProxy::new(self.core.clone(), self.device_sample_rate, self.proxy_id));
+ 486:         }
+ 487: 
+ 488:         *self.current_decoder.lock().unwrap() = Some(decoder);
+ 489:         *self.current_path.lock().unwrap() = Some(path.to_string());
+ 490: 
+ 491:         self.kind = "file".into();
+ 492:         self.stream_title.clear();
+ 493:         self.error.clear();
+ 494:         self.ended = false;
+ 495: 
+ 496:         if play {
+ 497:             if let Some(ref sink) = self.sink {
+ 498:                 sink.play();
+ 499:             }
+ 500:             self.is_playing = true;
+ 501:         } else {
+ 502:             if let Some(ref sink) = self.sink {
+ 503:                 sink.pause();
+ 504:             }
+ 505:             self.is_playing = false;
+ 506:         }
+ 507: 
+ 508:         log_line(&format!("LOAD_OK {} song_id={} decoder={:?}", path, song_id, self.current_decoder.lock().unwrap()));
+ 509:         Ok(())
+ 510:     }
+ 511: 
+ 512:     fn prepare_ffmpeg_track(&mut self, path: &str, song_id: i64, ext: &str, position_ms: i64, seq: u64, token: u64) -> Result<(TrackChain, TrackResampler, Option<Box<dyn Iterator<Item = f32> + Send>>, String), String> {
+ 513:         let ffprobe_path = locate("ffprobe.exe")
+ 514:             .map(|(p, _, _)| p)
+ 515:             .ok_or("找不到 ffprobe")?;
+ 516: 
+ 517:         // SE6：使用 ffprobe_json helper（64 KB / 10 s 上限，逾時可中斷）
+ 518:         let value = ffprobe_json(&ffprobe_path, path)?;
+ 519: 
+ 520:         let streams = value["streams"].as_array().ok_or("無音訊串流")?;
+ 521:         let audio_stream = streams.iter().find(|s| s["codec_type"] == "audio").ok_or("無音訊串流")?;
+ 522: 
+ 523:         let codec = audio_stream["codec_name"].as_str().unwrap_or("");
+ 524:         let sample_rate = audio_stream["sample_rate"].as_str().unwrap_or("0").parse().unwrap_or(0);
+ 525:         let channels = audio_stream["channels"].as_u64().unwrap_or(0) as u16;
+ 526:         let duration = value["format"]["duration"].as_str().and_then(|d| d.parse::<f64>().ok());
+ 527:         let duration_ms = duration.map(|d| (d * 1000.0) as i64).unwrap_or(0);
+ 528: 
+ 529:         let is_long = duration_ms > STREAM_OVER_MS || duration_ms == 0;
+ 530: 
+ 531:         let (final_sr, final_ch) = if codec.starts_with("dsd") {
+ 532:             let dsd_rate = sample_rate;
+ 533:             let pcm_rate = (dsd_rate / 32).min(176400);
+ 534:             (pcm_rate, 2)
+ 535:         } else {
+ 536:             (sample_rate.max(1), channels.max(1))
+ 537:         };
+ 538: 
+ 539:         if is_long {
+ 540:             let ffmpeg_path = locate("ffmpeg.exe")
+ 541:                 .map(|(p, _, _)| p)
+ 542:                 .ok_or("找不到 ffmpeg")?;
+ 543: 
+ 544:             let stream = FfmpegStream::new(&ffmpeg_path, path, final_sr, final_ch, duration_ms)?;
+ 545:             // 串流軌由設定為 TrackChain 之外的 stream_source 直接播放（不回收，由 set_stream_source 換軌時釋放）
+ 546:             let stream_source: Option<Box<dyn Iterator<Item = f32> + Send>> = Some(Box::new(stream));
+ 547:             let chain = TrackChain::new();
+ 548:             let resampler = TrackResampler::new();
+ 549:             Ok((chain, resampler, stream_source, "stream".to_string()))
+ 550:         } else {
+ 551:             let ffmpeg_path = locate("ffmpeg.exe")
+ 552:                 .map(|(p, _, _)| p)
+ 553:                 .ok_or("找不到 ffmpeg")?;
+ 554: 
+ 555:             let output = Command::new(&ffmpeg_path)
+ 556:                 .args([
+ 557:                     "-nostdin",
+ 558:                     "-v",
+ 559:                     "error",
+ 560:                     "-protocol_whitelist",
+ 561:                     "file,pipe", // SE11：本機 ffmpeg 只允許 file/pipe
+ 562:                     "-i",
+ 563:                     path,
+ 564:                     "-f",
+ 880:                 PlayerCommand::SetMode { mode } => {
+ 881:                     if !matches!(mode, PlayMode::All | PlayMode::Random) {
+ 882:                         engine.core.next_coordinator().clear_next();
+ 883:                     }
+ 884:                     engine.mode = mode;
+ 885:                 }
+ 886:                 PlayerCommand::SetEq { bands } => {
+ 887:                     engine.core.eq_shared.update(|p| {
+ 888:                         for (i, g) in bands.into_iter().take(BANDS).enumerate() {
+ 889:                             p.bands[i] = g;
+ 890:                         }
+ 891:                     });
+ 892:                 }
+ 893:                 PlayerCommand::SetPreamp { db } => {
+ 894:                     engine.core.eq_shared.update(|p| p.preamp_db = db);
+ 895:                 }
+ 896:                 PlayerCommand::SetEqEnabled { enabled } => {
+ 897:                     engine.core.eq_shared.update(|p| p.enabled = enabled);
+ 898:                 }
+ 899:                 PlayerCommand::SetFx { fx } => {
+ 900:                     engine.core.eq_shared.update(|p| p.fx = fx);
+ 901:                 }
+ 902:                 PlayerCommand::SetOutput { name } => {
+ 903:                     if let Err(e) = engine.switch_output(&name) {
+ 904:                         engine.error = e;
+ 905:                     } else {
+ 906:                         engine.error.clear();
+ 907:                     }
+ 908:                 }
+ 909:                 PlayerCommand::SetNormalize { enabled } => {
+7:use crate::dsp::{DspSource, FxParams, FxChain, RateStage, BLOCK as DSP_BLOCK};
+8:use crate::eq::{EqProcessor, EqShared, BANDS, EQ_HZ, db_to_linear};
+73:    /// 電台位置追蹤（DspSource::new 回傳）
+151:        *eq_proc = Some(EqProcessor::new(
+278:        if let Ok(chain_guard) = self.core.track_chain.lock() {
+289:        if let Ok(chain_guard) = self.core.track_chain.lock() {
+302:            if let Ok(chain_guard) = self.core.track_chain.lock() {
+337:            let _guard = self.core.core_lock.lock().unwrap();
+364:    fn load(&mut self, path: &str, song_id: i64) -> Result<(), String> {
+368:    fn load_at(&mut self, path: &str, song_id: i64, position_ms: i64, play: bool) -> Result<(), String> {
+392:        self.core.set_stream_source(None); // 串流軌與記憶體軌切換時先清掉舊來源
+403:        let (track_chain, track_resampler, stream_source, decoder) = match backend {
+479:        *self.core.track_chain.lock().unwrap() = Some(track_chain);
+481:        self.core.set_stream_source(stream_source);
+545:            // 串流軌由設定為 TrackChain 之外的 stream_source 直接播放（不回收，由 set_stream_source 換軌時釋放）
+618:    fn restart_from(&mut self, ms: i64, play: bool) {
+621:            let chain_guard = self.core.track_chain.lock().unwrap();
+639:        self.core.track_chain.lock().unwrap().take();
+773:        let (dsp, played) = DspSource::new(
+899:                PlayerCommand::SetFx { fx } => {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+目前確認到兩個尚未閉合的契約：4.1 將重取樣後、尚未經 DSP 的資料放進 `dsp_out`，但 4.2 又把它定義為 DSP 最終輸出；另外，4.1 寫的 `TrackResampler::process()` 簽名與現有程式不符。我會接著核對參數套用及換軌生命週期，確認修正範圍。
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'src-tauri/src/eq.rs'; "'$lines=Get-Content -LiteralPath $p; foreach ($r in @(@(24,79),@(224,301))) { for($n=$r[0];$n -le $r[1];$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] } }; $p='"'src-tauri/src/playback_pipeline.rs'; "'$lines=Get-Content -LiteralPath $p; foreach ($r in @(@(40,78),@(936,1036),@(640,744))) { for($n=$r[0];$n -le $r[1];$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] } }' in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 475ms:
+  24: #[derive(Clone, Debug, PartialEq)]
+  25: pub struct EqParams {
+  26:     pub enabled: bool,
+  27:     pub bands: [f32; BANDS],
+  28:     pub preamp_db: f32,
+  29:     pub normalize: bool,
+  30:     /// 等化器以外的音效（速度、殘響…）。跟等化器共用版本號，一起即時生效。
+  31:     pub fx: crate::dsp::FxParams,
+  32: }
+  33: 
+  34: impl Default for EqParams {
+  35:     fn default() -> Self {
+  36:         Self { enabled: true, bands: [0.0; BANDS], preamp_db: 0.0, normalize: false, fx: crate::dsp::FxParams::default() }
+  37:     }
+  38: }
+  39: 
+  40: pub struct EqShared {
+  41:     params: Mutex<EqParams>,
+  42:     version: AtomicU64,
+  43: }
+  44: 
+  45: impl EqShared {
+  46:     pub fn new() -> Self {
+  47:         Self { params: Mutex::new(EqParams::default()), version: AtomicU64::new(1) }
+  48:     }
+  49: 
+  50:     pub fn get(&self) -> EqParams {
+  51:         self.params.lock().map(|p| p.clone()).unwrap_or_default()
+  52:     }
+  53: 
+  54:     pub fn version(&self) -> u64 {
+  55:         self.version.load(Ordering::Acquire)
+  56:     }
+  57: 
+  58:     pub fn update(&self, f: impl FnOnce(&mut EqParams)) {
+  59:         if let Ok(mut p) = self.params.lock() {
+  60:             f(&mut p);
+  61:             for b in p.bands.iter_mut() {
+  62:                 *b = if b.is_finite() { b.clamp(-GAIN_LIMIT_DB, GAIN_LIMIT_DB) } else { 0.0 };
+  63:             }
+  64:             p.preamp_db = if p.preamp_db.is_finite() { p.preamp_db.clamp(-GAIN_LIMIT_DB, GAIN_LIMIT_DB) } else { 0.0 };
+  65:             p.fx = p.fx.clone().sanitized();
+  66:         }
+  67:         self.version.fetch_add(1, Ordering::AcqRel);
+  68:     }
+  69: }
+  70: 
+  71: #[derive(Clone, Copy, Debug)]
+  72: pub struct Biquad {
+  73:     pub(crate) b0: f32,
+  74:     pub(crate) b1: f32,
+  75:     pub(crate) b2: f32,
+  76:     pub(crate) a1: f32,
+  77:     pub(crate) a2: f32,
+  78:     pub(crate) z1: f32,
+  79:     pub(crate) z2: f32,
+ 224: /// 每個聲道一條濾波鏈，跟著 EqShared 的版本即時換係數。
+ 225: pub struct EqProcessor {
+ 226:     shared: std::sync::Arc<EqShared>,
+ 227:     seen: u64,
+ 228:     sample_rate: u32,
+ 229:     channels: usize,
+ 230:     pub(crate) chains: Vec<Vec<Biquad>>,
+ 231:     enabled: bool,
+ 232:     norm_gain: f32,
+ 233:     gain_target: f32,
+ 234:     gain_now: f32,
+ 235:     idx: usize,
+ 236: }
+ 237: 
+ 238: impl EqProcessor {
+ 239:     pub fn new(shared: std::sync::Arc<EqShared>, sample_rate: u32, channels: u16, norm_gain: f32) -> Self {
+ 240:         let mut p = Self {
+ 241:             shared,
+ 242:             seen: 0,
+ 243:             sample_rate: sample_rate.max(1),
+ 244:             channels: channels.max(1) as usize,
+ 245:             chains: Vec::new(),
+ 246:             enabled: true,
+ 247:             norm_gain,
+ 248:             gain_target: 1.0,
+ 249:             gain_now: 1.0,
+ 250:             idx: 0,
+ 251:         };
+ 252:         p.refresh();
+ 253:         p.gain_now = p.gain_target;
+ 254:         p
+ 255:     }
+ 256: 
+ 257:     fn refresh(&mut self) {
+ 258:         let v = self.shared.version();
+ 259:         if v == self.seen {
+ 260:             return;
+ 261:         }
+ 262:         self.seen = v;
+ 263:         let params = self.shared.get();
+ 264:         let norm = if params.normalize { self.norm_gain } else { 1.0 };
+ 265:         let pre = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
+ 266:         self.gain_target = norm * pre;
+ 267:         let chain = if params.enabled { make_chain(&params.bands, self.sample_rate) } else { Vec::new() };
+ 268:         let reuse = self.enabled == params.enabled && self.chains.first().map(|c| c.len()) == Some(chain.len());
+ 269:         if reuse {
+ 270:             for ch in self.chains.iter_mut() {
+ 271:                 for (f, n) in ch.iter_mut().zip(chain.iter()) {
+ 272:                     f.retune(n);
+ 273:                 }
+ 274:             }
+ 275:         } else {
+ 276:             self.chains = (0..self.channels).map(|_| chain.clone()).collect();
+ 277:         }
+ 278:         self.enabled = params.enabled;
+ 279:     }
+ 280: 
+ 281:     #[inline]
+ 282:     pub fn process(&mut self, x: f32) -> f32 {
+ 283:         let ch = self.idx % self.channels;
+ 284:         self.idx = self.idx.wrapping_add(1);
+ 285:         if ch == 0 {
+ 286:             self.refresh();
+ 287:             // 前級／正規化變更用約 10ms 的平滑，避免拖桿時爆音。
+ 288:             self.gain_now += (self.gain_target - self.gain_now) * 0.004;
+ 289:         }
+ 290:         let mut s = x * self.gain_now;
+ 291:         if let Some(chain) = self.chains.get_mut(ch) {
+ 292:             for f in chain.iter_mut() {
+ 293:                 s = f.process(s);
+ 294:             }
+ 295:         }
+ 296:         // 不在這裡限幅：後面的音效還要處理，最後由 DspSource 統一限幅。
+ 297:         if s.is_finite() { s } else { 0.0 }
+ 298:     }
+ 299: }
+ 300: 
+ 301: /// 畫面曲線：用與音訊執行緒相同的設計算 20Hz–20kHz 響應（含前級）。
+  40: #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  41: pub enum PlaybackState {
+  42:     /// 正常播放
+  43:     Playing,
+  44:     /// 目前軌結束、槽空，等待下一首（DSP 凍結，輸出靜音繞過 DSP）
+  45:     WaitingForNext,
+  46:     /// 暫停
+  47:     Paused,
+  48:     /// 播放結束（無下一首）
+  49:     Finished,
+  50: }
+  51: 
+  52: /// 唯一權威座標：DSP 輸出端的 48kHz frame（離開 DSP、進入 DeviceConverter 的那一刻）
+  53: /// 兩套邊界分離，職責分層：
+  54: /// - boundary_in_48k：TrackResampler 負責。原生邊界 × 48000 / 原生取樣率 + 重取樣器延遲 - 尾端補樣。單位：DSP 輸入端 48kHz frame。
+  55: /// - boundary_out_48k：DSP 負責。boundary_in_48k 經由 DSP 檢查點映射（含 WSOLA 伸縮、EQ 濾波器延遲、殘響、限幅）轉換而來。單位：DSP 輸出端 48kHz frame。
+  56: 
+  57: /// 交界紀錄
+  58: #[derive(Debug, Clone)]
+  59: pub struct BoundaryRecord {
+  60:     /// DSP 輸入端 48kHz frame 位置（用於進度計算）
+  61:     pub boundary_in_48k: u64,
+  62:     /// DSP 輸出端 48kHz frame 位置（用於交界發布、DeviceConverter 同步）
+  63:     pub boundary_out_48k: u64,
+  64:     /// 播放序號
+  65:     pub seq: u64,
+  66:     /// token
+  67:     pub token: u64,
+  68:     /// 歌曲 ID
+  69:     pub song_id: i64,
+  70:     /// 正規化增益
+  71:     pub norm_gain: f32,
+  72:     /// 時長
+  73:     pub duration_ms: i64,
+  74:     /// 原生取樣率
+  75:     pub native_sample_rate: u32,
+  76:     /// 原生聲道
+  77:     pub native_channels: u16,
+  78: }
+ 936:     pub fn process(&mut self, input: f32) -> Option<f32> {
+ 937:         if self.current_track.is_none() {
+ 938:             return None;
+ 939:         }
+ 940: 
+ 941:         let ch = self.current_track.as_ref().unwrap().channels as usize;
+ 942:         let internal_ch = INTERNAL_CHANNELS as usize;
+ 943: 
+ 944:         self.input_buffer.push(input);
+ 945:         // 只有湊齊一個 native frame（ch 個樣本）才計入框計數
+ 946:         if self.input_buffer.len() % ch != 0 {
+ 947:             return self.pop_output();
+ 948:         }
+ 949:         self.frames_in_buffer += 1;
+ 950: 
+ 951:         // 累積到滿一個 rubato 區塊再處理；不足時回傳已緩衝的輸出（若有）
+ 952:         if self.frames_in_buffer < BLOCK_FRAMES {
+ 953:             return self.pop_output();
+ 954:         }
+ 955: 
+ 956:         // 取出 BLOCK_FRAMES 個 native frame，轉成 rubato 非交錯格式（內建 internal_ch 聲道）
+ 957:         let block_samples: Vec<f32> = self.input_buffer.drain(..).collect();
+ 958:         let block: Vec<Vec<f32>> = (0..internal_ch)
+ 959:             .map(|c| {
+ 960:                 (0..BLOCK_FRAMES).map(|i| {
+ 961:                     let native_idx = i * ch + if c < ch { c } else { 0 };
+ 962:                     block_samples[native_idx]
+ 963:                 }).collect()
+ 964:             })
+ 965:             .collect();
+ 966:         if let Some(ref mut resampler) = self.resampler {
+ 967:             match resampler.process(&block, None) {
+ 968:                 Ok(out) => {
+ 969:                     let n = out.first().map(|v| v.len()).unwrap_or(0);
+ 970:                     for f in 0..n {
+ 971:                         for c in 0..internal_ch {
+ 972:                             self.output_buffer.push(out[c][f]);
+ 973:                         }
+ 974:                     }
+ 975:                     self.output_frames += n as u64;
+ 976:                 }
+ 977:                 Err(e) => {
+ 978:                     log_line(&format!("track resampler process error: {e}"));
+ 979:                 }
+ 980:             }
+ 981:         }
+ 982:         self.frames_in_buffer = 0;
+ 983:         self.input_frames += BLOCK_FRAMES as u64;
+ 984: 
+ 985:         self.pop_output()
+ 986:     }
+ 987: 
+ 988:     /// 處理一批輸入（用於高效處理）
+ 989:     pub fn process_batch(&mut self, input: &[f32], output: &mut Vec<f32>) {
+ 990:         if self.current_track.is_none() {
+ 991:             return;
+ 992:         }
+ 993: 
+ 994:         let ch = self.current_track.as_ref().unwrap().channels as usize;
+ 995:         let frames = input.len() / ch;
+ 996:         let internal_ch = INTERNAL_CHANNELS as usize;
+ 997:         if let Some(ref mut resampler) = self.resampler {
+ 998:             // 把交錯輸入轉成 rubato 的非交錯格式（一個 Vec per 聲道）。
+ 999:             let input_chan: Vec<Vec<f32>> = (0..internal_ch)
+1000:                 .map(|c| {
+1001:                     (0..frames)
+1002:                         .map(|i| {
+1003:                             let idx = i * ch + if c < ch { c } else { 0 };
+1004:                             input[idx]
+1005:                         })
+1006:                         .collect()
+1007:                 })
+1008:                 .collect();
+1009:             match resampler.process(&input_chan, None) {
+1010:                 Ok(out) => {
+1011:                     let n = out.first().map(|v| v.len()).unwrap_or(0);
+1012:                     for f in 0..n {
+1013:                         for c in 0..internal_ch {
+1014:                             output.push(out[c][f]);
+1015:                         }
+1016:                     }
+1017:                     self.output_frames += n as u64;
+1018:                 }
+1019:                 Err(_) => {
+1020:                     log_line("track resampler process_batch error");
+1021:                 }
+1022:             }
+1023:         }
+1024:         self.input_frames += frames as u64;
+1025:     }
+1026: 
+1027:     /// 取得 boundary_in_48k（DSP 輸入端 48kHz frame 邊界）
+1028:     pub fn boundary_in_48k(&self) -> u64 {
+1029:         self.boundary_in_48k_accum + self.output_frames
+1030:     }
+1031: 
+1032:     /// 更新邊界累計（當軌切換時呼叫）
+1033:     pub fn commit_boundary(&mut self) {
+1034:         self.boundary_in_48k_accum += self.output_frames;
+1035:         self.output_frames = 0;
+1036:     }
+ 640:     pub fn take_next(&mut self, next: Option<TrackChainItem>) -> Option<BoundaryRecord> {
+ 641:         // 釋放已播放完畢的軌，只保留目前軌之後的資料（軌資料生命週期：最多三份）
+ 642:         // 釋放所有已播放完畢的軌，只保留最多一軌（軌資料生命週期：最多三份）
+ 643:         self.tracks.clear();
+ 644:         self.current_index = 0;
+ 645:         self.finished = false;
+ 646: 
+ 647:         if let Some(item) = next {
+ 648:             self.tracks.push(item);
+ 649:             self.current_index = 0;
+ 650:             self.record_boundary()
+ 651:         } else {
+ 652:             // 沒有下一軌
+ 653:             self.finished = true;
+ 654:             None
+ 655:         }
+ 656:     }
+ 657: 
+ 658:     fn record_boundary(&mut self) -> Option<BoundaryRecord> {
+ 659:         if self.current_index == 0 || self.current_index >= self.tracks.len() {
+ 660:             return None;
+ 661:         }
+ 662:         let prev = &self.tracks[self.current_index - 1];
+ 663:         let curr = &self.tracks[self.current_index];
+ 664: 
+ 665:         // 計算 boundary_in_48k：原生 frame 位置 × 48000 / 原生取樣率
+ 666:         // 這裡簡化：累積前一軌的原生 frame 數轉 48kHz
+ 667:         let native_frames = prev.samples.len() as u64 / prev.channels as u64;
+ 668:         let boundary_in_48k = prev.native_frame_pos + (native_frames * 48000 / prev.sample_rate as u64);
+ 669: 
+ 670:         Some(BoundaryRecord {
+ 671:             boundary_in_48k,
+ 672:             boundary_out_48k: 0, // 由 DSP 填入
+ 673:             seq: curr.seq,
+ 674:             token: curr.token,
+ 675:             song_id: curr.song_id,
+ 676:             norm_gain: curr.norm_gain,
+ 677:             duration_ms: curr.duration_ms,
+ 678:             native_sample_rate: curr.sample_rate,
+ 679:             native_channels: curr.channels,
+ 680:         })
+ 681:     }
+ 682: 
+ 683:     /// 取得當前軌
+ 684:     pub fn current(&self) -> Option<&TrackChainItem> {
+ 685:         if self.current_index < self.tracks.len() {
+ 686:             Some(&self.tracks[self.current_index])
+ 687:         } else {
+ 688:             None
+ 689:         }
+ 690:     }
+ 691: 
+ 692:     /// 是否結束
+ 693:     pub fn is_finished(&self) -> bool {
+ 694:         self.finished && (self.tracks.is_empty() || self.current_index >= self.tracks.len() - 1)
+ 695:     }
+ 696: }
+ 697: 
+ 698: impl Iterator for TrackChain {
+ 699:     type Item = f32;
+ 700: 
+ 701:     fn next(&mut self) -> Option<f32> {
+ 702:         loop {
+ 703:             if let Some(track) = self.tracks.get_mut(self.current_index) {
+ 704:                 if track.native_frame_pos < track.samples.len() as u64 {
+ 705:                     let sample = track.samples[track.native_frame_pos as usize];
+ 706:                     track.native_frame_pos += 1;
+ 707:                     return Some(sample);
+ 708:                 } else {
+ 709:                     // 當前軌結束
+ 710:                     if self.current_index + 1 < self.tracks.len() {
+ 711:                         // 還有預載的軌，直接接上
+ 712:                         self.current_index += 1;
+ 713:                         // 釋放已播放完畢的軌（軌資料生命週期）
+ 714:                         if self.current_index > 0 {
+ 715:                             self.tracks.drain(..self.current_index);
+ 716:                             self.current_index = 0;
+ 717:                         }
+ 718:                         continue;
+ 719:                     } else if let Some(coord) = &self.coordinator {
+ 720:                         // 唯一交接點：從待播槽 take 下一軌
+ 721:                         if let Some(prepared) = coord.take_next() {
+ 722:                             if let Some(item) = prepared_to_trackchain_item(&prepared) {
+ 723:                                 self.take_next(Some(item));
+ 724:                                 continue;
+ 725:                             }
+ 726:                         }
+ 727:                         // 槽空：鏈結束
+ 728:                         self.finished = true;
+ 729:                         return None;
+ 730:                     } else {
+ 731:                         self.finished = true;
+ 732:                         return None;
+ 733:                     }
+ 734:                 }
+ 735:             } else {
+ 736:                 return None;
+ 737:             }
+ 738:         }
+ 739:     }
+ 740: }
+ 741: 
+ 742: /// 將 PreparedTrack 轉成 TrackChainItem。僅記憶體軌可進入 TrackChain，
+ 743: /// 串流軌由引擎直接以 DspSource 處理，不經 TrackChain。
+ 744: fn prepared_to_trackchain_item(prepared: &PreparedTrack) -> Option<TrackChainItem> {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+exec
+"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '$p='"'planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md'; "'$lines=Get-Content -LiteralPath $p; for($n=111;$n -le $lines.Count;$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] }; $p='"'src-tauri/src/player.rs'; "'$lines=Get-Content -LiteralPath $p; for($n=618;$n -le 648;$n++){ '"'{0,4}: {1}' -f "'$n,$lines[$n-1] }; $paths=@('"'planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md','planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md','planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Review.md','src-tauri/src/playback_pipeline.rs','src-tauri/src/dsp.rs','src-tauri/src/player.rs','src-tauri/src/eq.rs'); foreach("'$p in $paths){ $h=Get-FileHash -LiteralPath $p; '"'{0} {1}' -f "'$h.Hash,$p }; git -c safe.directory=C:/tempDevelopmenyEnviroment/LaiFlashTune/SonicLedger status --short' in C:\tempDevelopmenyEnviroment\LaiFlashTune\SonicLedger
+ succeeded in 503ms:
+ 111: 
+ 112: ## 驗收條件對照
+ 113: 
+ 114: | AC 編號 | Planning 條件 | 設計對應 | 測試方式 |
+ 115: |---|---|---|---|
+ 116: | AC1 | 長檔串流樣本經 TrackResampler 重取樣到 48kHz | R1、R2 → `playback_pipeline.rs` `next_playing()` 串流軌分支，移除繞過路徑 | 單元測試：建立長檔串流來源（未知長度或 >15 分鐘），確認 `next_playing()` 的輸出樣本經過 `TrackResampler::process()`（非直接 `apply_dsp(raw_sample)`）；驗證輸出為 48kHz 立體聲 |
+ 117: | AC2 | `apply_dsp()` 套用 FxChain（含殘響、節奏、音高、回音等） | R3 → `playback_pipeline.rs` `apply_dsp()` 加入 `RateStage`（速度/節奏/音高）並以立體聲幀送入 `FxChain` | 單元測試：分別驗證 `tempo != 1.0`（樣本數變、音高不變）、`pitch != 0.0`（樣本數不變、內容變）、`speed != 1.0`（兩者皆變）、`reverb_on`（殘疊尾音）、`echo_on`（延遲重複）；全部關閉時為 bit-exact passthrough |
+ 118: | AC3 | `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過 | — | 執行測試命令，0 失敗 |
+ 119: | AC4 | `npx tauri build` 成功 | — | 執行 `npx tauri build`，exe 產出並含新的 `dist/assets/index-*.js` |
+ 120: 
+ 121: ## 風險對策表
+ 122: 
+ 123: | 風險 | 可能性 | 影響 | 對策 |
+ 124: |---|---|---|---|
+ 125: | `RateStage` WSOLA 在串流軌上累積過多緩衝，導致延遲 | 中 | 中 | `RateStage.run()` 本身依輸入量產出，不主動累積；`next_playing()` 以 1024-frame 區塊拉取，天然背壓 |
+ 126: | 軌切換時 `RateStage` 殘餘樣本混入下一軌 | 低 | 中 | 軌切換時重新建立 `RateStage`（Q3 已決定） |
+ 127: | `apply_dsp` 改為立體聲幀後，單聲道來源（串流軌可能為單聲道）聲道對齊錯誤 | 低 | 中 | `TrackResampler` 輸出固定 `INTERNAL_CHANNELS=2` 立體聲交錯，單聲道輸入已在 `process()` 中以聲道 0 填充（`playback_pipeline.rs:961` `if c < ch { c } else { 0 }`） |
+ 128: | `npx tauri build` 失敗（TypeScript 型別不對齊） | 低 | 中 | 本任務無前端變更，不影響 `src/types.ts` |
+ 129: 
+ 130: ## 實作順序建議
+ 131: 
+ 132: ```mermaid
+ 133: flowchart LR
+ 134:   A[playback_pipeline.rs: PlaybackCore 新增 rate_stage 欄位，new() 初始化] --> B[playback_pipeline.rs: apply_dsp 改為立體聲幀 [L,R]，加入 RateStage]
+ 135:   B --> C[playback_pipeline.rs: next_playing() 串流軌分支移除 resampler 繞過，取兩次 pop_output 組成一幀]
+ 136:   C --> D[playback_pipeline.rs: 軌切換時重新建立 RateStage，依 FxParams 設定 allow_rate]
+ 137:   D --> E[cargo test --release 驗證]
+ 138:   E --> F[npx tauri build 驗證]
+ 139: ```
+ 140: 
+ 141: ## 測試案例表
+ 142: 
+ 143: | 測試案例 | 對應 AC | 類型 | 驗證重點 |
+ 144: |---|---|---|---|
+ 145: | 長檔串流樣本經 TrackResampler 重取樣 | AC1 | 單元測試 | 模擬 SymStream 迭代器（未知長度），確認 `next_playing()` 輸出經過 `TrackResampler::process()`（非直接 `apply_dsp(raw)`），輸出為 48kHz 立體聲交錯 |
+ 146: | 串流軌 resampler 為 None 時不繞過 | AC1 | 單元測試 | `track_resampler` 設為 `None`，確認輸出靜音並記錄錯誤，不直接處理原始樣本 |
+ 147: | `apply_dsp_block` 區塊輸入、零到多幀輸出 | AC2 | 單元測試 | 餵入區塊，確認輸出樣本數可變（WSOLA 累積後成批產出），非固定一幀 |
+ 148: | `dsp_out` 佇列先進先出 | AC1 | 單元測試 | 確認 `next_playing()` 先從 `dsp_out` 取樣本，不足再拉上游，不插入靜音 |
+ 149: | `apply_dsp` 立體聲幀處理 | AC2 | 單元測試 | 輸入 `[L, R]` 幀，確認左右聲道皆經 `FxChain` 處理（聲道索引 0 與 1 皆被使用） |
+ 150: | 速度/節奏/音高參數生效（分別驗證） | AC2 | 單元測試 | `tempo != 1.0`：輸出樣本數變化、音高不變；`pitch != 0.0`：樣本數不變、內容變化；`speed != 1.0`：樣本數與內容皆變；`reverb_on`：輸出殘疊尾音；`echo_on`：輸出延遲重複 |
+ 151: | 全部音效關閉為 bit-exact passthrough | AC2 | 單元測試 | 所有 FxParams 為預設關閉狀態，`apply_dsp_block([L, R])` 輸出等於輸入 |
+ 152: | 軌切換 EOF 一次性排空 | AC2 | 單元測試 | 確認舊軌尾端經 EQ → `flush=false` 全部餵入舊 `RateStage` → 單次 `flush=true` 排空，產出僅走後段音效／正規化／限幅，不重複 EQ 或 RateStage |
+ 153: | `cargo test --release` 全過 | AC3 | 建置驗證 | 0 失敗 |
+ 154: | `npx tauri build` 成功 | AC4 | 建置驗證 | exe 產出 |
+ 155: 
+ 156: ## 變更檔案清單
+ 157: 
+ 158: | 檔案 | 變更類型 | 說明 |
+ 159: |---|---|---|
+ 160: | `src-tauri/src/playback_pipeline.rs` | 需修正 | `PlaybackCore` 新增 `rate_stage: Mutex<Option<RateStage>>`、`dsp_out: Mutex<VecDeque<f32>>`、`dsp_params: Mutex<Option<FxParams>>`；`new()` 初始化；`apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)` 改為餵入區塊、輸出零到多幀，併入 RateStage（速度/節奏/音高）；`next_playing()` 串流軌分支移除 `resampler` 為 `None` 的繞過路徑，先從 `dsp_out` 取樣本，不足再拉上游；軌載入/切換時建立 `RateStage`，依 `FxParams.allow_rate` 設定 |
+ 161: | `src-tauri/src/dsp.rs` | 需修正 | `RateStage::new(channels: usize, sample_rate: u32)` 與 `RateStage::run(&mut self, input: &[f32], flush: bool, out: &mut Vec<f32>)` 改為 `pub(crate)`（line 540, 547, 550）；`new()` 的 `channels` 參數為 `usize`，呼叫處傳入 `INTERNAL_CHANNELS as usize` |
+ 162: | `src-tauri/src/player.rs` | 需修正 | FFmpeg 長檔分支（line 539-549）需建立 `RateStage` 並呼叫 `set_track`，與短檔同一來源安裝入口；Symphonia 失敗後備路徑需納入統一安裝流程（見發現 F6） |
+ 163: | `src-tauri/src/` 其他 | 無 | 無前端、無 IPC、無資料庫變更 |
+ 164: 
+ 165: ## 回寫 Agents/ 文件規劃
+ 166: 
+ 167: 交付前需同步更新：
+ 168: - `Agents/system-architecture.md`：音訊管線圖中 DSP 子圖加入「速度/節奏/音高（RateStage）」；註記長檔串流軌必經 TrackResampler
+ 169: - `Agents/business-logic.md`：第 99 條等化器與音效章節已涵蓋 10 種音效，確認長檔串流軌亦走完整 DSP 鏈（無須增修，僅確認一致）
+ 170: - `planning/ROADMAP.md`：將 P0 `[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈` 標記為完成
+ 171: 
+ 172: ## 審查記錄區
+ 173: 
+ 174: ### 設計審查（實作前）
+ 175: 
+ 176: | 階段 | 結論 | 發現編號 | 修正狀態 |
+ 177: |---|---|---|---|
+ 178: | Spec | 通過 | SC#1、SC#2 | 皆已關閉（v7） |
+ 179: | Code | 不通過（第 1 輪） | F1–F9 | v8 修正中（見修正追蹤表） |
+ 180: | Security | — | — | — |
+ 181: 
+ 182: ### 實作審查（實作後）
+ 183: 
+ 184: | 階段 | 結論 | 發現編號 | 修正狀態 |
+ 185: |---|---|---|---|
+ 186: | Spec | — | — | — |
+ 187: | Code | — | — | — |
+ 188: | Security | — | — | — |
+ 189: 
+ 190: 修正追蹤表：編號 / 來源 / 修正動作 / Design.md 對應位置 / 狀態
+ 191: 
+ 192: | 編號 | 來源 | 修正動作 | Design.md 對應位置 | 狀態 |
+ 193: |---|---|---|---|---|
+ 194: | F1 | Code 審查第 1 輪 | `RateStage::new()`、`run()` 改為 `pub(crate)`；`new()` channels 參數為 `usize`；`dsp.rs` 列入變更清單 | 4.2、變更檔案清單 | 修正中（v8） |
+ 195: | F2 | Code 審查第 1 輪 | `apply_dsp` 改為 `apply_dsp_block(&self, input: &[f32], out: &mut Vec<f32>)`，餵入區塊輸出零到多幀；`PlaybackCore` 新增 `dsp_out` 佇列 | 4.1、4.2 | 修正中（v8） |
+ 196: | F3 | Code 審查第 1 輪 | `process()`/`pop_output()` 改為「先消耗 `dsp_out`，不足再拉上游」；`None` 表示未滿區塊而非靜音，繼續拉取 | 4.1 | 修正中（v8） |
+ 197: | F4 | Code 審查第 1 輪 | RateStage 建立時機涵蓋初次載入、手動換軌、seek、自然交接；新增 PlaybackCore 載入入口 | 4.2 | 修正中（v8） |
+ 198: | F5 | Code 審查第 1 輪 | PlaybackCore 新增 `dsp_params` 快照，命令執行緒更新、`apply_dsp_block` 讀取快照供 RateStage 與 FxChain 使用 | 4.2 | 修正中（v8） |
+ 199: | F6 | Code 審查第 1 輪 | FFmpeg 長檔分支建立 `RateStage` 並 `set_track`；Symphonia 後備路徑納入統一安裝入口 | 變更檔案清單（player.rs）、4.2 | 修正中（v8） |
+ 200: | F7 | Code 審查第 1 輪 | EOF 狀態：上游 flush 一次 → 全部尾段經 EQ／舊 RateStage → RateStage 只終結一次 → 排完 `dsp_out` → 進 WaitingForNext；不可重複 flush_tail | 4.3 | 修正中（v8） |
+ 201: | F8 | Code 審查第 1 輪 | DSP 檢查點映射列為待實作；以舊軌最後一個 DSP 輸出幀位置提交邊界 | 4.3、76 行註解 | 修正中（v8） |
+ 202: | F9 | Code 審查第 1 輪 | 區塊數值改為 2048（與管線一致）；尾段用游標或佇列批次消耗；需量測換軌最壞耗時 | 4.1、風險對策表 | 修正中（v8） |
+ 618:     fn restart_from(&mut self, ms: i64, play: bool) {
+ 619:         // 交接後 seek：current_path/current_decoder 可能已過期，優先從 TrackChain 當前軌讀取
+ 620:         let (path, decoder, song_id) = {
+ 621:             let chain_guard = self.core.track_chain.lock().unwrap();
+ 622:             if let Some(cur) = chain_guard.as_ref().and_then(|c| c.current()) {
+ 623:                 (cur.path.clone(), cur.decoder.clone(), cur.song_id)
+ 624:             } else {
+ 625:                 let p = self.current_path.lock().unwrap().clone().unwrap_or_default();
+ 626:                 let d = self.current_decoder.lock().unwrap().clone().unwrap_or_default();
+ 627:                 let s = self.get_current_song_id().unwrap_or(0);
+ 628:                 (p, d, s)
+ 629:             }
+ 630:         };
+ 631:         if path.is_empty() {
+ 632:             return;
+ 633:         }
+ 634: 
+ 635:         // 保留播放身分（seek 不得換 seq/token，違反 seek preserves playback identity）
+ 636:         let current_seq = self.core.now_seq();
+ 637:         let current_token = self.core.now_token();
+ 638: 
+ 639:         self.core.track_chain.lock().unwrap().take();
+ 640:         self.core.track_resampler.lock().unwrap().take();
+ 641:         self.core.reset_played_out_frames();
+ 642:         self.core.clear_expired_boundaries(current_seq + 1);
+ 643:         self.core.set_seek_origin_ms(ms.max(0) as u64);
+ 644: 
+ 645:         let _ = self.load_at(&path, song_id, ms, play);
+ 646:         // 恢復播放身分（load_at 會遞增 seq_counter，seek 時必須沿用原來的 seq/token）
+ 647:         self.core.set_now_identity(current_seq, current_token);
+ 648: 
+AA0FBE096333F8EB28BA43DE79FC3FA7B3AE6EE2679AC48CFEE1E67EEE61858E planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Design.md
+1DDB64FB700A5AC1A1F176F58F6CFF9831B75923A4C8311D95761AA692499B68 planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/planning.md
+9AB0827EE3D4DFECD0E983CE1B6DEAA5AA4C1D8DDC7D1221FD16E8F4EBDB3040 planning/[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈/Review.md
+929A3DA32F8761B84E0B4498550E06769100D4BF4A06B3E91E596C7B7DF99A67 src-tauri/src/playback_pipeline.rs
+EF0643A07C48314E789C3931C70B366DACF0BF44A5F430AE560DFB6708722BE2 src-tauri/src/dsp.rs
+0A648987DA22FF828520A600E9ABEC141CA0E825A46F8FE416399E0548D212E6 src-tauri/src/player.rs
+A32038A286E4C3942B56D99CC20D46BA2C7E7A99B7048901B8B7FB6E63B41D43 src-tauri/src/eq.rs
+warning: unable to access 'C:\Users\jake4/.config/git/ignore': Permission denied
+warning: unable to access 'C:\Users\jake4/.config/git/ignore': Permission denied
+?? nul
+?? "planning/[#3]P0-Imp1Imp3-\351\225\267\346\252\224TrackResampler\350\210\207DSP\351\217\210/Design.md"
+?? "planning/[#3]P0-Imp1Imp3-\351\225\267\346\252\224TrackResampler\350\210\207DSP\351\217\210/Review.md"
+?? task3_design_code_r1_log.txt
+?? task3_design_code_r1_out.md
+?? task3_design_code_r2_log.txt
+?? task3_spec_r1_log.txt
+?? task3_spec_r1_out.md
+?? task3_spec_r2_log.txt
+?? task3_spec_r2_out.md
+?? task3_spec_r3_log.txt
+?? task3_spec_r3_out.md
+?? task3_spec_r4_log.txt
+?? task3_spec_r4_out.md
+?? task3_spec_r5_log.txt
+?? task3_spec_r5_out.md
+?? task3_spec_r6_log.txt
+?? task3_spec_r6_out.md
+?? task3_spec_r7_log.txt
+?? task3_spec_r7_out.md
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+v8 尚有 **3 項阻擋、2 項重要問題**。F4、F6、F7、F8 的原問題在設計層級可關閉；F1、F2、F3、F5、F9 尚未完整閉合。
+
+以下 `Design.md` 均指本任務 v8。
+
+| # | 嚴重度 | 位置 | 問題 | 證據 | 建議 |
+|---|---|---|---|---|---|
+| R2-1（F3） | 阻擋 | `Design.md:53、107、135` | 重取樣介面仍不相容，消耗規則也未統一。正文改用切片輸入、向量輸出，其他段落卻仍要求取兩次 `pop_output()`。 | 文件寫 `process(&[sample]) -> Option<Vec<f32>>`；實際 `src-tauri/src/playback_pipeline.rs:936` 是 `process(f32) -> Option<f32>`，並在 `947、953、985` 自行消耗一個輸出樣本。變更清單 `Design.md:160` 未交代此介面的改造。 | 明確選擇保留現有介面或改成區塊介面。保留時須接住 `process()` 已回傳的樣本，先排出剩餘輸出再餵入上游，統一正文與 Q2。 |
+| R2-2（F2） | 阻擋 | `Design.md:48–55、64、69–76、95` | **同一個 `dsp_out` 同時被定義為 DSP 輸入與最終輸出**，無法判定哪些樣本已處理，可能繞過或重複套用 DSP。此外，內部函式契約仍保留一幀進、一幀出的舊版本。 | `53–54` 要將 TrackResampler 輸出直接加入 `dsp_out`，再取出送 DSP；`64、76` 卻將它當成 DSP 最終輸出。`95` 仍寫回傳 `[f32; 2]`。實際 `src-tauri/src/dsp.rs:499–527、550–576` 會累積輸入並產出可變數量樣本；`playback_pipeline.rs:313–321` 對外仍逐樣本回傳。 | 固定資料流為「重取樣輸出暫存 → `apply_dsp_block` → `dsp_out` → 逐樣本回傳」；最終佇列不得再送入 DSP，並同步修正第 95 行。 |
+| R2-3（F1／F5） | 阻擋 | `Design.md:65–73、100、160–161` | 可見性與 `usize` 已修正，但 **RateStage 契約漏掉必要參數，且引用不存在的 `FxParams.allow_rate`**；新增快照尚未形成一致的參數套用契約。 | 文件的 `run(input, flush, out)` 與實際 `src-tauri/src/dsp.rs:550` 的 `run(input, p: &FxParams, flush, out)` 不符；`FxParams` 在 `dsp.rs:18–48` 沒有 `allow_rate`，它實際是來源建構參數（`617、630`）。既有 `player.rs:899–900` 只更新 EqShared；`eq.rs:58–67` 負責清理參數與更新版本。FxChain 必須經 `dsp.rs:311–324` 的 `set()` 更新設定及配置效果狀態。 | 保留 `run` 的 `&FxParams` 參數；以來源類型決定是否建立／略過 RateStage。明定快照由清理後的 EqShared 取得，於區塊開始套用 `FxChain::set(&params)`，同一快照傳給 RateStage。 |
+| R2-4（新增，與 F4 直接相關） | 重要 | `Design.md:64–68、76、126` | 新增 `dsp_out` 只寫建構初始化，沒有定義 seek／手動換軌時的清空規則。**推測：**若沿用佇列，跳轉後會先播放舊位置殘留聲音。 | `src-tauri/src/player.rs:479–485` 在同一個 core 安裝新來源；`618–645` 的 seek 也重用 core。文件只要求重建 RateStage，未處理新加入的最終輸出佇列。 | 明定手動換軌／seek 安裝來源前清空 `dsp_out` 與相關暫存、重設終結狀態；自然交接則依既定順序保留並排完舊軌輸出。 |
+| R2-5（F9） | 重要 | `Design.md:53、125、202` | F9 只部分落實：風險表仍宣稱「1024-frame、天然背壓」及 RateStage「不主動累積」，與修正追蹤表及程式相矛盾。 | `src-tauri/src/playback_pipeline.rs:31、1201、1214–1218` 是核心鎖內拉取 2048 幀；`917` 仍以 `Vec::remove(0)` 消耗尾段。`src-tauri/src/dsp.rs:500–507` 明確累積 WSOLA 輸入直到門檻。 | 將第 202 行承諾落入正式做法與風險表：尾段採游標或佇列批次消耗、正確區分區塊大小，並保留換軌最壞耗時的實作量測要求；刪除尚無依據的背壓保證。 |
+
+可關閉項目的核對依據：
+
+- **F4：**`Design.md:68` 已涵蓋四種建立時機，補足長檔空 TrackChain 導致 `sync_identity()` 提早返回的問題（`player.rs:435`、`playback_pipeline.rs:415–417`）；新增佇列生命週期另見 R2-4。
+- **F6：**`Design.md:20、162` 已納入 FFmpeg 長檔及 Symphonia 後備入口，對應 `player.rs:468、471–472、539–549`。
+- **F7：**`Design.md:89、152` 已明定一次性排空與等待順序，對應現行重複 flush 呼叫點（`playback_pipeline.rs:358–372`）。
+- **F8：**`Design.md:83` 已撤回映射既有實作的暗示，明列待實作及 DSP 輸出邊界依據，對應現行占位值（`playback_pipeline.rs:453–455`）。
+
+本輪僅做文件與原始碼靜態複查，未執行測試、建置或音訊量測；未修改任何 repo 檔案。
+
+結論：不通過
+hook: Stop
+hook: Stop Completed
+tokens used
+85,910
+v8 尚有 **3 項阻擋、2 項重要問題**。F4、F6、F7、F8 的原問題在設計層級可關閉；F1、F2、F3、F5、F9 尚未完整閉合。
+
+以下 `Design.md` 均指本任務 v8。
+
+| # | 嚴重度 | 位置 | 問題 | 證據 | 建議 |
+|---|---|---|---|---|---|
+| R2-1（F3） | 阻擋 | `Design.md:53、107、135` | 重取樣介面仍不相容，消耗規則也未統一。正文改用切片輸入、向量輸出，其他段落卻仍要求取兩次 `pop_output()`。 | 文件寫 `process(&[sample]) -> Option<Vec<f32>>`；實際 `src-tauri/src/playback_pipeline.rs:936` 是 `process(f32) -> Option<f32>`，並在 `947、953、985` 自行消耗一個輸出樣本。變更清單 `Design.md:160` 未交代此介面的改造。 | 明確選擇保留現有介面或改成區塊介面。保留時須接住 `process()` 已回傳的樣本，先排出剩餘輸出再餵入上游，統一正文與 Q2。 |
+| R2-2（F2） | 阻擋 | `Design.md:48–55、64、69–76、95` | **同一個 `dsp_out` 同時被定義為 DSP 輸入與最終輸出**，無法判定哪些樣本已處理，可能繞過或重複套用 DSP。此外，內部函式契約仍保留一幀進、一幀出的舊版本。 | `53–54` 要將 TrackResampler 輸出直接加入 `dsp_out`，再取出送 DSP；`64、76` 卻將它當成 DSP 最終輸出。`95` 仍寫回傳 `[f32; 2]`。實際 `src-tauri/src/dsp.rs:499–527、550–576` 會累積輸入並產出可變數量樣本；`playback_pipeline.rs:313–321` 對外仍逐樣本回傳。 | 固定資料流為「重取樣輸出暫存 → `apply_dsp_block` → `dsp_out` → 逐樣本回傳」；最終佇列不得再送入 DSP，並同步修正第 95 行。 |
+| R2-3（F1／F5） | 阻擋 | `Design.md:65–73、100、160–161` | 可見性與 `usize` 已修正，但 **RateStage 契約漏掉必要參數，且引用不存在的 `FxParams.allow_rate`**；新增快照尚未形成一致的參數套用契約。 | 文件的 `run(input, flush, out)` 與實際 `src-tauri/src/dsp.rs:550` 的 `run(input, p: &FxParams, flush, out)` 不符；`FxParams` 在 `dsp.rs:18–48` 沒有 `allow_rate`，它實際是來源建構參數（`617、630`）。既有 `player.rs:899–900` 只更新 EqShared；`eq.rs:58–67` 負責清理參數與更新版本。FxChain 必須經 `dsp.rs:311–324` 的 `set()` 更新設定及配置效果狀態。 | 保留 `run` 的 `&FxParams` 參數；以來源類型決定是否建立／略過 RateStage。明定快照由清理後的 EqShared 取得，於區塊開始套用 `FxChain::set(&params)`，同一快照傳給 RateStage。 |
+| R2-4（新增，與 F4 直接相關） | 重要 | `Design.md:64–68、76、126` | 新增 `dsp_out` 只寫建構初始化，沒有定義 seek／手動換軌時的清空規則。**推測：**若沿用佇列，跳轉後會先播放舊位置殘留聲音。 | `src-tauri/src/player.rs:479–485` 在同一個 core 安裝新來源；`618–645` 的 seek 也重用 core。文件只要求重建 RateStage，未處理新加入的最終輸出佇列。 | 明定手動換軌／seek 安裝來源前清空 `dsp_out` 與相關暫存、重設終結狀態；自然交接則依既定順序保留並排完舊軌輸出。 |
+| R2-5（F9） | 重要 | `Design.md:53、125、202` | F9 只部分落實：風險表仍宣稱「1024-frame、天然背壓」及 RateStage「不主動累積」，與修正追蹤表及程式相矛盾。 | `src-tauri/src/playback_pipeline.rs:31、1201、1214–1218` 是核心鎖內拉取 2048 幀；`917` 仍以 `Vec::remove(0)` 消耗尾段。`src-tauri/src/dsp.rs:500–507` 明確累積 WSOLA 輸入直到門檻。 | 將第 202 行承諾落入正式做法與風險表：尾段採游標或佇列批次消耗、正確區分區塊大小，並保留換軌最壞耗時的實作量測要求；刪除尚無依據的背壓保證。 |
+
+可關閉項目的核對依據：
+
+- **F4：**`Design.md:68` 已涵蓋四種建立時機，補足長檔空 TrackChain 導致 `sync_identity()` 提早返回的問題（`player.rs:435`、`playback_pipeline.rs:415–417`）；新增佇列生命週期另見 R2-4。
+- **F6：**`Design.md:20、162` 已納入 FFmpeg 長檔及 Symphonia 後備入口，對應 `player.rs:468、471–472、539–549`。
+- **F7：**`Design.md:89、152` 已明定一次性排空與等待順序，對應現行重複 flush 呼叫點（`playback_pipeline.rs:358–372`）。
+- **F8：**`Design.md:83` 已撤回映射既有實作的暗示，明列待實作及 DSP 輸出邊界依據，對應現行占位值（`playback_pipeline.rs:453–455`）。
+
+本輪僅做文件與原始碼靜態複查，未執行測試、建置或音訊量測；未修改任何 repo 檔案。
+
+結論：不通過
