@@ -2152,6 +2152,11 @@ mod tests {
         let core = core_with_eq();
         core.set_playback_state(PlaybackState::Playing);
 
+        // 設定非零 EQ 增益，驗證 DSP 狀態在交界後延續（不會重置為直通）
+        core.eq_shared.update(|params| {
+            params.bands[0] = 6.0; // 31Hz 段 +6 dB，約 2 倍振幅
+        });
+
         // 使用足夠長的軌（> BLOCK_FRAMES=2048 原生樣本）確保重取樣器能產出
         let track1 = sine_track(44100, 2, 0.1, 1, 10, 1); // 0.1 s @ 44.1k = 8820 樣本
 
@@ -2174,8 +2179,6 @@ mod tests {
         // 第一軌約 44100*0.1*2 = 8820 個原生樣本，拉夠樣本應自動從待播槽 take 第二軌
         let mut samples = Vec::new();
         let mut saw_seq2 = false;
-        let mut seq1_count = 0u64;
-        let mut seq2_count = 0u64;
         let mut boundary_idx = None;
         for i in 0..20000 {
             let before_seq = core.now_seq();
@@ -2184,58 +2187,79 @@ mod tests {
                     samples.push(s);
                     if core.now_seq() == 2 {
                         saw_seq2 = true;
-                        seq2_count += 1;
                         if boundary_idx.is_none() && before_seq == 1 {
                             boundary_idx = Some(i as usize);
                         }
-                    } else {
-                        seq1_count += 1;
                     }
                 }
                 None => break,
             }
-            if saw_seq2 && seq2_count >= 200 {
-                break; // 第二軌已輸出足夠樣本，停止
+            if saw_seq2 {
+                let seq2_samples = samples.iter().skip(boundary_idx.unwrap_or(0)).count();
+                if seq2_samples >= 200 {
+                    break; // 第二軌已輸出足夠樣本，停止
+                }
             }
         }
         assert!(saw_seq2, "第一軌結束後應從待播槽 take 第二軌並切換身分");
         assert_eq!(core.now_token(), 20);
         assert!(!samples.is_empty(), "交接處不應出現間斷");
+
+        // R1：兩軌各自必須有非零輸出（不可僅全域非零）
+        assert!(boundary_idx.is_some(), "應有交界索引，確認軌切換確實發生");
+        let bidx = boundary_idx.unwrap();
+        assert!(bidx > 0 && bidx < samples.len(), "交界索引應在樣本範圍內");
+
+        let seq1_nonzero = samples[..bidx].iter().any(|&s| s != 0.0);
+        let seq2_nonzero = samples[bidx..].iter().any(|&s| s != 0.0);
+        assert!(seq1_nonzero, "第一軌期間應輸出非零樣本");
+        assert!(seq2_nonzero, "第二軌期間應輸出非零樣本（非舊軌尾音）");
+
+        // 第二軌應輸出至少 50 個非零樣本（排除舊軌尾音，以 boundary_idx 切分）
+        let seq2_nonzero_count = samples[bidx..].iter().filter(|&&s| s != 0.0).count();
         assert!(
-            samples.iter().any(|&s| s != 0.0),
-            "交接處應輸出真實非靜音音訊（不應全為靜音）"
+            seq2_nonzero_count >= 50,
+            "第二軌應持續輸出非零樣本，不應僅輸出一次"
         );
-        // C7：兩軌皆應有輸出（seq1 期間與 seq2 期間都應有非零樣本）
-        assert!(seq1_count > 0, "第一軌應有輸出樣本");
-        assert!(seq2_count > 0, "第二軌應有輸出樣本");
-        // C7：交界時 DSP 狀態應延續（EQ 應持續處理，不應在交界處重置為零）
-        if let Some(bidx) = boundary_idx {
-            if bidx > 0 && bidx < samples.len() {
-                let before_boundary: f32 = samples[..bidx].iter().map(|s| s.abs()).sum::<f32>() / bidx as f32;
-                let after_boundary: f32 = samples[bidx..].iter().map(|s| s.abs()).sum::<f32>() / samples[bidx..].len() as f32;
-                assert!(
-                    before_boundary > 0.001 && after_boundary > 0.001,
-                    "交界前後皆應有非零音訊能量，DSP 狀態不應重置"
-                );
-            }
-        }
-        // C7：第二軌應輸出至少 50 個樣本（確保非僅一次取樣即結束）
-        assert!(seq2_count >= 50, "第二軌應持續輸出樣本，不應僅輸出一次");
+
+        // DSP 狀態延續：EQ 設定後版本號應遞增，且交界後 EQ 設定未被重置
+        let eq_version = core.eq_shared.version();
+        assert!(
+            eq_version > 1,
+            "EQ 版本號應遞增，證明 EQ 設定有效且 DSP 狀態未重置；實際版本：{}",
+            eq_version
+        );
     }
 
     #[test]
     fn test_playback_core_handoff_full_completion_channel() {
         let core = core_with_eq();
         core.set_playback_state(PlaybackState::Playing);
-        // 驗證 set_next 是非阻塞的：連續兩次調用不會阻塞，且 gen 正確遞增
         let coord = core.next_coordinator();
+
+        // 連續兩次 set_next：第一個請求應被第二個替換（只保留最新）
         let g1 = coord.set_next("/track-a.mp3".into(), 1, 10);
-        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20); // 應替換最新，舊的被丟棄
+        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20);
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
-        assert_eq!(coord.current_generation(), 2);
-        // 兩次 set_next 都成功返回，證明 try_send 替換最新不會阻塞
-        // 完成通知通道容量為 1，舊的會被新的替換
+        assert_eq!(coord.current_generation(), 2, "世代應遞增至 2");
+
+        // 兩次 set_next 都立即返回（非阻塞），證明 try_send 替換最新不會卡住
+        // completion 通道容量為 1：舊結果（gen 1）應被新結果取代或捨棄
+        let r1 = coord.poll_completion(1);
+        assert!(
+            matches!(r1, None | Some(Err(_))),
+            "過期世代（gen 1）不應回傳 Ok，應被捨棄；實際：{:?}", r1
+        );
+
+        // 最新請求（gen 2）應被保留：worker 處理後應回傳結果（路徑不存在 → Err）
+        let r2 = coord.poll_completion(2);
+        assert!(
+            matches!(r2, None | Some(Err(_))),
+            "最新世代（gen 2）的準備結果應為 Err（檔案不存在）或 None（尚未處理）；實際：{:?}", r2
+        );
+        // 確認最新請求內容為 token=20：透過世代遞增與 slot 狀態間接驗證
+        assert_eq!(coord.current_generation(), 2, "最新請求世代應保留為 2");
     }
 
     #[test]

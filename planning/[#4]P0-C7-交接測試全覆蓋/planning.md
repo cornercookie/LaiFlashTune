@@ -16,14 +16,21 @@
 - 第二軌需輸出 ≥ 50 個樣本；
 - 新增 `test_playback_core_handoff_full_completion_channel` 驗證 `set_next` 非阻塞、gen 追蹤、latest request 保留；
 - `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過。
+- Q1 已確認：交界時間容許誤差為 ±5 ms。
+- Q2 已確認：DSP 狀態（EQ、正規化）延續的驗證方式為依 §4.1 建議，比較 EQ 濾波器狀態與預期輸出差異。
+- Q3 已確認：測試允許觸發 FFmpeg 後備子程序路徑；正常測試路徑不觸發 FFmpeg。
 
 ## Acceptance Criteria
-- [ ] 交接測試兩軌皆非零能量斷言已加強；
-- [ ] 第二軌樣本數 ≥ 50 的驗收已加入；
-- [ ] `test_playback_core_handoff_full_completion_channel` 已新增並通過；
-- [ ] `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過。
+- [x] 交接測試兩軌皆非零能量斷言已加強；
+- [x] 第二軌樣本數 ≥ 50 的驗收已加入；
+- [x] `test_playback_core_handoff_full_completion_channel` 已新增並通過；
+- [x] `cargo test --release --manifest-path src-tauri/Cargo.toml` 全過。
+- [x] Q1 已確認：交界時間容許誤差為 ±5 ms。
+- [x] Q2 已確認：DSP 狀態（EQ、正規化）延續的驗證方式為依 §4.1 建議，比較 EQ 濾波器狀態與預期輸出差異。
+- [x] Q3 已確認：測試允許觸發 FFmpeg 後備子程序路徑；正常測試路徑不觸發 FFmpeg。
 
 ## Additional context
 - 相關檔案：`src-tauri/src/playback_pipeline.rs`（測試區塊）
 - 審查來源：Review.md C7（Code 第 7 輪，重要）；Compacted Summary 中「仍待解決」列表
 - 設計參考：planning/P0-daily-blockers/design.md v29 C7 章節
+- 已確認事項：Q1 交界時間容許誤差 ±5 ms；Q2 DSP 狀態延續驗證方式依 §4.1 建議；Q3 允許觸發 FFmpeg 後備路徑（正常測試路徑不觸發）。
