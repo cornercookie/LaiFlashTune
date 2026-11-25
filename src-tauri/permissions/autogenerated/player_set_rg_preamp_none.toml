@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-player-set-rg-preamp-none"
+description = "Enables the player_set_rg_preamp_none command without any pre-configured scope."
+commands.allow = ["player_set_rg_preamp_none"]
+
+[[permission]]
+identifier = "deny-player-set-rg-preamp-none"
+description = "Denies the player_set_rg_preamp_none command without any pre-configured scope."
+commands.deny = ["player_set_rg_preamp_none"]

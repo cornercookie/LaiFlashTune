@@ -32,6 +32,10 @@ pub struct Song {
     pub sample_rate: Option<i32>,
     pub channels: Option<i32>,
     pub missing: i32,
+    pub replaygain_track_gain: Option<f32>,
+    pub replaygain_track_peak: Option<f32>,
+    pub replaygain_album_gain: Option<f32>,
+    pub replaygain_album_peak: Option<f32>,
 }
 
 /// 新增/更新歌曲的輸入（掃描時使用）
@@ -58,6 +62,10 @@ pub struct NewSong {
     pub bitrate: Option<i32>,
     pub sample_rate: Option<i32>,
     pub channels: Option<i32>,
+    pub replaygain_track_gain: Option<f32>,
+    pub replaygain_track_peak: Option<f32>,
+    pub replaygain_album_gain: Option<f32>,
+    pub replaygain_album_peak: Option<f32>,
 }
 
 /// 歌單
@@ -135,6 +143,10 @@ pub struct AppConfig {
     pub music_folders: Vec<String>,
     pub theme: String, // "dark" | "light"
     pub lyrics_offset_ms: i32,
+    pub replaygain_mode: ReplayGainMode,
+    pub volume_normalization: VolumeNormalization,
+    pub rg_preamp_has: f32,
+    pub rg_preamp_none: f32,
 }
 
 impl Default for AppConfig {
@@ -143,6 +155,10 @@ impl Default for AppConfig {
             music_folders: Vec::new(),
             theme: "dark".to_string(),
             lyrics_offset_ms: 0,
+            replaygain_mode: ReplayGainMode::default(),
+            volume_normalization: VolumeNormalization::default(),
+            rg_preamp_has: 0.0,
+            rg_preamp_none: -6.0,
         }
     }
 }
@@ -170,6 +186,31 @@ impl Default for PlayMode {
     fn default() -> Self {
         PlayMode::Sequence
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayGainMode {
+    Off,
+    Track,
+    Album,
+    Auto,
+}
+
+impl Default for ReplayGainMode {
+    fn default() -> Self { ReplayGainMode::Track }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeNormalization {
+    Replaygain,
+    Peak,
+    Off,
+}
+
+impl Default for VolumeNormalization {
+    fn default() -> Self { VolumeNormalization::Off }
 }
 
 /// 歌詞行
@@ -215,6 +256,12 @@ pub struct EngineSnapshot {
     pub applied_gain: f32,
     pub band_hz: Vec<i32>,
     pub mode: PlayMode,
+    pub applied_replaygain_db: Option<f32>,
+    pub applied_preamp_db: f32,
+    pub has_replaygain: bool,
+    pub rg_mode: ReplayGainMode,
+    pub volume_norm_mode: VolumeNormalization,
+    pub rg_source: String,
     /// 播放序號（每次自然切換或手動載入遞增）
     pub play_seq: u64,
     /// 當前軌 token
@@ -248,6 +295,12 @@ impl Default for EngineSnapshot {
             applied_gain: 1.0,
             band_hz: crate::eq::EQ_HZ.iter().map(|h| *h as i32).collect(),
             mode: PlayMode::Sequence,
+            applied_replaygain_db: None,
+            applied_preamp_db: 0.0,
+            has_replaygain: false,
+            rg_mode: ReplayGainMode::default(),
+            volume_norm_mode: VolumeNormalization::default(),
+            rg_source: "Unknown".to_string(),
             play_seq: 0,
             now_token: 0,
             next_token: 0,
@@ -266,9 +319,9 @@ pub struct PlayerState {
 /// 播放控制命令（音訊執行緒透過 mpsc 接收，避免在 UI 執行緒解碼）
 #[derive(Debug, Clone)]
 pub enum PlayerCommand {
-    Load { path: String, song_id: i64, token: u64 },
+    Load { path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32> },
     /// 載入並停在指定位置，不開始播放。重新開啟時接進度用。
-    Prepare { path: String, song_id: i64, position_ms: i64, token: u64 },
+    Prepare { path: String, song_id: i64, position_ms: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32> },
     Play,
     Pause,
     Toggle,
@@ -276,7 +329,7 @@ pub enum PlayerCommand {
     Next,
     Prev,
     /// 設定下一首（立即回傳，背景準備）
-    SetNext { path: String, song_id: i64, token: u64 },
+    SetNext { path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32> },
     /// 清除下一首
     ClearNext,
     Seek { position_ms: i64 },
@@ -288,6 +341,11 @@ pub enum PlayerCommand {
     SetFx { fx: crate::dsp::FxParams },
     SetOutput { name: String },
     SetNormalize { enabled: bool },
+    SetReplayGainMode { mode: ReplayGainMode, is_album_context: Option<bool> },
+    SetVolumeNormalization { mode: VolumeNormalization, is_album_context: Option<bool> },
+    SetRgPreampHas { db: f32 },
+    SetRgPreampNone { db: f32 },
+    SetAlbumContext { is_album_context: bool },
     SetCrossfade { ms: i64 },
     PlayUrl { url: String },
 }

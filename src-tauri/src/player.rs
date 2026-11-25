@@ -361,11 +361,11 @@ impl AudioEngine {
         Ok(())
     }
 
-    fn load(&mut self, path: &str, song_id: i64) -> Result<(), String> {
-        self.load_at(path, song_id, 0, true)
+    fn load(&mut self, path: &str, song_id: i64, rg: (Option<f32>, Option<f32>, Option<f32>, Option<f32>)) -> Result<(), String> {
+        self.load_at(path, song_id, 0, true, rg)
     }
 
-    fn load_at(&mut self, path: &str, song_id: i64, position_ms: i64, play: bool) -> Result<(), String> {
+    fn load_at(&mut self, path: &str, song_id: i64, position_ms: i64, play: bool, rg: (Option<f32>, Option<f32>, Option<f32>, Option<f32>)) -> Result<(), String> {
         self.halt_radio();
         validate_local_path(Path::new(path))?;
 
@@ -426,6 +426,10 @@ impl AudioEngine {
                                 duration_ms,
                                 song_id,
                                 norm_gain: 1.0,
+                                replaygain_track_gain: rg.0,
+                                replaygain_track_peak: rg.1,
+                                replaygain_album_gain: rg.2,
+                                replaygain_album_peak: rg.3,
                                 token,
                                 seq,
                                 native_frame_pos: 0,
@@ -453,6 +457,10 @@ impl AudioEngine {
                                 duration_ms,
                                 song_id,
                                 norm_gain,
+                                replaygain_track_gain: rg.0,
+                                replaygain_track_peak: rg.1,
+                                replaygain_album_gain: rg.2,
+                                replaygain_album_peak: rg.3,
                                 token,
                                 seq,
                                 native_frame_pos: 0,
@@ -467,11 +475,11 @@ impl AudioEngine {
                             (chain, resampler, None, "symphonia".to_string())
                         }
                     }
-                    Err(_e) => self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token)?,
+                    Err(_e) => self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token, rg)?,
                 }
             }
             Some(crate::scanner::Backend::Ffmpeg) => {
-                self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token)?
+                self.prepare_ffmpeg_track(path, song_id, &ext, position_ms, seq, token, rg)?
             }
             None => {
                 return Err(format!("這個格式尚未支援: {}", ext));
@@ -516,7 +524,7 @@ impl AudioEngine {
         Ok(())
     }
 
-    fn prepare_ffmpeg_track(&mut self, path: &str, song_id: i64, ext: &str, position_ms: i64, seq: u64, token: u64) -> Result<(TrackChain, TrackResampler, Option<Box<dyn Iterator<Item = f32> + Send>>, String), String> {
+    fn prepare_ffmpeg_track(&mut self, path: &str, song_id: i64, ext: &str, position_ms: i64, seq: u64, token: u64, rg: (Option<f32>, Option<f32>, Option<f32>, Option<f32>)) -> Result<(TrackChain, TrackResampler, Option<Box<dyn Iterator<Item = f32> + Send>>, String), String> {
         let ffprobe_path = locate("ffprobe.exe")
             .map(|(p, _, _)| p)
             .ok_or("找不到 ffprobe")?;
@@ -560,6 +568,10 @@ impl AudioEngine {
                 duration_ms,
                 song_id,
                 norm_gain: 1.0,
+                replaygain_track_gain: rg.0,
+                replaygain_track_peak: rg.1,
+                replaygain_album_gain: rg.2,
+                replaygain_album_peak: rg.3,
                 token,
                 seq,
                 native_frame_pos: 0,
@@ -615,6 +627,10 @@ impl AudioEngine {
                 duration_ms,
                 song_id,
                 norm_gain,
+                replaygain_track_gain: rg.0,
+                replaygain_track_peak: rg.1,
+                replaygain_album_gain: rg.2,
+                replaygain_album_peak: rg.3,
                 token,
                 seq,
                 native_frame_pos: 0,
@@ -663,7 +679,8 @@ impl AudioEngine {
         self.core.clear_expired_boundaries(current_seq + 1);
         self.core.set_seek_origin_ms(ms.max(0) as u64);
 
-        let _ = self.load_at(&path, song_id, ms, play);
+        let rg = self.core.current_replaygain();
+        let _ = self.load_at(&path, song_id, ms, play, (rg.0, rg.1, rg.2, rg.3));
         // 恢復播放身分（load_at 會遞增 seq_counter，seek 時必須沿用原來的 seq/token）
         self.core.set_now_identity(current_seq, current_token);
 
@@ -824,8 +841,9 @@ fn audio_loop(
     loop {
         match rx.recv_timeout(Duration::from_millis(80)) {
             Ok(command) => match command {
-                PlayerCommand::Load { path, song_id, token } => {
-                    if let Err(e) = engine.load(&path, song_id) {
+                PlayerCommand::Load { path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
+                    let rg = (rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak);
+                    if let Err(e) = engine.load(&path, song_id, rg) {
                         engine.error = e.clone();
                         engine.is_playing = false;
                         log_load_error(&format!("Load {path} song_id={song_id}: {e}"));
@@ -833,10 +851,23 @@ fn audio_loop(
                         log_line(&format!("LOAD_OK {path} song_id={song_id} token={token}"));
                         // C1：前端傳入的 token 作為目前軌身分，供前端比對「已要求的 token」
                         engine.core.set_now_identity(engine.core.now_seq(), token);
+                        // 更新 EqProcessor RG context（load 內可能未 sync）
+                        let rg_mode = *engine.core.rg_mode.lock().unwrap();
+                        let volume_norm_mode = *engine.core.volume_norm_mode.lock().unwrap();
+                        let is_album_ctx = *engine.core.is_album_playback_context.lock().unwrap();
+                        if let Ok(mut eq) = engine.core.eq_processor.lock() {
+                            if let Some(p) = eq.as_mut() {
+                                p.set_rg_context(rg.0, rg.1, rg.2, rg.3, rg_mode, volume_norm_mode, is_album_ctx);
+                                if volume_norm_mode == crate::models::VolumeNormalization::Peak {
+                                    // norm_gain 已在 load_at 計算；stream 長檔為 1.0
+                                }
+                            }
+                        }
                     }
                 }
-                PlayerCommand::Prepare { path, song_id, position_ms, token } => {
-                    if let Err(e) = engine.load_at(&path, song_id, position_ms, false) {
+                PlayerCommand::Prepare { path, song_id, position_ms, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
+                    let rg = (rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak);
+                    if let Err(e) = engine.load_at(&path, song_id, position_ms, false, rg) {
                         engine.error = e;
                         engine.is_playing = false;
                     } else {
@@ -930,20 +961,50 @@ fn audio_loop(
                     }
                 }
                 PlayerCommand::SetNormalize { enabled } => {
-                    engine.core.eq_shared.update(|p| p.normalize = enabled);
+                    let mode = if enabled {
+                        crate::models::VolumeNormalization::Peak
+                    } else {
+                        crate::models::VolumeNormalization::Off
+                    };
+                    engine.core.eq_shared.update(|p| p.volume_norm_mode = mode);
                 }
+                PlayerCommand::SetReplayGainMode { mode, is_album_context } => {
+                                    engine.core.eq_shared.update(|p| {
+                                        p.rg_mode = mode;
+                                        if let Some(ctx) = is_album_context {
+                                            p.is_album_playback_context = ctx;
+                                        }
+                                    });
+                                }
+                                PlayerCommand::SetVolumeNormalization { mode, is_album_context } => {
+                                    engine.core.eq_shared.update(|p| {
+                                        p.volume_norm_mode = mode;
+                                        if let Some(ctx) = is_album_context {
+                                            p.is_album_playback_context = ctx;
+                                        }
+                                    });
+                                }
+                                PlayerCommand::SetRgPreampHas { db } => {
+                                    engine.core.eq_shared.update(|p| p.rg_preamp_has = db);
+                                }
+                                PlayerCommand::SetRgPreampNone { db } => {
+                                                                    engine.core.eq_shared.update(|p| p.rg_preamp_none = db);
+                                                                }
+                                                                PlayerCommand::SetAlbumContext { is_album_context } => {
+                                                                    engine.core.eq_shared.update(|p| p.is_album_playback_context = is_album_context);
+                                                                }
                 PlayerCommand::SetCrossfade { ms } => {
                     engine.crossfade_ms = ms.clamp(0, 12_000);
                     engine.core.set_crossfade_ms(engine.crossfade_ms as u64);
                 }
                 PlayerCommand::PlayUrl { url } => engine.play_url(&url),
-                PlayerCommand::SetNext { path, song_id, token } => {
-                    // 共用 PlaybackCore 的待播協調器（與 TrackChain 唯一交接點同一實例）
-                    let gen = engine.core.next_coordinator().set_next(path, song_id, token);
-                    engine.next_coord_gen = gen;
-                    engine.core.set_next_token(token);
-                    log_line(&format!("CMD set_next gen={} token={}", gen, token));
-                }
+                PlayerCommand::SetNext { path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
+                                    // 共用 PlaybackCore 的待播協調器（與 TrackChain 唯一交接點同一實例）
+                                    let gen = engine.core.next_coordinator().set_next(path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak);
+                                    engine.next_coord_gen = gen;
+                                    engine.core.set_next_token(token);
+                                    log_line(&format!("CMD set_next gen={} token={}", gen, token));
+                                }
                 PlayerCommand::ClearNext => {
                     // C5取消：ClearNext 遞增協調器世代，必須同步更新 engine.next_coord_gen，
                     // 否則 poll_completion 會拿舊世代比較，舊結果仍會入槽。

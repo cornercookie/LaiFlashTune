@@ -26,14 +26,27 @@ use tauri::{AppHandle, Emitter, State};
 #[tauri::command]
 pub fn player_load(
     state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
     path: String,
     song_id: i64,
     token: u64,
 ) -> Result<(), String> {
     crate::open_with::log_line(&format!("CMD player_load path={path} song_id={song_id} token={token}"));
+    let rg = {
+        let conn = db_lock(&db_state);
+        crate::db::get_replaygain(&conn, song_id).unwrap_or((None, None, None, None))
+    };
     let tx = state.tx.lock().map_err(|e| e.to_string())?;
     let tx = tx.as_ref().ok_or("播放器尚未初始化")?;
-    tx.send(PlayerCommand::Load { path, song_id, token })
+    tx.send(PlayerCommand::Load {
+        path,
+        song_id,
+        token,
+        rg_track_gain: rg.0,
+        rg_track_peak: rg.1,
+        rg_album_gain: rg.2,
+        rg_album_peak: rg.3,
+    })
         .map_err(|e| e.to_string())
 }
 
@@ -41,12 +54,26 @@ pub fn player_load(
 #[tauri::command]
 pub fn player_set_next(
     state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
     path: String,
     song_id: i64,
     token: u64,
 ) -> Result<(), String> {
     crate::open_with::log_line(&format!("CMD player_set_next path={path} song_id={song_id} token={token}"));
-    send_cmd(state, PlayerCommand::SetNext { path, song_id, token })
+    let rg = {
+        let conn = db_lock(&db_state);
+        crate::db::get_replaygain(&conn, song_id).unwrap_or((None, None, None, None))
+    };
+    let cmd = PlayerCommand::SetNext {
+        path,
+        song_id,
+        token,
+        rg_track_gain: rg.0,
+        rg_track_peak: rg.1,
+        rg_album_gain: rg.2,
+        rg_album_peak: rg.3,
+    };
+    send_cmd(state, cmd)
 }
 
 /// 清除下一首。
@@ -62,11 +89,25 @@ pub fn player_clear_next(
 #[tauri::command]
 pub fn player_preload(
     state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
     path: String,
     song_id: i64,
 ) -> Result<(), String> {
     let token = 0; // 相容模式不帶 token
-    send_cmd(state, PlayerCommand::SetNext { path, song_id, token })
+    let rg = {
+        let conn = db_lock(&db_state);
+        crate::db::get_replaygain(&conn, song_id).unwrap_or((None, None, None, None))
+    };
+    let cmd = PlayerCommand::SetNext {
+        path,
+        song_id,
+        token,
+        rg_track_gain: rg.0,
+        rg_track_peak: rg.1,
+        rg_album_gain: rg.2,
+        rg_album_peak: rg.3,
+    };
+    send_cmd(state, cmd)
 }
 
 #[tauri::command]
@@ -142,13 +183,28 @@ fn send_cmd(state: State<'_, PlayerState>, cmd: PlayerCommand) -> Result<(), Str
 #[tauri::command]
 pub fn player_prepare(
     state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
     path: String,
     song_id: i64,
     position_ms: i64,
     token: u64,
 ) -> Result<(), String> {
     crate::open_with::log_line(&format!("CMD player_prepare path={path} song_id={song_id} position_ms={position_ms} token={token}"));
-    send_cmd(state, PlayerCommand::Prepare { path, song_id, position_ms, token })
+    let rg = {
+        let conn = db_lock(&db_state);
+        crate::db::get_replaygain(&conn, song_id).unwrap_or((None, None, None, None))
+    };
+    let cmd = PlayerCommand::Prepare {
+        path,
+        song_id,
+        position_ms,
+        token,
+        rg_track_gain: rg.0,
+        rg_track_peak: rg.1,
+        rg_album_gain: rg.2,
+        rg_album_peak: rg.3,
+    };
+    send_cmd(state, cmd)
 }
 
 // ============================================================================
@@ -506,8 +562,63 @@ pub fn player_set_output(state: State<'_, PlayerState>, name: String) -> Result<
 
 /// 峰值正規化。只作用於本地檔案。
 #[tauri::command]
+#[deprecated(note = "改用 player_set_volume_normalization")]
 pub fn player_set_normalize(state: State<'_, PlayerState>, enabled: bool) -> Result<(), String> {
-    send_cmd(state, PlayerCommand::SetNormalize { enabled })
+    let mode = if enabled {
+        crate::models::VolumeNormalization::Peak
+    } else {
+        crate::models::VolumeNormalization::Off
+    };
+    send_cmd(state, PlayerCommand::SetVolumeNormalization { mode, is_album_context: None })
+}
+
+/// 設定 ReplayGain 模式（off | track | album | auto）。
+#[tauri::command]
+pub fn player_set_replaygain_mode(state: State<'_, PlayerState>, mode: String) -> Result<(), String> {
+    let rg_mode = match mode.as_str() {
+        "off" => crate::models::ReplayGainMode::Off,
+        "track" => crate::models::ReplayGainMode::Track,
+        "album" => crate::models::ReplayGainMode::Album,
+        "auto" => crate::models::ReplayGainMode::Auto,
+        _ => return Err(format!("無效的 ReplayGain 模式: {}", mode)),
+    };
+    send_cmd(state, PlayerCommand::SetReplayGainMode { mode: rg_mode, is_album_context: None })
+}
+
+/// 設定音量正規化模式（replaygain | peak | off）。
+#[tauri::command]
+pub fn player_set_volume_normalization(state: State<'_, PlayerState>, mode: String) -> Result<(), String> {
+    let vol_norm_mode = match mode.as_str() {
+        "replaygain" => crate::models::VolumeNormalization::Replaygain,
+        "peak" => crate::models::VolumeNormalization::Peak,
+        "off" => crate::models::VolumeNormalization::Off,
+        _ => return Err(format!("無效的音量正規化模式: {}", mode)),
+    };
+    send_cmd(state, PlayerCommand::SetVolumeNormalization { mode: vol_norm_mode, is_album_context: None })
+}
+
+/// 設定有 ReplayGain 檔案的前級。
+#[tauri::command]
+pub fn player_set_rg_preamp_has(state: State<'_, PlayerState>, db: f32) -> Result<(), String> {
+    if !db.is_finite() || db < -20.0 || db > 20.0 {
+        return Err(format!("前級值超出範圍 -20..+20 dB: {}", db));
+    }
+    send_cmd(state, PlayerCommand::SetRgPreampHas { db })
+}
+
+/// 設定無 ReplayGain 檔案的前級。
+#[tauri::command]
+pub fn player_set_rg_preamp_none(state: State<'_, PlayerState>, db: f32) -> Result<(), String> {
+    if !db.is_finite() || db < -20.0 || db > 20.0 {
+        return Err(format!("前級值超出範圍 -20..+20 dB: {}", db));
+    }
+    send_cmd(state, PlayerCommand::SetRgPreampNone { db })
+}
+
+/// 設定專輯播放上下文。
+#[tauri::command]
+pub fn player_set_album_context(state: State<'_, PlayerState>, is_album_context: bool) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetAlbumContext { is_album_context })
 }
 
 /// 交叉淡化毫秒數。0 為關閉。只作用於本地檔案。

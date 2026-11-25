@@ -252,6 +252,10 @@ fn ensure_song_columns(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         ("sample_rate", "INTEGER"),
         ("channels", "INTEGER"),
         ("missing", "INTEGER DEFAULT 0"),
+        ("replaygain_track_gain", "REAL"),
+        ("replaygain_track_peak", "REAL"),
+        ("replaygain_album_gain", "REAL"),
+        ("replaygain_album_peak", "REAL"),
     ] {
         if !names.iter().any(|n| n == name) {
             conn.execute(&format!("ALTER TABLE songs ADD COLUMN {name} {decl}"), [])?;
@@ -287,6 +291,10 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
             bitrate = ?19,
             sample_rate = ?20,
             channels = ?21,
+            replaygain_track_gain = ?22,
+            replaygain_track_peak = ?23,
+            replaygain_album_gain = ?24,
+            replaygain_album_peak = ?25,
             missing = 0
         WHERE path = ?1
         "#,
@@ -312,6 +320,10 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
             song.bitrate,
             song.sample_rate,
             song.channels,
+            song.replaygain_track_gain,
+            song.replaygain_track_peak,
+            song.replaygain_album_gain,
+            song.replaygain_album_peak,
         ],
     )?;
     if changed > 0 {
@@ -324,8 +336,9 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
         INSERT INTO songs
             (path, title, artist, album, album_artist, genre, year, duration_ms, file_mtime, file_size,
              cover_path, title_pinyin, artist_pinyin, title_pinyin_initial, artist_pinyin_initial, added_at,
-             track_number, disc_number, format, bitrate, sample_rate, channels, missing)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,0)
+             track_number, disc_number, format, bitrate, sample_rate, channels,
+             replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak, missing)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,0)
         "#,
         rusqlite::params![
             song.path,
@@ -350,6 +363,10 @@ pub fn upsert_song(conn: &rusqlite::Connection, song: &NewSong) -> rusqlite::Res
             song.bitrate,
             song.sample_rate,
             song.channels,
+            song.replaygain_track_gain,
+            song.replaygain_track_peak,
+            song.replaygain_album_gain,
+            song.replaygain_album_peak,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -413,7 +430,8 @@ pub fn list_songs(
         "SELECT id, path, title, artist, album, album_artist, genre, year, duration_ms,
          file_mtime, file_size, cover_path, title_pinyin, artist_pinyin,
          title_pinyin_initial, artist_pinyin_initial, added_at, play_count, last_played_at,
-         track_number, disc_number, format, bitrate, sample_rate, channels, missing
+         track_number, disc_number, format, bitrate, sample_rate, channels, missing,
+         replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak
          FROM songs ORDER BY {} {} LIMIT ?1 OFFSET ?2",
         col, order
     );
@@ -468,7 +486,8 @@ pub fn search_songs(
         "SELECT s.id, s.path, s.title, s.artist, s.album, s.album_artist, s.genre, s.year,
          s.duration_ms, s.file_mtime, s.file_size, s.cover_path, s.title_pinyin, s.artist_pinyin,
          s.title_pinyin_initial, s.artist_pinyin_initial, s.added_at, s.play_count, s.last_played_at,
-         s.track_number, s.disc_number, s.format, s.bitrate, s.sample_rate, s.channels, s.missing
+         s.track_number, s.disc_number, s.format, s.bitrate, s.sample_rate, s.channels, s.missing,
+         s.replaygain_track_gain, s.replaygain_track_peak, s.replaygain_album_gain, s.replaygain_album_peak
          FROM songs_fts_content f
          JOIN songs s ON s.id = f.rowid
          WHERE {where_sql}
@@ -488,7 +507,8 @@ pub fn get_song(conn: &rusqlite::Connection, id: i64) -> rusqlite::Result<Option
         "SELECT id, path, title, artist, album, album_artist, genre, year, duration_ms,
          file_mtime, file_size, cover_path, title_pinyin, artist_pinyin,
          title_pinyin_initial, artist_pinyin_initial, added_at, play_count, last_played_at,
-         track_number, disc_number, format, bitrate, sample_rate, channels, missing
+         track_number, disc_number, format, bitrate, sample_rate, channels, missing,
+         replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak
          FROM songs WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(rusqlite::params![id], |row| song_from_row(row))?;
@@ -551,6 +571,10 @@ fn song_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Song> {
         sample_rate: row.get(23)?,
         channels: row.get(24)?,
         missing: row.get::<_, Option<i32>>(25)?.unwrap_or(0),
+        replaygain_track_gain: row.get(26)?,
+        replaygain_track_peak: row.get(27)?,
+        replaygain_album_gain: row.get(28)?,
+        replaygain_album_peak: row.get(29)?,
     })
 }
 
@@ -681,7 +705,8 @@ pub fn query_smart_playlist_songs(
         "SELECT id, path, title, artist, album, album_artist, genre, year, duration_ms,
          file_mtime, file_size, cover_path, title_pinyin, artist_pinyin,
          title_pinyin_initial, artist_pinyin_initial, added_at, play_count, last_played_at,
-         track_number, disc_number, format, bitrate, sample_rate, channels, missing
+         track_number, disc_number, format, bitrate, sample_rate, channels, missing,
+         replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak
          FROM songs {where_sql} ORDER BY {order} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
     );
     let mut bound: Vec<rusqlite::types::Value> = params.into_iter().map(rusqlite::types::Value::Text).collect();
@@ -839,7 +864,41 @@ pub fn load_config(conn: &rusqlite::Connection) -> rusqlite::Result<AppConfig> {
     if let Some(offset) = get("lyrics_offset_ms") {
         config.lyrics_offset_ms = offset.parse().unwrap_or(0);
     }
+    if let Some(v) = get("replaygain_mode") {
+        config.replaygain_mode = match v.as_str() {
+            "off" => crate::models::ReplayGainMode::Off,
+            "track" => crate::models::ReplayGainMode::Track,
+            "album" => crate::models::ReplayGainMode::Album,
+            "auto" => crate::models::ReplayGainMode::Auto,
+            _ => crate::models::ReplayGainMode::default(),
+        };
+    }
+    if let Some(v) = get("volume_normalization") {
+        config.volume_normalization = match v.as_str() {
+            "replaygain" => crate::models::VolumeNormalization::Replaygain,
+            "peak" => crate::models::VolumeNormalization::Peak,
+            "off" => crate::models::VolumeNormalization::Off,
+            _ => crate::models::VolumeNormalization::default(),
+        };
+    }
+    if let Some(v) = get("rg_preamp_has") { config.rg_preamp_has = v.parse().unwrap_or(0.0); }
+    if let Some(v) = get("rg_preamp_none") { config.rg_preamp_none = v.parse().unwrap_or(-6.0); }
     Ok(config)
+}
+
+pub fn get_replaygain(conn: &rusqlite::Connection, song_id: i64) -> rusqlite::Result<(Option<f32>, Option<f32>, Option<f32>, Option<f32>)> {
+    if song_id == 0 {
+        return Ok((None, None, None, None));
+    }
+    match conn.query_row(
+        "SELECT replaygain_track_gain, replaygain_track_peak, replaygain_album_gain, replaygain_album_peak FROM songs WHERE id = ?1",
+        [song_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    ) {
+        Ok(v) => Ok(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None, None, None)),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn get_config_value(conn: &rusqlite::Connection, key: &str) -> rusqlite::Result<Option<String>> {

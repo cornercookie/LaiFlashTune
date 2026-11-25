@@ -610,6 +610,10 @@ fn precheck_tag_budget(path: &Path) -> Result<(), String> {
 
     // FLAC：解析 metadata block，累計 VORBIS_COMMENT（類型 4）大小
     if &header[0..4] == b"fLaC" {
+        use std::io::{Seek, SeekFrom};
+        if file.seek(SeekFrom::Start(4)).is_err() {
+            return Err("FLAC 定位失敗".to_string());
+        }
         let mut last = false;
         let mut total_comments = 0usize;
         while !last {
@@ -654,6 +658,23 @@ fn precheck_tag_budget(path: &Path) -> Result<(), String> {
 
     // 未知格式：無法預先判斷標籤大小，fail-open，交由 lofty/ffprobe 後續處理
     Ok(())
+}
+
+fn parse_gain_db(s: Option<&String>) -> Option<f32> {
+    let v = s?.trim().trim_end_matches("dB").trim().trim_end_matches("db").trim();
+    let n: f32 = v.parse().ok()?;
+    if !n.is_finite() || n < -60.0 || n > 60.0 { None } else { Some(n) }
+}
+
+fn parse_r128_gain(s: &str) -> Option<f32> {
+    let n: i16 = s.trim().parse().ok()?;
+    let v = n as f32 / 256.0 + 5.0;
+    if !v.is_finite() || v < -60.0 || v > 60.0 { None } else { Some(v) }
+}
+
+fn parse_peak(s: Option<&String>) -> Option<f32> {
+    let n: f32 = s?.trim().parse().ok()?;
+    if !n.is_finite() || n <= 0.0 || n > 2.0 { None } else { Some(n) }
 }
 
 fn limited_tag(tag: &Tag, key: &ItemKey, total: &mut usize) -> Result<Option<String>, bool> {
@@ -777,6 +798,42 @@ fn process_single_file(path: &Path) -> ScanResult {
                     }
                 }
             }
+
+            // ReplayGain 專用 ItemKey（ID3/APE/Vorbis）
+            for (key, dst) in [
+                (ItemKey::ReplayGainTrackGain, "replaygain_track_gain"),
+                (ItemKey::ReplayGainTrackPeak, "replaygain_track_peak"),
+                (ItemKey::ReplayGainAlbumGain, "replaygain_album_gain"),
+                (ItemKey::ReplayGainAlbumPeak, "replaygain_album_peak"),
+            ] {
+                if let Some(s) = tag.get_string(&key) {
+                    let s = s.to_string();
+                    if !s.trim().is_empty() {
+                        tags.insert(dst.to_string(), s);
+                    }
+                }
+            }
+
+            // MP4 / Opus 等 Unknown 鍵
+            for item in tag.items() {
+                if let ItemKey::Unknown(full) = item.key() {
+                    let full_l = full.to_ascii_lowercase();
+                    let short = full_l.split(':').last().unwrap_or(&full_l).to_string();
+                    if (short.starts_with("replaygain_") || short.starts_with("r128_"))
+                        && !tags.contains_key(&short)
+                    {
+                        let val = item
+                            .value()
+                            .text()
+                            .map(|s| s.to_string())
+                            .or_else(|| item.value().locator().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        if !val.trim().is_empty() {
+                            tags.insert(short, val);
+                        }
+                    }
+                }
+            }
         }
         true
     } else {
@@ -803,7 +860,13 @@ fn process_single_file(path: &Path) -> ScanResult {
                         break;
                     }
                     total_tag_bytes += v.len();
-                    tags.insert(k, v);
+                    let mut key = k.to_lowercase();
+                    let short = key.split(':').last().unwrap_or(&key).to_string();
+                    if (short.starts_with("replaygain_") || short.starts_with("r128_"))
+                        && (short.starts_with("replaygain_") || short.starts_with("r128_")) {
+                        key = short;
+                    }
+                    tags.insert(key, v);
                 }
                 duration_ms = meta.duration_ms;
                 sample_rate = meta.sample_rate;
@@ -869,6 +932,23 @@ fn process_single_file(path: &Path) -> ScanResult {
     let track_number = tag_number(tags.get("track").map(|s| s.as_str()));
     let disc_number = tag_number(tags.get("disc").map(|s| s.as_str()));
 
+    // ReplayGain 解析
+    let mut rg_track_gain = parse_gain_db(tags.get("replaygain_track_gain"));
+    let rg_track_peak = parse_peak(tags.get("replaygain_track_peak"));
+    let mut rg_album_gain = parse_gain_db(tags.get("replaygain_album_gain"));
+    let rg_album_peak = parse_peak(tags.get("replaygain_album_peak"));
+    if rg_track_gain.is_none() {
+        if let Some(v) = tags.get("r128_track_gain") {
+            rg_track_gain = parse_r128_gain(v);
+        }
+    }
+    if rg_album_gain.is_none() {
+        if let Some(v) = tags.get("r128_album_gain") {
+            rg_album_gain = parse_r128_gain(v);
+        }
+    }
+
+
     let (title_pinyin, title_pinyin_initial) = compute_pinyin(title.as_deref().unwrap_or(""));
     let (artist_pinyin, artist_pinyin_initial) = compute_pinyin(artist.as_deref().unwrap_or(""));
 
@@ -895,6 +975,10 @@ fn process_single_file(path: &Path) -> ScanResult {
             bitrate,
             sample_rate,
             channels,
+            replaygain_track_gain: rg_track_gain,
+            replaygain_track_peak: rg_track_peak,
+            replaygain_album_gain: rg_album_gain,
+            replaygain_album_peak: rg_album_peak,
         },
         errors,
     )

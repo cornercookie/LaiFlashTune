@@ -133,6 +133,12 @@ pub struct PlaybackCore {
     crossfade_ms: AtomicU64,
     /// 峰值正規化開關
     normalize: AtomicBool,
+    /// ReplayGain 模式
+    pub(crate) rg_mode: Mutex<crate::models::ReplayGainMode>,
+    /// 音量正規化模式
+    pub(crate) volume_norm_mode: Mutex<crate::models::VolumeNormalization>,
+    /// 專輯播放上下文
+    pub(crate) is_album_playback_context: Mutex<bool>,
     /// 待播協調器（TrackChain 讀完時由此 take 下一軌）
     next_coordinator: Arc<NextCoordinator>,
     /// 串流軌直接來源（長檔/ffmpeg 串流，不經 TrackChain）
@@ -170,6 +176,9 @@ impl PlaybackCore {
             dsp_params: Mutex::new(None),
             crossfade_ms: AtomicU64::new(0),
             normalize: AtomicBool::new(false),
+            rg_mode: Mutex::new(crate::models::ReplayGainMode::default()),
+            volume_norm_mode: Mutex::new(crate::models::VolumeNormalization::default()),
+            is_album_playback_context: Mutex::new(false),
             next_coordinator: Arc::new(NextCoordinator::new()),
             stream_source: Mutex::new(None),
             on_track_change: Mutex::new(None),
@@ -205,6 +214,18 @@ impl PlaybackCore {
     pub fn set_playback_state(&self, state: PlaybackState) {
         *self.playback_state.lock().unwrap() = state;
     }
+
+    /// 取得目前軌的 ReplayGain（若有）
+        pub fn current_replaygain(&self) -> (Option<f32>, Option<f32>, Option<f32>, Option<f32>) {
+            let chain = self.track_chain.lock().unwrap();
+            if let Some(c) = chain.as_ref() {
+                if c.current_index < c.tracks.len() {
+                    let item = &c.tracks[c.current_index];
+                    return (item.replaygain_track_gain, item.replaygain_track_peak, item.replaygain_album_gain, item.replaygain_album_peak);
+                }
+            }
+            (None, None, None, None)
+        }
 
     /// 取得下一首 token（快照用）
     pub fn next_token(&self) -> u64 {
@@ -481,7 +502,7 @@ impl PlaybackCore {
     /// 順序：flush_tail 舊軌尾端 → commit_boundary 寫入邊界 → set_track 切換重取樣器。
     /// 兩把鎖不同時持有，避免鎖序倒置。
     fn sync_identity(&self) {
-        let (seq, token, song_id, norm_gain, duration_ms, native_sample_rate, native_channels, path, decoder) = {
+        let (seq, token, song_id, norm_gain, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, duration_ms, native_sample_rate, native_channels, path, decoder) = {
             let chain = self.track_chain.lock().unwrap();
             let Some(cur) = chain.as_ref().and_then(|c| c.current()) else { return };
             if cur.seq == self.now_seq() && cur.token == self.now_token() {
@@ -492,6 +513,10 @@ impl PlaybackCore {
                 cur.token,
                 cur.song_id,
                 cur.norm_gain,
+                cur.replaygain_track_gain,
+                cur.replaygain_track_peak,
+                cur.replaygain_album_gain,
+                cur.replaygain_album_peak,
                 cur.duration_ms,
                 cur.sample_rate,
                 cur.channels,
@@ -564,6 +589,19 @@ impl PlaybackCore {
         // 避免身分提前切換卻進度歸零，導致交界處的位置錯誤。
         self.set_now_identity(seq, token);
         self.current_norm_gain_bits.store(norm_gain.to_bits() as u64, Ordering::Release);
+
+        // 更新 EqProcessor 的 ReplayGain context
+        let rg_mode = *self.rg_mode.lock().unwrap();
+        let volume_norm_mode = *self.volume_norm_mode.lock().unwrap();
+        let is_album_ctx = *self.is_album_playback_context.lock().unwrap();
+        if let Ok(mut eq) = self.eq_processor.lock() {
+            if let Some(p) = eq.as_mut() {
+                p.set_rg_context(rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, rg_mode, volume_norm_mode, is_album_ctx);
+                if volume_norm_mode == crate::models::VolumeNormalization::Peak {
+                    p.set_norm_gain(norm_gain);
+                }
+            }
+        }
         self.push_boundary(BoundaryRecord {
             boundary_in_48k,
             boundary_out_48k: self.current_boundary_out_start(),
@@ -826,6 +864,11 @@ pub(crate) struct TrackChainItem {
     pub(crate) song_id: i64,
     /// 正規化增益
     pub(crate) norm_gain: f32,
+    /// ReplayGain 曲目增益
+    pub(crate) replaygain_track_gain: Option<f32>,
+    pub(crate) replaygain_track_peak: Option<f32>,
+    pub(crate) replaygain_album_gain: Option<f32>,
+    pub(crate) replaygain_album_peak: Option<f32>,
     /// token
     pub(crate) token: u64,
     /// 播放序號
@@ -973,6 +1016,10 @@ fn prepared_to_trackchain_item(prepared: &PreparedTrack) -> Option<TrackChainIte
             duration_ms: prepared.duration_ms,
             song_id: prepared.song_id,
             norm_gain: prepared.norm_gain,
+            replaygain_track_gain: prepared.replaygain_track_gain,
+            replaygain_track_peak: prepared.replaygain_track_peak,
+            replaygain_album_gain: prepared.replaygain_album_gain,
+            replaygain_album_peak: prepared.replaygain_album_peak,
             token: prepared.token,
             seq: prepared.seq,
             native_frame_pos: 0,
@@ -1018,6 +1065,10 @@ struct TrackResamplerTrack {
     duration_ms: i64,
     song_id: i64,
     norm_gain: f32,
+    replaygain_track_gain: Option<f32>,
+    replaygain_track_peak: Option<f32>,
+    replaygain_album_gain: Option<f32>,
+    replaygain_album_peak: Option<f32>,
     token: u64,
     seq: u64,
 }
@@ -1048,6 +1099,10 @@ impl TrackResampler {
             duration_ms: t.duration_ms,
             song_id: t.song_id,
             norm_gain: t.norm_gain,
+            replaygain_track_gain: t.replaygain_track_gain,
+            replaygain_track_peak: t.replaygain_track_peak,
+            replaygain_album_gain: t.replaygain_album_gain,
+            replaygain_album_peak: t.replaygain_album_peak,
             token: t.token,
             seq: t.seq,
         });
@@ -1491,6 +1546,10 @@ pub struct PreparedTrack {
     pub channels: u16,
     pub duration_ms: i64,
     pub norm_gain: f32,
+    pub replaygain_track_gain: Option<f32>,
+    pub replaygain_track_peak: Option<f32>,
+    pub replaygain_album_gain: Option<f32>,
+    pub replaygain_album_peak: Option<f32>,
     pub data: TrackData,
 }
 
@@ -1637,6 +1696,10 @@ struct PrepareRequest {
     generation: u64,
     seq: u64,
     token: u64,
+    rg_track_gain: Option<f32>,
+    rg_track_peak: Option<f32>,
+    rg_album_gain: Option<f32>,
+    rg_album_peak: Option<f32>,
 }
 
 impl NextCoordinator {
@@ -1680,7 +1743,7 @@ impl NextCoordinator {
 
                 // 執行準備工作：成功或失敗都透過 completion channel 通知，
                 // 讓前端能略過壞檔並重排，而不會靜默丟棄。
-                let result = prepare_track(&request.path, request.song_id, request.seq, request.token);
+                let result = prepare_track(&request.path, request.song_id, request.seq, request.token, request.rg_track_gain, request.rg_track_peak, request.rg_album_gain, request.rg_album_peak);
                 let mut sent = false;
                 while !sent && !cancel_flag.load(Ordering::Relaxed) {
                     match completion_tx.send_timeout((result.clone(), request.generation), Duration::from_millis(100)) {
@@ -1694,36 +1757,40 @@ impl NextCoordinator {
     }
 
     /// 設定下一首（立即回傳，背景準備）。待處理請求為可替換槽：滿時捨棄舊請求，只保留最新，
-    /// 並以非阻塞 try_send 避免卡住引擎。若正在回收中（preparing_frozen），拒絕新請求。
-    pub fn set_next(&self, path: String, song_id: i64, token: u64) -> u64 {
-        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        /// 並以非阻塞 try_send 避免卡住引擎。若正在回收中（preparing_frozen），拒絕新請求。
+        pub fn set_next(&self, path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> u64 {
+            let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // SE9：回收期間凍結，拒絕新的準備請求
-        if self.preparing_frozen.load(Ordering::Acquire) {
-            crate::open_with::log_line(&format!(
-                "NEXT_COORD set_next rejected (preparing_frozen) gen={}, song_id={}, token={}",
-                gen, song_id, token
-            ));
-            return gen;
-        }
-
-        // 清空待播槽；舊的交給回收執行緒（這裡簡化：記錄日誌）
-        if let Ok(mut slot) = self.slot.lock() {
-            if let Some(old) = slot.take() {
-                crate::open_with::log_line(&format!("NEXT_COORD clear slot for seq={}, token={}", old.seq, old.token));
+            // SE9：回收期間凍結，拒絕新的準備請求
+            if self.preparing_frozen.load(Ordering::Acquire) {
+                crate::open_with::log_line(&format!(
+                    "NEXT_COORD set_next rejected (preparing_frozen) gen={}, song_id={}, token={}",
+                    gen, song_id, token
+                ));
+                return gen;
             }
-        }
 
-        // 送入待處理請求（只保留最新，非阻塞）
-        let tx = self.pending_tx.as_ref().expect("pending_tx must exist");
-        loop {
-            match tx.try_send(PrepareRequest {
-                path: path.clone(),
-                song_id,
-                generation: gen,
-                seq: 0, // 由 prepare_track 中的 load_at 賦予正確的 seq
-                token,
-            }) {
+            // 清空待播槽；舊的交給回收執行緒（這裡簡化：記錄日誌）
+            if let Ok(mut slot) = self.slot.lock() {
+                if let Some(old) = slot.take() {
+                    crate::open_with::log_line(&format!("NEXT_COORD clear slot for seq={}, token={}", old.seq, old.token));
+                }
+            }
+
+            // 送入待處理請求（只保留最新，非阻塞）
+            let tx = self.pending_tx.as_ref().expect("pending_tx must exist");
+            loop {
+                match tx.try_send(PrepareRequest {
+                    path: path.clone(),
+                    song_id,
+                    generation: gen,
+                    seq: 0, // 由 prepare_track 中的 load_at 賦予正確的 seq
+                    token,
+                    rg_track_gain,
+                    rg_track_peak,
+                    rg_album_gain,
+                    rg_album_peak,
+                }) {
                 Ok(()) => break,
                 Err(TrySendError::Full(_)) => {
                     // 通道滿：捨棄舊的尚未處理請求，只保留最新
@@ -1810,7 +1877,7 @@ impl Drop for NextCoordinator {
 }
 
 /// 準備單一軌（解碼或開啟串流）
-fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
     let path_buf = std::path::PathBuf::from(path);
     
     // 使用 handle 持有機制：開啟並驗證檔案，回傳持有的 handle
@@ -1851,8 +1918,12 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
                                                 rate: stream.sample_rate(),
                                                 channels: stream.channels(),
                                                 duration_ms,
-                                                norm_gain: 1.0,
-                                                data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred {
+                                                    norm_gain: 1.0,
+                                                    replaygain_track_gain: rg_track_gain,
+                                                    replaygain_track_peak: rg_track_peak,
+                                                    replaygain_album_gain: rg_album_gain,
+                                                    replaygain_album_peak: rg_album_peak,
+                                                    data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred {
                                                                                                     path: final_path,
                                                                                                     sample_rate: stream.sample_rate(),
                                                                                                     channels: stream.channels(),
@@ -1882,21 +1953,25 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
                             channels: stream.channels(),
                             duration_ms,
                             norm_gain,
+                            replaygain_track_gain: rg_track_gain,
+                            replaygain_track_peak: rg_track_peak,
+                            replaygain_album_gain: rg_album_gain,
+                            replaygain_album_peak: rg_album_peak,
                             data: TrackData::Memory(Arc::new(samples)),
                         })
                     }
                 }
                 Err(_) => {
-                                    // symphonia 失敗，嘗試 ffmpeg（需要重新開檔）
-                                    // file 已在 SymStream::open 中被移動，file_for_stream 仍可用於 ffmpeg
-                                    drop(file_for_stream);
-                                    prepare_with_ffmpeg(path, song_id, &ext, seq, token)
-                                }
+                    // symphonia 失敗，嘗試 ffmpeg（需要重新開檔）
+                    // file 已在 SymStream::open 中被移動，file_for_stream 仍可用於 ffmpeg
+                    drop(file_for_stream);
+                    prepare_with_ffmpeg(path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
+                }
             }
         }
         Some(crate::scanner::Backend::Ffmpeg) => {
             // ffmpeg 路徑：傳遞 final_path
-            prepare_with_ffmpeg_final(&final_path, song_id, &ext, seq, token)
+            prepare_with_ffmpeg_final(&final_path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
         }
         None => {
             Err(format!("這個格式尚未支援: {}", ext))
@@ -1904,7 +1979,7 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64) -> Result<Prepa
     }
 }
 
-fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
         .ok_or("找不到 ffprobe")?;
@@ -1938,17 +2013,21 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u6
         };
 
         Ok(PreparedTrack {
-            seq,
-            token,
-            song_id,
-            path: path.to_string(),
-            decoder: "stream".to_string(),
-            rate: sample_rate,
-            channels,
-            duration_ms,
-            norm_gain: 1.0,
-            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
-        })
+                    seq,
+                    token,
+                    song_id,
+                    path: path.to_string(),
+                    decoder: "stream".to_string(),
+                    rate: sample_rate,
+                    channels,
+                    duration_ms,
+                    norm_gain: 1.0,
+                    replaygain_track_gain: rg_track_gain,
+                    replaygain_track_peak: rg_track_peak,
+                    replaygain_album_gain: rg_album_gain,
+                    replaygain_album_peak: rg_album_peak,
+                    data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
+                })
     } else {
         let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
             .map(|(p, _, _)| p)
@@ -1982,22 +2061,26 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u6
         let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
 
         Ok(PreparedTrack {
-            seq,
-            token,
-            song_id,
-            path: path.to_string(),
-            decoder: "ffmpeg".to_string(),
-            rate: sample_rate,
-            channels,
-            duration_ms,
-            norm_gain,
-            data: TrackData::Memory(Arc::new(samples)),
-        })
+                    seq,
+                    token,
+                    song_id,
+                    path: path.to_string(),
+                    decoder: "ffmpeg".to_string(),
+                    rate: sample_rate,
+                    channels,
+                    duration_ms,
+                    norm_gain,
+                    replaygain_track_gain: rg_track_gain,
+                    replaygain_track_peak: rg_track_peak,
+                    replaygain_album_gain: rg_album_gain,
+                    replaygain_album_peak: rg_album_peak,
+                    data: TrackData::Memory(Arc::new(samples)),
+                })
     }
 }
 
 /// 使用最終規範路徑的 ffmpeg 準備（供 handle 機制呼叫）
-fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
         .ok_or("找不到 ffprobe")?;
@@ -2031,17 +2114,21 @@ fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, tok
         };
 
         Ok(PreparedTrack {
-            seq,
-            token,
-            song_id,
-            path: path.to_string(),
-            decoder: "stream".to_string(),
-            rate: sample_rate,
-            channels,
-            duration_ms,
-            norm_gain: 1.0,
-            data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
-        })
+                    seq,
+                    token,
+                    song_id,
+                    path: path.to_string(),
+                    decoder: "stream".to_string(),
+                    rate: sample_rate,
+                    channels,
+                    duration_ms,
+                    norm_gain: 1.0,
+                    replaygain_track_gain: rg_track_gain,
+                    replaygain_track_peak: rg_track_peak,
+                    replaygain_album_gain: rg_album_gain,
+                    replaygain_album_peak: rg_album_peak,
+                    data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
+                })
     } else {
         let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
             .map(|(p, _, _)| p)
@@ -2075,17 +2162,21 @@ fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, tok
         let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
 
         Ok(PreparedTrack {
-            seq,
-            token,
-            song_id,
-            path: path.to_string(),
-            decoder: "ffmpeg".to_string(),
-            rate: sample_rate,
-            channels,
-            duration_ms,
-            norm_gain,
-            data: TrackData::Memory(Arc::new(samples)),
-        })
+                    seq,
+                    token,
+                    song_id,
+                    path: path.to_string(),
+                    decoder: "ffmpeg".to_string(),
+                    rate: sample_rate,
+                    channels,
+                    duration_ms,
+                    norm_gain,
+                    replaygain_track_gain: rg_track_gain,
+                    replaygain_track_peak: rg_track_peak,
+                    replaygain_album_gain: rg_album_gain,
+                    replaygain_album_peak: rg_album_peak,
+                    data: TrackData::Memory(Arc::new(samples)),
+                })
     }
 }
 
@@ -2114,6 +2205,10 @@ mod tests {
             duration_ms: (secs * 1000.0) as i64,
             song_id,
             norm_gain: 1.0,
+            replaygain_track_gain: None,
+            replaygain_track_peak: None,
+            replaygain_album_gain: None,
+            replaygain_album_peak: None,
             token,
             seq,
             native_frame_pos: 0,
@@ -2134,6 +2229,10 @@ mod tests {
             channels: ch,
             duration_ms: t.duration_ms,
             norm_gain: 1.0,
+            replaygain_track_gain: None,
+            replaygain_track_peak: None,
+            replaygain_album_gain: None,
+            replaygain_album_peak: None,
             data: TrackData::Memory(t.samples),
         }
     }
@@ -2426,17 +2525,21 @@ mod tests {
             .lock()
             .unwrap()
             .replace(PreparedTrack {
-                seq: 2,
-                token: 20,
-                song_id: 2,
-                path: "test".into(),
-                decoder: "symphonia".into(),
-                rate: 48000,
-                channels: 2,
-                duration_ms: 100,
-                norm_gain: 1.0,
-                data: TrackData::Memory(Arc::new(second_samples)),
-            });
+                            seq: 2,
+                            token: 20,
+                            song_id: 2,
+                            path: "test".into(),
+                            decoder: "symphonia".into(),
+                            rate: 48000,
+                            channels: 2,
+                            duration_ms: 100,
+                            norm_gain: 1.0,
+                            replaygain_track_gain: None,
+                            replaygain_track_peak: None,
+                            replaygain_album_gain: None,
+                            replaygain_album_peak: None,
+                            data: TrackData::Memory(Arc::new(second_samples)),
+                        });
 
         // 播放直到軌切換並持續消耗，確認第二軌音訊確實出現（振幅 1.0 > 第一軌 0.3）
         // 不依賴 seq（sync_identity 會在舊尾音尚存於 dsp_out 時就發布新身分），

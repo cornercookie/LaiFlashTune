@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 const SONG_COLS: &str = "id, path, title, artist, album, album_artist, genre, year, duration_ms, \
     file_mtime, file_size, cover_path, title_pinyin, artist_pinyin, title_pinyin_initial, \
     artist_pinyin_initial, added_at, play_count, last_played_at, track_number, disc_number, \
-    format, bitrate, sample_rate, channels, missing";
+    format, bitrate, sample_rate, channels, missing, replaygain_track_gain, replaygain_track_peak, \
+    replaygain_album_gain, replaygain_album_peak";
 
 fn song_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Song> {
     Ok(Song {
@@ -42,6 +43,10 @@ fn song_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Song> {
         sample_rate: row.get(23)?,
         channels: row.get(24)?,
         missing: row.get::<_, Option<i32>>(25)?.unwrap_or(0),
+        replaygain_track_gain: row.get(26)?,
+        replaygain_track_peak: row.get(27)?,
+        replaygain_album_gain: row.get(28)?,
+        replaygain_album_peak: row.get(29)?,
     })
 }
 

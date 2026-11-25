@@ -27,13 +27,31 @@ pub struct EqParams {
     pub bands: [f32; BANDS],
     pub preamp_db: f32,
     pub normalize: bool,
+    pub rg_preamp_has: f32,
+    pub rg_preamp_none: f32,
+    pub rg_mode: crate::models::ReplayGainMode,
+    pub volume_norm_mode: crate::models::VolumeNormalization,
+    pub is_album_playback_context: bool,
+    pub rg_peak: Option<f32>,
     /// 等化器以外的音效（速度、殘響…）。跟等化器共用版本號，一起即時生效。
     pub fx: crate::dsp::FxParams,
 }
 
 impl Default for EqParams {
     fn default() -> Self {
-        Self { enabled: true, bands: [0.0; BANDS], preamp_db: 0.0, normalize: false, fx: crate::dsp::FxParams::default() }
+        Self {
+            enabled: true,
+            bands: [0.0; BANDS],
+            preamp_db: 0.0,
+            normalize: false,
+            rg_preamp_has: 0.0,
+            rg_preamp_none: -6.0,
+            rg_mode: crate::models::ReplayGainMode::default(),
+            volume_norm_mode: crate::models::VolumeNormalization::default(),
+            is_album_playback_context: false,
+            rg_peak: None,
+            fx: crate::dsp::FxParams::default(),
+        }
     }
 }
 
@@ -233,37 +251,153 @@ pub struct EqProcessor {
     gain_target: f32,
     gain_now: f32,
     idx: usize,
+    rg_preamp_has: f32,
+    rg_preamp_none: f32,
+    rg_mode: crate::models::ReplayGainMode,
+    volume_norm_mode: crate::models::VolumeNormalization,
+    rg_track_gain_db: Option<f32>,
+    rg_track_peak: Option<f32>,
+    rg_album_gain_db: Option<f32>,
+    rg_album_peak: Option<f32>,
+    has_rg_track: bool,
+    has_rg_album: bool,
+    has_rg: bool,
+    is_album_playback_context: bool,
+    current_rg_preamp_db: f32,
+    current_rg_source: String,
 }
 
 impl EqProcessor {
     pub fn new(shared: std::sync::Arc<EqShared>, sample_rate: u32, channels: u16, norm_gain: f32) -> Self {
-        let mut p = Self {
-            shared,
-            seen: 0,
-            sample_rate: sample_rate.max(1),
-            channels: channels.max(1) as usize,
-            chains: Vec::new(),
-            enabled: true,
-            norm_gain,
-            gain_target: 1.0,
-            gain_now: 1.0,
-            idx: 0,
-        };
+        let params = shared.get();
+                let mut p = Self {
+                    shared,
+                    seen: 0,
+                    sample_rate: sample_rate.max(1),
+                    channels: channels.max(1) as usize,
+                    chains: Vec::new(),
+                    enabled: true,
+                    norm_gain,
+                    gain_target: 1.0,
+                    gain_now: 1.0,
+                    idx: 0,
+                    rg_preamp_has: params.rg_preamp_has,
+                    rg_preamp_none: params.rg_preamp_none,
+                    rg_mode: params.rg_mode,
+                    volume_norm_mode: params.volume_norm_mode,
+                    rg_track_gain_db: None,
+                    rg_track_peak: None,
+                    rg_album_gain_db: None,
+                    rg_album_peak: None,
+                    has_rg_track: false,
+                    has_rg_album: false,
+                    has_rg: false,
+                    is_album_playback_context: params.is_album_playback_context,
+                    current_rg_preamp_db: 0.0,
+                    current_rg_source: "Unknown".to_string(),
+                };
         p.refresh();
         p.gain_now = p.gain_target;
         p
     }
 
     fn refresh(&mut self) {
-        let v = self.shared.version();
-        if v == self.seen {
-            return;
-        }
-        self.seen = v;
-        let params = self.shared.get();
-        let norm = if params.normalize { self.norm_gain } else { 1.0 };
-        let pre = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
-        self.gain_target = norm * pre;
+            let v = self.shared.version();
+            if v == self.seen {
+                return;
+            }
+            self.seen = v;
+            let params = self.shared.get();
+
+            // 同步前級設定（來自 EqParams）
+            self.rg_preamp_has = params.rg_preamp_has;
+            self.rg_preamp_none = params.rg_preamp_none;
+            if params.rg_mode != self.rg_mode {
+                // 若 shared 帶入新模式，更新（主要由 set_rg_context 設定）
+                self.rg_mode = params.rg_mode;
+            }
+            // 同步音量正規化模式與專輯播放上下文
+            self.volume_norm_mode = params.volume_norm_mode;
+            self.is_album_playback_context = params.is_album_playback_context;
+
+            // 決定 norm_gain 來源與前級
+            match self.volume_norm_mode {
+            crate::models::VolumeNormalization::Peak => {
+                let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
+                self.gain_target = self.norm_gain * eq_preamp;
+                self.has_rg = false;
+                self.current_rg_preamp_db = params.preamp_db;
+                self.current_rg_source = "Peak".to_string();
+            }
+            crate::models::VolumeNormalization::Off => {
+                let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
+                self.gain_target = 1.0 * eq_preamp;
+                self.has_rg = false;
+                self.current_rg_preamp_db = 0.0;
+                self.current_rg_source = "Off".to_string();
+            }
+            crate::models::VolumeNormalization::Replaygain => {
+                if matches!(self.rg_mode, crate::models::ReplayGainMode::Off) {
+                    let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
+                    self.gain_target = 1.0 * eq_preamp;
+                    self.has_rg = false;
+                    self.current_rg_preamp_db = 0.0;
+                    self.current_rg_source = "RG_Off".to_string();
+                } else {
+                    let (selected_gain_db, selected_peak, rg_source, has_rg) = match self.rg_mode {
+                        crate::models::ReplayGainMode::Track => {
+                            if self.has_rg_track {
+                                (self.rg_track_gain_db, self.rg_track_peak, "RG_Track".to_string(), true)
+                            } else {
+                                (None, None, "RG_None".to_string(), false)
+                            }
+                        }
+                        crate::models::ReplayGainMode::Album => {
+                            if self.has_rg_album {
+                                (self.rg_album_gain_db, self.rg_album_peak, "RG_Album".to_string(), true)
+                            } else if self.has_rg_track {
+                                (self.rg_track_gain_db, self.rg_track_peak, "RG_Track_Fallback".to_string(), true)
+                            } else {
+                                (None, None, "RG_None".to_string(), false)
+                            }
+                        }
+                        crate::models::ReplayGainMode::Auto => {
+                            let is_album_ctx = self.is_album_playback_context;
+                            if is_album_ctx && self.has_rg_album {
+                                (self.rg_album_gain_db, self.rg_album_peak, "RG_Album".to_string(), true)
+                            } else if self.has_rg_track {
+                                let source = if is_album_ctx { "RG_Track_Fallback".to_string() } else { "RG_Track".to_string() };
+                                (self.rg_track_gain_db, self.rg_track_peak, source, true)
+                            } else {
+                                (None, None, "RG_None".to_string(), false)
+                            }
+                        }
+                        crate::models::ReplayGainMode::Off => unreachable!(),
+                    };
+
+                    let (requested_gain_linear, rg_preamp_db) = if has_rg {
+                        let gain_with_preamp = selected_gain_db.unwrap_or(0.0) + self.rg_preamp_has;
+                        (db_to_linear(gain_with_preamp), self.rg_preamp_has)
+                    } else {
+                        (db_to_linear(self.rg_preamp_none), self.rg_preamp_none)
+                    };
+
+                    let norm_gain_final = if let Some(peak) = selected_peak {
+                        let max_gain = 1.0 / peak.max(0.0001);
+                        requested_gain_linear.min(max_gain)
+                    } else {
+                        requested_gain_linear
+                    };
+
+                    let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
+                    self.gain_target = norm_gain_final * eq_preamp;
+                    self.has_rg = has_rg;
+                    self.current_rg_preamp_db = rg_preamp_db;
+                    self.current_rg_source = rg_source;
+                }
+            }
+        };
+
         let chain = if params.enabled { make_chain(&params.bands, self.sample_rate) } else { Vec::new() };
         let reuse = self.enabled == params.enabled && self.chains.first().map(|c| c.len()) == Some(chain.len());
         if reuse {
@@ -277,6 +411,34 @@ impl EqProcessor {
         }
         self.enabled = params.enabled;
     }
+
+    pub fn set_rg_context(&mut self, track_gain: Option<f32>, track_peak: Option<f32>,
+                          album_gain: Option<f32>, album_peak: Option<f32>,
+                          rg_mode: crate::models::ReplayGainMode, volume_norm_mode: crate::models::VolumeNormalization,
+                          is_album_playback: bool) {
+        self.rg_mode = rg_mode;
+        self.volume_norm_mode = volume_norm_mode;
+        self.rg_track_gain_db = track_gain;
+        self.rg_track_peak = track_peak;
+        self.rg_album_gain_db = album_gain;
+        self.rg_album_peak = album_peak;
+        self.has_rg_track = track_gain.is_some();
+        self.has_rg_album = album_gain.is_some();
+        self.is_album_playback_context = is_album_playback;
+        self.seen = 0;
+    }
+
+    pub fn set_norm_gain(&mut self, norm_gain: f32) {
+        self.norm_gain = norm_gain;
+        self.seen = 0;
+    }
+
+    pub fn gain_target(&self) -> f32 { self.gain_target }
+    pub fn has_rg(&self) -> bool { self.has_rg }
+    pub fn current_rg_preamp_db(&self) -> f32 { self.current_rg_preamp_db }
+    pub fn current_rg_source(&self) -> String { self.current_rg_source.clone() }
+    pub fn rg_mode(&self) -> crate::models::ReplayGainMode { self.rg_mode }
+    pub fn volume_norm_mode(&self) -> crate::models::VolumeNormalization { self.volume_norm_mode }
 
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {

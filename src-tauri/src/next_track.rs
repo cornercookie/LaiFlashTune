@@ -31,6 +31,10 @@ pub struct PreparedTrack {
     pub channels: u16,
     pub duration_ms: i64,
     pub norm_gain: f32,
+    pub replaygain_track_gain: Option<f32>,
+    pub replaygain_track_peak: Option<f32>,
+    pub replaygain_album_gain: Option<f32>,
+    pub replaygain_album_peak: Option<f32>,
     pub data: TrackData,
 }
 
@@ -327,6 +331,10 @@ struct PrepareRequest {
     song_id: i64,
     generation: u64,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    rg_track_gain: Option<f32>,
+    rg_track_peak: Option<f32>,
+    rg_album_gain: Option<f32>,
+    rg_album_peak: Option<f32>,
 }
 
 impl NextCoordinator {
@@ -370,7 +378,7 @@ impl NextCoordinator {
                 }
                 
                 // 執行準備工作
-                if let Ok(track) = prepare_track(&request.path, request.song_id, request.cancel) {
+                if let Ok(track) = prepare_track(&request.path, request.song_id, request.cancel, request.rg_track_gain, request.rg_track_peak, request.rg_album_gain, request.rg_album_peak) {
                     let _ = completion_tx.send((track, request.generation));
                 }
             }
@@ -378,7 +386,7 @@ impl NextCoordinator {
     }
 
     /// 設定下一首（立即回傳，背景準備）
-    pub fn set_next(&self, path: String, song_id: i64) -> u64 {
+    pub fn set_next(&self, path: String, song_id: i64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> u64 {
         let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         
         // 清空待播槽
@@ -398,6 +406,10 @@ impl NextCoordinator {
             song_id,
             generation: gen,
             cancel: cancel.clone(),
+            rg_track_gain,
+            rg_track_peak,
+            rg_album_gain,
+            rg_album_peak,
         }) {
             // 滿了：丟掉舊的再送新的
             let _ = self.pending_rx.try_recv();
@@ -406,6 +418,10 @@ impl NextCoordinator {
                 song_id,
                 generation: gen,
                 cancel,
+                rg_track_gain,
+                rg_track_peak,
+                rg_album_gain,
+                rg_album_peak,
             });
         }
         
@@ -481,7 +497,7 @@ impl Drop for NextCoordinator {
 }
 
 /// 準備單一軌（解碼或開啟串流）
-fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<PreparedTrack, String> {
+fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::AtomicBool>, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
     // S1: 驗證本機路徑並取得 handle（NT6: TOCTOU 緩解）
     validate_local_path(Path::new(path))?;
     let mut file = std::fs::File::open(path).map_err(|e| format!("開啟檔案失敗: {e}"))?;
@@ -523,6 +539,10 @@ fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::Atomic
                             channels: stream.channels(),
                             duration_ms,
                             norm_gain: 1.0,
+                            replaygain_track_gain: rg_track_gain,
+                            replaygain_track_peak: rg_track_peak,
+                            replaygain_album_gain: rg_album_gain,
+                            replaygain_album_peak: rg_album_peak,
                             data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred { 
                                 path: path.to_string(), 
                                 sample_rate: stream.sample_rate(), 
@@ -553,18 +573,22 @@ fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::Atomic
                             channels: stream.channels(),
                             duration_ms,
                             norm_gain,
+                            replaygain_track_gain: rg_track_gain,
+                            replaygain_track_peak: rg_track_peak,
+                            replaygain_album_gain: rg_album_gain,
+                            replaygain_album_peak: rg_album_peak,
                             data: TrackData::Memory(Arc::new(samples)),
                         })
                     }
                 }
                 Err(e) => {
                     // symphonia 失敗，嘗試 ffmpeg
-                    prepare_with_ffmpeg(path, song_id, &ext, file, cancel)
+                    prepare_with_ffmpeg(path, song_id, &ext, file, cancel, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
                 }
             }
         }
         Some(crate::scanner::Backend::Ffmpeg) => {
-            prepare_with_ffmpeg(path, song_id, &ext, file, cancel)
+            prepare_with_ffmpeg(path, song_id, &ext, file, cancel, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
         }
         None => {
             // 受阻格式
@@ -573,7 +597,7 @@ fn prepare_track(path: &str, song_id: i64, cancel: Arc<std::sync::atomic::Atomic
     }
 }
 
-fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str, file: std::fs::File, cancel: Arc<std::sync::atomic::AtomicBool>) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str, file: std::fs::File, cancel: Arc<std::sync::atomic::AtomicBool>, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
     // 使用 ffprobe 讀取中繼資料（SE6：64 KB / 10 秒上限）
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
@@ -608,6 +632,10 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str, file: std::fs::File,
             channels,
             duration_ms,
             norm_gain: 1.0,
+            replaygain_track_gain: rg_track_gain,
+            replaygain_track_peak: rg_track_peak,
+            replaygain_album_gain: rg_album_gain,
+            replaygain_album_peak: rg_album_peak,
             data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegDeferred {
                 path: path.to_string(),
                 sample_rate,
@@ -688,6 +716,10 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, ext: &str, file: std::fs::File,
             channels,
             duration_ms,
             norm_gain,
+            replaygain_track_gain: rg_track_gain,
+            replaygain_track_peak: rg_track_peak,
+            replaygain_album_gain: rg_album_gain,
+            replaygain_album_peak: rg_album_peak,
             data: TrackData::Memory(Arc::new(samples)),
         })
     }

@@ -12,6 +12,7 @@ import {
   writeTagsBatch,  listRadio, saveRadio, renameRadio, deleteRadio,
   classifyDrop,
   addSmartRule, listSmartRules, smartPlaylistSongs,
+  playerSetReplayGainMode, playerSetVolumeNormalization, playerSetRgPreampHas, playerSetRgPreampNone, playerSetAlbumContext,
 } from '../lib/api';
 import { TrackTable, type SortKey } from './TrackTable';
 import { ConvertView, EqPanel, RadioView, SettingsView, TagView } from './Tools';
@@ -127,9 +128,17 @@ export default function Shell() {
   const [autoNote, setAutoNote] = useState('');
   const [preamp, setPreamp] = useState(0);
   const [normalize, setNormalize] = useState(false);
-  const [crossfade, setCrossfade] = useState(0);
-  const [gain, setGain] = useState(1);
-  const [eqPresets, setEqPresets] = useState<EqPreset[]>([]);
+    const [crossfade, setCrossfade] = useState(0);
+    const [gain, setGain] = useState(1);
+    const [rgMode, setRgMode] = useState<'off' | 'track' | 'album' | 'auto'>('auto');
+    const [volumeNormMode, setVolumeNormMode] = useState<'replaygain' | 'peak' | 'off'>('replaygain');
+    const [rgPreampHas, setRgPreampHas] = useState(0);
+    const [rgPreampNone, setRgPreampNone] = useState(-6);
+    const [isAlbumContext, setIsAlbumContext] = useState(false);
+    const [appliedRgDb, setAppliedRgDb] = useState<number | null>(null);
+    const [hasRg, setHasRg] = useState(false);
+    const [rgSource, setRgSource] = useState('');
+    const [eqPresets, setEqPresets] = useState<EqPreset[]>([]);
   const [presetDraft, setPresetDraft] = useState('');
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
@@ -734,16 +743,22 @@ export default function Shell() {
 
     const t = setInterval(async () => {
       try {
-        const s = await playerStatus();
-        setPosition(s.position_ms);
-        if (s.kind !== 'radio') {
-          positionRef.current = s.position_ms;
-          setDuration(s.duration_ms);
-        }
-        setPlaying(s.is_playing);
-        setGain(s.applied_gain);
-        if (s.error) setEngineError(s.error);
-        if (s.kind === 'radio') setRadioTitle(s.stream_title);
+              const s = await playerStatus();
+              setPosition(s.position_ms);
+              if (s.kind !== 'radio') {
+                positionRef.current = s.position_ms;
+                setDuration(s.duration_ms);
+              }
+              setPlaying(s.is_playing);
+              setGain(s.applied_gain);
+              // ReplayGain 狀態同步
+              if (s.applied_replaygain_db !== undefined) setAppliedRgDb(s.applied_replaygain_db);
+              if (s.has_replaygain !== undefined) setHasRg(s.has_replaygain);
+              if (s.rg_mode !== undefined) setRgMode(s.rg_mode);
+              if (s.volume_norm_mode !== undefined) setVolumeNormMode(s.volume_norm_mode);
+              if (s.rg_source !== undefined) setRgSource(s.rg_source);
+              if (s.error) setEngineError(s.error);
+              if (s.kind === 'radio') setRadioTitle(s.stream_title);
         if (s.kind !== 'radio' && s.is_playing && hydratedRef.current && Date.now() - lastFlushRef.current >= 5000) {
           void flushNowRef.current().catch(() => {});
         }
@@ -932,10 +947,30 @@ export default function Shell() {
     playerSetNormalize(on).catch((e) => setEngineError(String(e)));
   };
   const changeCrossfade = (ms: number) => {
-    setCrossfade(ms);
-    playerSetCrossfade(ms).catch((e) => setEngineError(String(e)));
-  };
-  const closeEq = useCallback(() => setEqOpen(false), []);
+      setCrossfade(ms);
+      playerSetCrossfade(ms).catch((e) => setEngineError(String(e)));
+    };
+    const changeRgMode = (mode: 'off' | 'track' | 'album' | 'auto') => {
+      setRgMode(mode);
+      playerSetReplayGainMode(mode, isAlbumContext).catch((e) => setEngineError(String(e)));
+    };
+    const changeVolumeNormMode = (mode: 'replaygain' | 'peak' | 'off') => {
+      setVolumeNormMode(mode);
+      playerSetVolumeNormalization(mode, isAlbumContext).catch((e) => setEngineError(String(e)));
+    };
+    const changeRgPreampHas = (db: number) => {
+      setRgPreampHas(db);
+      playerSetRgPreampHas(db).catch((e) => setEngineError(String(e)));
+    };
+    const changeRgPreampNone = (db: number) => {
+      setRgPreampNone(db);
+      playerSetRgPreampNone(db).catch((e) => setEngineError(String(e)));
+    };
+    const changeAlbumContext = (on: boolean) => {
+      setIsAlbumContext(on);
+      playerSetAlbumContext(on).catch((e) => setEngineError(String(e)));
+    };
+    const closeEq = useCallback(() => setEqOpen(false), []);
   const changeFx = (next: Fx) => {
     setFx(next);
     fxRef.current = next;
@@ -1558,10 +1593,20 @@ export default function Shell() {
           </div>
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
-        <div className="flex-[1_1_320px] min-w-0 text-[12px] leading-5 text-[#c8c2b8] break-all" title={active?.path || radioTitle || ''}>
-          {radioTitle ? `直播　${radioTitle}` : (active ? `${techLine(active)}　${active.path}` : '尚未選擇檔案')}
-        </div>
-        <div className="flex items-center gap-2 min-w-0 ml-auto">
+                <div className="flex-[1_1_320px] min-w-0 text-[12px] leading-5 text-[#c8c2b8] break-all" title={active?.path || radioTitle || ''}>
+                  {radioTitle ? `直播　${radioTitle}` : (active ? `${techLine(active)}　${active.path}` : '尚未選擇檔案')}
+                </div>
+                {/* ReplayGain 狀態列 */}
+                {!radioTitle && hasRg && appliedRgDb !== null && (
+                  <div className="flex items-center gap-2 text-[11px] text-[#e23b2f] shrink-0" title={`來源：${rgSource} | 模式：${rgMode} | 正規化：${volumeNormMode} | 專輯上下文：${isAlbumContext ? '開' : '關'}`}>
+                    <span>RG: <b>{appliedRgDb > 0 ? '+' : ''}{appliedRgDb.toFixed(2)} dB</b></span>
+                    <span className="text-[#8a847a]">|</span>
+                    <span>{rgMode}</span>
+                    <span className="text-[#8a847a]">|</span>
+                    <span>{volumeNormMode}</span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2 min-w-0 ml-auto">
           <select className="field text-[11px] min-w-[140px]" style={{ width: 260, flex: '0 1 260px' }} value={outputDevice} onChange={(e) => { void playerSetOutput(e.target.value).catch((err) => setEngineError(String(err))); setOutputDevice(e.target.value); }} disabled={outputDevices.length === 0}>
             {outputDevices.map((d) => (<option key={d} value={d}>{d}</option>))}
           </select>
@@ -1701,17 +1746,23 @@ export default function Shell() {
         </div>
       )}
       {eqOpen && !mini && (
-        <EqPanel
-          bands={eq} preamp={preamp} enabled={eqEnabled} normalize={normalize} crossfade={crossfade} gain={gain}
-          presets={eqPresets} selectedPreset={selectedPreset} presetDraft={presetDraft}
-          onBands={changeBands} onPreamp={changePreamp} onEnabled={changeEqEnabled}
-          onNormalize={changeNormalize} onCrossfade={changeCrossfade}
-          onApplyPreset={applyPreset} onSavePreset={savePreset} onDeletePreset={deletePreset}
-          onPresetNameChange={setPresetDraft} onClose={closeEq}
-          fx={fx} onFx={changeFx} onScene={applyScene} isRadio={!!radioTitle}
-          song={active} auto={autoEq} onAuto={changeAuto} autoNote={autoNote}
-        />
-      )}
+              <EqPanel
+                bands={eq} preamp={preamp} enabled={eqEnabled} normalize={normalize} crossfade={crossfade} gain={gain}
+                presets={eqPresets} selectedPreset={selectedPreset} presetDraft={presetDraft}
+                onBands={changeBands} onPreamp={changePreamp} onEnabled={changeEqEnabled}
+                onNormalize={changeNormalize} onCrossfade={changeCrossfade}
+                onApplyPreset={applyPreset} onSavePreset={savePreset} onDeletePreset={deletePreset}
+                onPresetNameChange={setPresetDraft} onClose={closeEq}
+                                fx={fx} onFx={changeFx} onScene={applyScene} isRadio={!!radioTitle}
+                                song={active} auto={autoEq} onAuto={changeAuto} autoNote={autoNote}
+                                rgMode={rgMode} onRgModeChange={changeRgMode}
+                                volumeNormMode={volumeNormMode} onVolumeNormModeChange={changeVolumeNormMode}
+                                rgPreampHas={rgPreampHas} onRgPreampHasChange={changeRgPreampHas}
+                                rgPreampNone={rgPreampNone} onRgPreampNoneChange={changeRgPreampNone}
+                                isAlbumContext={isAlbumContext} onAlbumContextChange={changeAlbumContext}
+                                appliedRgDb={appliedRgDb} hasRg={hasRg} rgSource={rgSource}
+                              />
+            )}
     </div>
   );
 }

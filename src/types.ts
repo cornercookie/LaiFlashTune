@@ -65,6 +65,9 @@ export interface PlayModeValue {
 
 export type PlayMode = 'Sequence' | 'Single' | 'All' | 'Random';
 
+export type ReplayGainMode = 'off' | 'track' | 'album' | 'auto';
+export type VolumeNormalization = 'replaygain' | 'peak' | 'off';
+
 export interface NewPlaylist {
   name: string;
   sort_order: number;
@@ -93,6 +96,10 @@ export interface AppConfig {
   music_folders: string[];
   theme: string;
   lyrics_offset_ms: number;
+  replaygain_mode: ReplayGainMode;
+  volume_normalization: VolumeNormalization;
+  rg_preamp_has: number;
+  rg_preamp_none: number;
 }
 
 export interface ScanProgress {
@@ -133,6 +140,11 @@ export interface EngineSnapshot {
   next_token: number;
   next_clear_epoch: number;
   playback_state: string;
+  applied_replaygain_db: number | null;
+  has_replaygain: boolean;
+  rg_mode: ReplayGainMode;
+  volume_norm_mode: VolumeNormalization;
+  rg_source: string;
 }
 
 export interface LibraryFacet {

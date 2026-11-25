@@ -8,6 +8,8 @@ import type {
   AppConfig,
   ScanProgress,
   PlayMode,
+  ReplayGainMode,
+  VolumeNormalization,
   NewPlaylist,
   NewPlaylistItem,
   NewMusicFolder,
@@ -96,6 +98,13 @@ export const playerSetFx = (fx: import('../player/fx').Fx) => invokeCmd('player_
 export const eqResponse = (bands: number[], preamp: number, enabled: boolean, sampleRate?: number) =>
   invokeCmd<Array<[number, number]>>('eq_response_cmd', { bands, preamp, enabled, sampleRate });
 export const playerSetNormalize = (enabled: boolean) => invokeCmd('player_set_normalize', { enabled });
+export const playerSetReplayGainMode = (mode: ReplayGainMode, isAlbumContext?: boolean) =>
+  invokeCmd('player_set_replaygain_mode', { mode, isAlbumContext });
+export const playerSetVolumeNormalization = (mode: VolumeNormalization, isAlbumContext?: boolean) =>
+  invokeCmd('player_set_volume_normalization', { mode, isAlbumContext });
+export const playerSetRgPreampHas = (db: number) => invokeCmd('player_set_rg_preamp_has', { db });
+export const playerSetRgPreampNone = (db: number) => invokeCmd('player_set_rg_preamp_none', { db });
+export const playerSetAlbumContext = (isAlbumContext: boolean) => invokeCmd('player_set_album_context', { isAlbumContext });
 export const playerSetCrossfade = (ms: number) => invokeCmd('player_set_crossfade', { ms });
 export const playerPlayUrl = (url: string) => invokeCmd('player_play_url', { url });
 export const playerSetDefaultPlayer = (enable: boolean) =>

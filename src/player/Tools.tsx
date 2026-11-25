@@ -10,7 +10,9 @@ import {
 } from '../lib/api';
 import type { RadioStation } from '../types';
 
-type PanelTab = 'eq' | 'fx' | 'suggest';
+import type { ReplayGainMode, VolumeNormalization } from '../types';
+
+type PanelTab = 'eq' | 'fx' | 'suggest' | 'replaygain';
 
 function FxSlider({ label, value, min, max, step, fmt, onChange, disabled, title }: {
   label: string; value: number; min: number; max: number; step: number;
@@ -53,6 +55,12 @@ export function EqPanel({
   presets, selectedPreset, presetDraft, song, auto, autoNote,
   onBands, onPreamp, onEnabled, onNormalize, onCrossfade, onFx, onScene, onAuto,
   onApplyPreset, onSavePreset, onDeletePreset, onPresetNameChange, onClose,
+  rgMode, onRgModeChange,
+  volumeNormMode, onVolumeNormModeChange,
+  rgPreampHas, onRgPreampHasChange,
+  rgPreampNone, onRgPreampNoneChange,
+  isAlbumContext, onAlbumContextChange,
+  appliedRgDb, hasRg, rgSource,
 }: {
   bands: number[];
   preamp: number;
@@ -81,6 +89,19 @@ export function EqPanel({
   onDeletePreset: (name: string) => void;
   onPresetNameChange: (v: string) => void;
   onClose: () => void;
+  rgMode: ReplayGainMode;
+  onRgModeChange: (v: ReplayGainMode) => void;
+  volumeNormMode: VolumeNormalization;
+  onVolumeNormModeChange: (v: VolumeNormalization) => void;
+  rgPreampHas: number;
+  onRgPreampHasChange: (v: number) => void;
+  rgPreampNone: number;
+  onRgPreampNoneChange: (v: number) => void;
+  isAlbumContext: boolean;
+  onAlbumContextChange: (v: boolean) => void;
+  appliedRgDb: number | null;
+  hasRg: boolean;
+  rgSource: string;
 }) {
   const [tab, setTab] = useState<PanelTab>('eq');
   const [curve, setCurve] = useState<Array<[number, number]>>([]);
@@ -165,10 +186,11 @@ export function EqPanel({
         onPointerUp={() => { drag.current = null; }}
       >
         <div role="tablist" className="flex">
-          {tabBtn('eq', '等化器', enabled ? '' : '關')}
-          {tabBtn('fx', '音效', activeFx.length ? String(activeFx.length) : '')}
-          {tabBtn('suggest', '建議')}
-        </div>
+                {tabBtn('eq', '等化器', enabled ? '' : '關')}
+                {tabBtn('fx', '音效', activeFx.length ? String(activeFx.length) : '')}
+                {tabBtn('suggest', '建議')}
+                {tabBtn('replaygain', 'ReplayGain', hasRg ? '有' : '無')}
+              </div>
         <span className="ml-2 text-[11px] text-[#8a847a] truncate min-w-0">
           {activeFx.length ? `作用中：${activeFx.join('、')}` : '音效全關'}
         </span>
@@ -377,9 +399,121 @@ export function EqPanel({
           </div>
         </div>
       )}
-    </div>
-  );
-}
+
+            {tab === 'replaygain' && (
+              <div className="px-4 py-3">
+                <div className="mb-3 p-3 bg-[#12110f] border border-[#2a2723] rounded-sm">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[13px] font-bold text-[#f4f0e8]">ReplayGain 狀態</span>
+                    <span className={`text-[11px] px-2 py-0.5 rounded ${hasRg ? 'bg-[#1a3a1a] text-[#4ade80]' : 'bg-[#3a1a1a] text-[#f87171]'}`}>
+                      {hasRg ? '檔案有 RG 標籤' : '檔案無 RG 標籤'}
+                    </span>
+                  </div>
+                  <div className="grid gap-1 text-[12px] text-[#c8c2b8]" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
+                    <div>套用增益：<span className="text-[#e23b2f] font-mono">{appliedRgDb !== null ? `${appliedRgDb > 0 ? '+' : ''}${appliedRgDb.toFixed(2)} dB` : '—'}</span></div>
+                    <div>來源：<span className="text-[#e23b2f] font-mono">{rgSource || '—'}</span></div>
+                    <div>模式：<span className="text-[#e23b2f] font-mono">{rgMode}</span></div>
+                    <div>音量正規化：<span className="text-[#e23b2f] font-mono">{volumeNormMode}</span></div>
+                    <div>專輯播放上下文：<span className="text-[#e23b2f] font-mono">{isAlbumContext ? '開' : '關'}</span></div>
+                    <div>RG 前級：<span className="text-[#e23b2f] font-mono">{hasRg ? `${rgPreampHas > 0 ? '+' : ''}${rgPreampHas} dB` : `${rgPreampNone > 0 ? '+' : ''}${rgPreampNone} dB`}</span></div>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">ReplayGain 模式</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(['off', 'track', 'album', 'auto'] as ReplayGainMode[]).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          className={`px-3 py-1.5 rounded-sm text-[12px] transition-colors ${
+                            rgMode === m
+                              ? 'bg-[#e23b2f] text-[#f4f0e8] border-[#e23b2f]'
+                              : 'bg-[#12110f] text-[#c8c2b8] border-[#2a2723]'
+                          }`}
+                          onClick={() => onRgModeChange(m)}
+                        >
+                          {m === 'off' ? '關閉' : m === 'track' ? '依曲目' : m === 'album' ? '依專輯' : '自動'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">音量正規化模式</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(['replaygain', 'peak', 'off'] as VolumeNormalization[]).map((m) => (
+                        <button
+                          key={m}
+                          type="button"
+                          className={`px-3 py-1.5 rounded-sm text-[12px] transition-colors ${
+                            volumeNormMode === m
+                              ? 'bg-[#e23b2f] text-[#f4f0e8] border-[#e23b2f]'
+                              : 'bg-[#12110f] text-[#c8c2b8] border-[#2a2723]'
+                          }`}
+                          onClick={() => onVolumeNormModeChange(m)}
+                        >
+                          {m === 'replaygain' ? 'ReplayGain' : m === 'peak' ? '峰值正規化' : '關閉'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={isAlbumContext}
+                        onChange={(e) => onAlbumContextChange(e.target.checked)}
+                        className="accent-[#e23b2f]"
+                      />
+                      <span className="text-[13px] text-[#f4f0e8]">專輯播放上下文（整張專輯連續播放時使用專輯增益）</span>
+                    </label>
+                  </div>
+
+                  <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
+                    <div className="border border-[#2a2723] rounded-sm p-3">
+                      <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">有 RG 檔案前級</div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={-20}
+                          max={20}
+                          step={0.5}
+                          value={rgPreampHas}
+                          onChange={(e) => onRgPreampHasChange(Number(e.target.value))}
+                          className="line flex-1 accent-[#e23b2f]"
+                          style={{ ['--pct' as string]: `${((rgPreampHas + 20) / 40) * 100}%` }}
+                        />
+                        <span className="num text-[12px] text-[#e23b2f] w-12 shrink-0 text-right">{rgPreampHas > 0 ? '+' : ''}{rgPreampHas} dB</span>
+                      </div>
+                      <p className="text-[10px] text-[#8a847a] mt-1">套用於帶有 ReplayGain 標籤的檔案</p>
+                    </div>
+                    <div className="border border-[#2a2723] rounded-sm p-3">
+                      <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">無 RG 檔案前級</div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="range"
+                          min={-20}
+                          max={20}
+                          step={0.5}
+                          value={rgPreampNone}
+                          onChange={(e) => onRgPreampNoneChange(Number(e.target.value))}
+                          className="line flex-1 accent-[#e23b2f]"
+                          style={{ ['--pct' as string]: `${((rgPreampNone + 20) / 40) * 100}%` }}
+                        />
+                        <span className="num text-[12px] text-[#e23b2f] w-12 shrink-0 text-right">{rgPreampNone > 0 ? '+' : ''}{rgPreampNone} dB</span>
+                      </div>
+                      <p className="text-[10px] text-[#8a847a] mt-1">套用於沒有 ReplayGain 標籤的檔案（預設 -6 dB）</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      }
 
 export function RadioView({ onPlay }: { onPlay: (url: string) => void }) {
   const [stations, setStations] = useState<RadioStation[]>([]);
