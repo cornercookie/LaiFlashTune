@@ -137,6 +137,18 @@ pub struct QueueItem {
     pub song: Song,
 }
 
+/// 音量曲線
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeCurve {
+    Log,
+    Linear,
+}
+
+impl Default for VolumeCurve {
+    fn default() -> Self { VolumeCurve::Log }
+}
+
 /// 設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -147,6 +159,8 @@ pub struct AppConfig {
     pub volume_normalization: VolumeNormalization,
     pub rg_preamp_has: f32,
     pub rg_preamp_none: f32,
+    pub volume_curve: VolumeCurve,
+    pub loudness_compensation: bool,
 }
 
 impl Default for AppConfig {
@@ -159,6 +173,8 @@ impl Default for AppConfig {
             volume_normalization: VolumeNormalization::default(),
             rg_preamp_has: 0.0,
             rg_preamp_none: -6.0,
+            volume_curve: VolumeCurve::default(),
+            loudness_compensation: false,
         }
     }
 }
@@ -272,6 +288,12 @@ pub struct EngineSnapshot {
     pub playback_state: String, // "Playing" | "WaitingForNext" | "Paused" | "Finished"
     /// 下一首清除 epoch（引擎自行清除時遞增）
     pub next_clear_epoch: u64,
+    /// 真實音量增益 dB（靜音為 None，前端顯示「靜音」）
+    pub volume_db: Option<f32>,
+    /// 音量曲線
+    pub volume_curve: VolumeCurve,
+    /// 響度補償
+    pub loudness_compensation: bool,
 }
 
 impl Default for EngineSnapshot {
@@ -306,6 +328,9 @@ impl Default for EngineSnapshot {
             next_token: 0,
             playback_state: "Finished".into(),
             next_clear_epoch: 0,
+            volume_db: None,
+            volume_curve: VolumeCurve::default(),
+            loudness_compensation: false,
         }
     }
 }
@@ -348,6 +373,8 @@ pub enum PlayerCommand {
     SetAlbumContext { is_album_context: bool },
     SetCrossfade { ms: i64 },
     PlayUrl { url: String },
+    SetVolumeCurve { curve: VolumeCurve },
+    SetLoudnessCompensation { enabled: bool },
 }
 
 /// 歌詞解析結果

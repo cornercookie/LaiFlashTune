@@ -123,7 +123,7 @@ impl FxParams {
 /* ---------- 基本濾波器 ---------- */
 
 #[derive(Clone, Copy, Default)]
-struct Bq {
+pub struct Bq {
     b0: f32,
     b1: f32,
     b2: f32,
@@ -134,20 +134,20 @@ struct Bq {
 }
 
 impl Bq {
-    fn from(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
+    pub fn from(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
         Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z1: 0.0, z2: 0.0 }
     }
-    fn lowpass(sr: f32, f: f32) -> Self {
+    pub fn lowpass(sr: f32, f: f32) -> Self {
         let w = 2.0 * PI * f / sr;
         let (c, al) = (w.cos(), w.sin() / (2.0 * 0.7071));
         Self::from((1.0 - c) / 2.0, 1.0 - c, (1.0 - c) / 2.0, 1.0 + al, -2.0 * c, 1.0 - al)
     }
-    fn highpass(sr: f32, f: f32) -> Self {
+    pub fn highpass(sr: f32, f: f32) -> Self {
         let w = 2.0 * PI * f / sr;
         let (c, al) = (w.cos(), w.sin() / (2.0 * 0.7071));
         Self::from((1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0, 1.0 + al, -2.0 * c, 1.0 - al)
     }
-    fn lowshelf(sr: f32, f: f32, db: f32) -> Self {
+    pub fn lowshelf(sr: f32, f: f32, db: f32) -> Self {
         let a = 10f32.powf(db / 40.0);
         let w = 2.0 * PI * f / sr;
         let (c, s) = (w.cos(), w.sin());
@@ -162,7 +162,22 @@ impl Bq {
             (a + 1.0) + (a - 1.0) * c - sa,
         )
     }
-    fn retune(&mut self, n: Bq) {
+    pub fn highshelf(sr: f32, f: f32, db: f32) -> Self {
+        let a = 10f32.powf(db / 40.0);
+        let w = 2.0 * PI * f / sr;
+        let (c, s) = (w.cos(), w.sin());
+        let al = s / 2.0 * 2f32.sqrt();
+        let sa = 2.0 * a.sqrt() * al;
+        Self::from(
+            a * ((a + 1.0) + (a - 1.0) * c + sa),
+            -2.0 * a * ((a - 1.0) + (a + 1.0) * c),
+            a * ((a + 1.0) + (a - 1.0) * c - sa),
+            (a + 1.0) - (a - 1.0) * c + sa,
+            2.0 * ((a - 1.0) - (a + 1.0) * c),
+            (a + 1.0) - (a - 1.0) * c - sa,
+        )
+    }
+    pub fn retune(&mut self, n: Bq) {
         self.b0 = n.b0;
         self.b1 = n.b1;
         self.b2 = n.b2;
@@ -170,7 +185,7 @@ impl Bq {
         self.a2 = n.a2;
     }
     #[inline]
-    fn run(&mut self, x: f32) -> f32 {
+    pub fn run(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
@@ -585,7 +600,7 @@ impl RateStage {
 
 pub(crate) const BLOCK: usize = 1024;
 
-/// 解碼後的音訊經過：速度/節奏/音高 → 正規化 + 前級 + 18 段等化器 → 音效 → 限幅。
+/// 解碼後的音訊經過：速度/節奏/音高 → 正規化 + 前級 + 18 段等化器 → 響度補償 → 音效 → 限幅。
 pub struct DspSource<S: Iterator<Item = f32>> {
     inner: S,
     channels: u16,
@@ -603,6 +618,12 @@ pub struct DspSource<S: Iterator<Item = f32>> {
     consumed: u64,
     played_ms: Arc<AtomicU64>,
     total: Option<Duration>,
+    /// 響度補償：低頻擱架濾波器（每聲道一組）
+    loudness_bass: Vec<Bq>,
+    /// 響度補償：高頻擱架濾波器（每聲道一組）
+    loudness_treble: Vec<Bq>,
+    /// 上次套用響度補償時的 EqShared 版本號
+    loudness_seen: u64,
 }
 
 impl<S: Iterator<Item = f32>> DspSource<S> {
@@ -635,6 +656,9 @@ impl<S: Iterator<Item = f32>> DspSource<S> {
             consumed: 0,
             played_ms: played.clone(),
             total,
+            loudness_bass: vec![Bq::default(); ch],
+            loudness_treble: vec![Bq::default(); ch],
+            loudness_seen: 0,
         };
         s.refresh();
         (s, played)
@@ -644,8 +668,21 @@ impl<S: Iterator<Item = f32>> DspSource<S> {
         let v = self.shared.version();
         if v != self.seen {
             self.seen = v;
-            self.p = self.shared.get().fx;
+            let params = self.shared.get();
+            self.p = params.fx;
             self.fx.set(&self.p);
+
+            // 響度補償係數更新
+            if params.loudness_enabled {
+                let sr = self.sample_rate.max(1) as f32;
+                for (i, b) in self.loudness_bass.iter_mut().enumerate() {
+                    b.retune(Bq::lowshelf(sr, params.loudness_bass_hz, params.loudness_bass_db));
+                }
+                for (i, b) in self.loudness_treble.iter_mut().enumerate() {
+                    b.retune(Bq::highshelf(sr, params.loudness_treble_hz, params.loudness_treble_db));
+                }
+            }
+            self.loudness_seen = v;
         }
     }
 
@@ -673,10 +710,19 @@ impl<S: Iterator<Item = f32>> DspSource<S> {
                 break;
             }
         }
+        let params = self.shared.get();
+        let loudness_on = params.loudness_enabled;
         let fx_on = self.fx.active();
         for frame in self.out.chunks_mut(ch) {
             for s in frame.iter_mut() {
                 *s = self.eq.process(*s);
+            }
+            // 響度補償：在 EQ 之後、音效之前套用
+            if loudness_on {
+                for c in 0..ch {
+                    frame[c] = self.loudness_bass[c].run(frame[c]);
+                    frame[c] = self.loudness_treble[c].run(frame[c]);
+                }
             }
             if fx_on {
                 self.fx.frame(frame);

@@ -10,7 +10,7 @@ import {
 } from '../lib/api';
 import type { RadioStation } from '../types';
 
-import type { ReplayGainMode, VolumeNormalization } from '../types';
+import type { ReplayGainMode, VolumeNormalization, VolumeCurve } from '../types';
 
 type PanelTab = 'eq' | 'fx' | 'suggest' | 'replaygain';
 
@@ -61,6 +61,8 @@ export function EqPanel({
   rgPreampNone, onRgPreampNoneChange,
   isAlbumContext, onAlbumContextChange,
   appliedRgDb, hasRg, rgSource,
+  volumeCurve, onVolumeCurveChange,
+  loudnessCompensation, onLoudnessCompensationChange,
 }: {
   bands: number[];
   preamp: number;
@@ -102,6 +104,10 @@ export function EqPanel({
   appliedRgDb: number | null;
   hasRg: boolean;
   rgSource: string;
+  volumeCurve: VolumeCurve;
+  onVolumeCurveChange: (v: VolumeCurve) => void;
+  loudnessCompensation: boolean;
+  onLoudnessCompensationChange: (v: boolean) => void;
 }) {
   const [tab, setTab] = useState<PanelTab>('eq');
   const [curve, setCurve] = useState<Array<[number, number]>>([]);
@@ -470,6 +476,40 @@ export function EqPanel({
                       />
                       <span className="text-[13px] text-[#f4f0e8]">專輯播放上下文（整張專輯連續播放時使用專輯增益）</span>
                     </label>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">音量曲線</div>
+                    <div className="flex flex-wrap gap-2">
+                      {(['log', 'linear'] as VolumeCurve[]).map((c) => (
+                        <button
+                          key={c}
+                          type="button"
+                          className={`px-3 py-1.5 rounded-sm text-[12px] transition-colors ${
+                            volumeCurve === c
+                              ? 'bg-[#e23b2f] text-[#f4f0e8] border-[#e23b2f]'
+                              : 'bg-[#12110f] text-[#c8c2b8] border-[#2a2723]'
+                          }`}
+                          onClick={() => onVolumeCurveChange(c)}
+                        >
+                          {c === 'log' ? '對數 (−60 dB ~ 0 dB)' : '線性'}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="text-[10px] text-[#8a847a] mt-1">滑桿 0–100% 對應的增益曲線</p>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={loudnessCompensation}
+                        onChange={(e) => onLoudnessCompensationChange(e.target.checked)}
+                        className="accent-[#e23b2f]"
+                      />
+                      <span className="text-[13px] text-[#f4f0e8]">響度補償（音量越小自動增強低頻與高頻）</span>
+                    </label>
+                    <p className="text-[10px] text-[#8a847a] mt-1">100% 時不作用；越小聲自動提升低頻 +10 dB、高頻 +6 dB</p>
                   </div>
 
                   <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>

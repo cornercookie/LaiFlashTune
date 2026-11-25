@@ -145,6 +145,8 @@ pub struct PlaybackCore {
     stream_source: Mutex<Option<Box<dyn Iterator<Item = f32> + Send>>>,
     /// 軌交接回呼：(seq, token, path, decoder)，供引擎更新 current_path/current_decoder
     pub(crate) on_track_change: Mutex<Option<Box<dyn Fn(u64, u64, &str, &str) + Send + Sync>>>,
+    /// 響度補償擱架濾波器（本機歌曲路徑，EQ 後、FxChain 前）
+    loudness_shelves: Mutex<LoudnessShelves>,
 }
 
 impl PlaybackCore {
@@ -182,6 +184,7 @@ impl PlaybackCore {
             next_coordinator: Arc::new(NextCoordinator::new()),
             stream_source: Mutex::new(None),
             on_track_change: Mutex::new(None),
+            loudness_shelves: Mutex::new(LoudnessShelves::new(INTERNAL_CHANNELS as usize)),
         }
     }
 
@@ -659,7 +662,7 @@ impl PlaybackCore {
         s.clamp(-1.0, 1.0)
     }
 
-    /// 套用 DSP 至立體聲幀：EQ → 速度/節奏/音高 (RateStage) → FxChain → 正規化 → 限幅。
+    /// 套用 DSP 至立體聲幀：EQ → 速度/節奏/音高 (RateStage) → 響度補償 → FxChain → 正規化 → 限幅。
     /// 輸入一個立體聲幀 `[L, R]`，輸出零到多個處理後樣本（交錯立體聲）追加至 `out`。
     fn apply_dsp_block(&self, frame: &[f32; 2], out: &mut Vec<f32>) {
         // 取得參數快照（命令執行緒更新，音訊執行緒讀取；快照後立即釋放鎖）
@@ -689,7 +692,13 @@ impl PlaybackCore {
             }
         }
 
-        // 對每個輸出立體聲幀套用 FxChain → 正規化 → 限幅
+        // 響度補償：在 RateStage 後、FxChain 前套用
+        {
+            let mut shelves = self.loudness_shelves.lock().unwrap();
+            shelves.maybe_retune(&self.eq_shared, INTERNAL_SAMPLE_RATE);
+        }
+
+        // 對每個輸出立體聲幀套用響度補償 → FxChain → 正規化 → 限幅
         let mut frames_out: Vec<f32> = Vec::new();
         for chunk in tmp_out.chunks(2) {
             if chunk.len() < 2 {
@@ -697,6 +706,12 @@ impl PlaybackCore {
             }
             let mut l = chunk[0];
             let mut r = chunk[1];
+
+            // 響度補償擱架
+            {
+                let mut shelves = self.loudness_shelves.lock().unwrap();
+                (l, r) = shelves.process(l, r);
+            }
 
             // FxChain 音效（立體聲幀）
             {
@@ -728,7 +743,7 @@ impl PlaybackCore {
         out.extend_from_slice(&frames_out);
     }
 
-    /// 套用後段 DSP 至立體聲幀：FxChain → 正規化 → 限幅（不重複 EQ 與 RateStage）。
+    /// 套用後段 DSP 至立體聲幀：響度補償 → FxChain → 正規化 → 限幅（不重複 EQ 與 RateStage）。
     /// 用於 tail 排空與 EOF 終結：輸入已經過 EQ 與 RateStage 的立體聲幀 `[L, R]`。
     fn apply_dsp_block_post(&self, frame: &[f32; 2], out: &mut Vec<f32>) {
         // 取得參數快照
@@ -739,6 +754,13 @@ impl PlaybackCore {
 
         let mut l = frame[0];
         let mut r = frame[1];
+
+        // 響度補償：在 FxChain 前套用
+        {
+            let mut shelves = self.loudness_shelves.lock().unwrap();
+            shelves.maybe_retune(&self.eq_shared, INTERNAL_SAMPLE_RATE);
+            (l, r) = shelves.process(l, r);
+        }
 
         // FxChain 音效（立體聲幀）
         {
@@ -766,6 +788,55 @@ impl PlaybackCore {
 
         out.push(l);
         out.push(r);
+    }
+}
+
+/// 響度補償擱架濾波器狀態（每聲道一組，用於 PlaybackCore 本機路徑）
+#[derive(Clone)]
+struct LoudnessShelves {
+    bass: Vec<crate::dsp::Bq>,
+    treble: Vec<crate::dsp::Bq>,
+    seen: u64,
+    enabled: bool,
+}
+
+impl LoudnessShelves {
+    fn new(channels: usize) -> Self {
+        Self {
+            bass: vec![crate::dsp::Bq::default(); channels],
+            treble: vec![crate::dsp::Bq::default(); channels],
+            seen: 0,
+            enabled: false,
+        }
+    }
+    fn maybe_retune(&mut self, shared: &Arc<crate::eq::EqShared>, sample_rate: u32) {
+        let v = shared.version();
+        if v == self.seen {
+            return;
+        }
+        self.seen = v;
+        let params = shared.get();
+        self.enabled = params.loudness_enabled;
+        if !self.enabled {
+            return;
+        }
+        let sr = sample_rate.max(1) as f32;
+        for b in self.bass.iter_mut() {
+            b.retune(crate::dsp::Bq::lowshelf(sr, params.loudness_bass_hz, params.loudness_bass_db));
+        }
+        for b in self.treble.iter_mut() {
+            b.retune(crate::dsp::Bq::highshelf(sr, params.loudness_treble_hz, params.loudness_treble_db));
+        }
+    }
+    fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
+        if !self.enabled {
+            return (l, r);
+        }
+        let l = self.bass[0].run(l);
+        let l = self.treble[0].run(l);
+        let r = self.bass[1].run(r);
+        let r = self.treble[1].run(r);
+        (l, r)
     }
 }
 
@@ -2337,8 +2408,8 @@ mod tests {
         let coord = core.next_coordinator();
 
         // 連續兩次 set_next：第一個請求應被第二個替換（只保留最新）
-        let g1 = coord.set_next("/track-a.mp3".into(), 1, 10);
-        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20);
+        let g1 = coord.set_next("/track-a.mp3".into(), 1, 10, None, None, None, None);
+        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20, None, None, None, None);
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
         assert_eq!(coord.current_generation(), 2, "世代應遞增至 2");
@@ -2389,8 +2460,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_generation_and_clear() {
         let coord = NextCoordinator::new();
-        let g1 = coord.set_next("/a.mp3".into(), 1, 10);
-        let g2 = coord.set_next("/b.mp3".into(), 2, 20);
+        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
+        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None);
         let g3 = coord.clear_next();
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
@@ -2403,8 +2474,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_set_next_replaces_latest() {
         let coord = NextCoordinator::new();
-        let g1 = coord.set_next("/a.mp3".into(), 1, 10);
-        let g2 = coord.set_next("/b.mp3".into(), 2, 20);
+        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
+        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None);
         // 容量 1 的待處理槽只保留最新，兩次 set_next 不應阻塞，且僅記錄最新世代
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
@@ -2414,8 +2485,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_poll_completion_discards_stale() {
         let coord = NextCoordinator::new();
-        coord.set_next("/a.mp3".into(), 1, 10); // gen 1，不存在的檔案 → worker 會產出 Err 完成通知
-        coord.set_next("/b.mp3".into(), 2, 20); // gen 2，同樣不存在
+        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None); // gen 1，不存在的檔案 → worker 會產出 Err 完成通知
+        coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None); // gen 2，同樣不存在
         // 兩個檔案都不存在，絕不應回傳 Ok；過期世代（1）一律捨棄。
         // 工作執行緒是非同步的，channel 可能尚未就緒（None）或已傳達失敗（Err），皆可接受。
         assert!(
@@ -2464,7 +2535,7 @@ mod tests {
         let coord = NextCoordinator::new();
         // 準備一個真實可解碼的檔案：worker 會把 Ok 結果送進容量 1 的 completion channel，
         // 使其滿；此時 drop 不得因 channel 滿或 worker 阻塞而永久等待。
-        coord.set_next(path.to_string_lossy().to_string(), 1, 10);
+        coord.set_next(path.to_string_lossy().to_string(), 1, 10, None, None, None, None);
         // 不 poll_completion，讓 channel 保持滿的狀態，然後 drop 驗證不會 deadlock。
         drop(coord);
     }
@@ -2472,7 +2543,7 @@ mod tests {
     #[test]
     fn test_next_coordinator_drop_does_not_deadlock() {
         let coord = NextCoordinator::new();
-        coord.set_next("/a.mp3".into(), 1, 10);
+        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
         // worker 可能正在準備（或阻塞於 completion 通道），drop 時不得永久等待
         drop(coord);
     }
@@ -2561,5 +2632,52 @@ mod tests {
 
         assert!(total > 0, "應有樣本輸出");
         assert!(found_second, "第二軌（振幅 1.0）音訊應確實出現，而非僅為舊軌尾音（振幅 ≤ 0.3）");
+    }
+
+    /// 響度補償擱架：啟用時套用增益，關閉時旁路（輸入 = 輸出）
+    #[test]
+    fn test_loudness_shelves_bypass() {
+        use crate::dsp::Bq;
+        let mut shelves = LoudnessShelves::new(INTERNAL_CHANNELS as usize);
+        let eq_shared = Arc::new(EqShared::new());
+
+        // 初始狀態：關閉，輸入應等於輸出
+        let (l_in, r_in) = (0.5, -0.3);
+        let (l_out, r_out) = shelves.process(l_in, r_in);
+        assert_eq!(l_out, l_in, "關閉時左聲道應旁路");
+        assert_eq!(r_out, r_in, "關閉時右聲道應旁路");
+
+        // 啟用響度補償，設定 bass +6 dB, treble +3 dB
+        eq_shared.update(|p| {
+            p.loudness_enabled = true;
+            p.loudness_bass_db = 6.0;
+            p.loudness_treble_db = 3.0;
+            p.loudness_bass_hz = 150.0;
+            p.loudness_treble_hz = 6000.0;
+        });
+        shelves.maybe_retune(&eq_shared, INTERNAL_SAMPLE_RATE);
+        assert!(shelves.enabled, "應啟用響度補償");
+
+        // 低頻測試訊號（100 Hz，frame 1000 避免 sin(0)=0）應被 bass shelf 增強
+        let frame = 1000usize;
+        let lf = (2.0 * std::f32::consts::PI * 100.0 * frame as f32 / INTERNAL_SAMPLE_RATE as f32).sin() * 0.5;
+        let (l_lf, r_lf) = shelves.process(lf, lf);
+        // bass shelf 在 100 Hz (低於 150 Hz 角頻率) 應有增益 > 1
+        let bass_gain = l_lf.abs() / lf.abs();
+        assert!(bass_gain > 1.0, "低頻應被 bass shelf 增強，gain={bass_gain}");
+
+        // 高頻測試訊號（8000 Hz）應被 treble shelf 增強
+        let hf = (2.0 * std::f32::consts::PI * 8000.0 * frame as f32 / INTERNAL_SAMPLE_RATE as f32).sin() * 0.3;
+        let (l_hf, r_hf) = shelves.process(hf, hf);
+        let treble_gain = l_hf.abs() / hf.abs();
+        assert!(treble_gain > 1.0, "高頻應被 treble shelf 增強，gain={treble_gain}");
+
+        // 再次關閉：應回到旁路
+        eq_shared.update(|p| p.loudness_enabled = false);
+        shelves.maybe_retune(&eq_shared, INTERNAL_SAMPLE_RATE);
+        assert!(!shelves.enabled, "應關閉響度補償");
+        let (l_off, r_off) = shelves.process(l_in, r_in);
+        assert_eq!(l_off, l_in, "關閉後左聲道應旁路");
+        assert_eq!(r_off, r_in, "關閉後右聲道應旁路");
     }
 }

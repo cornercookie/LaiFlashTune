@@ -1,4 +1,4 @@
-use crate::models::{EngineSnapshot, PlayerCommand, PlayMode};
+use crate::models::{EngineSnapshot, PlayerCommand, PlayMode, VolumeCurve};
 use crate::playback_pipeline::{
     BLOCK_FRAMES, BLOCK_BYTES, CHANNEL_CAPACITY_BYTES, CHANNEL_CAPACITY_CHUNKS, DeviceConverter,
     OutputProxy, PlaybackCore, PlaybackState, PreparedTrack, RecycleItem,
@@ -50,7 +50,10 @@ struct AudioEngine {
     device_sample_rate: u32,
     mode: PlayMode,
     is_playing: bool,
-    volume: f32,
+    /// 前端傳來的滑桿值 0–1（clamp 後儲存，供 UI 顯示用）
+    volume_raw: f32,
+    /// 實際送給 sink.set_volume() 的線性增益
+    volume_gain: f32,
     crossfade_ms: i64,
     kind: String,
     stream_title: String,
@@ -77,13 +80,50 @@ struct AudioEngine {
     recycle_rx: Receiver<RecycleItem>,
     /// 回收執行緒 handle
     recycle_handle: Option<thread::JoinHandle<()>>,
+    /// 快取的音量 dB（避免 250ms 輪詢內重複計算）
+    cached_volume_db: Option<f32>,
+}
+
+// 音量曲線換算：log 曲線對應 −60 dB 到 0 dB，linear 為直接對應
+fn volume_to_gain(raw: f32, curve: &VolumeCurve) -> f32 {
+    let v = raw.clamp(0.0, 1.0);
+    match curve {
+        VolumeCurve::Linear => v,
+        VolumeCurve::Log => {
+            if v == 0.0 { return 0.0; } // 0% 強制靜音
+            (10.0f32).powf((-60.0 + 60.0 * v) / 20.0)
+        }
+    }
+}
+
+/// 響度補償參數更新：依目前音量重算 bass/treble 增益並寫入 EqShared
+/// 若 loudness_enabled 為 false 或增益為 0（靜音），將 bass/treble 歸零（旁路）。
+fn update_loudness_params(engine: &AudioEngine, raw: f32) {
+    let gain = engine.volume_gain;
+    let params = engine.core.eq_shared.get();
+    let enabled = params.loudness_enabled;
+    // 靜音或關閉時旁路：不呼叫 log10，直接歸零
+    let (bass_db, treble_db) = if !enabled || gain == 0.0 {
+        (0.0, 0.0)
+    } else {
+        let cur_db = 20.0 * gain.log10(); // 有限正數，安全
+        let amount = ((0.0 - cur_db).clamp(0.0, 40.0) / 40.0); // 0 dB → 0，-40 dB 以下 → 1
+        (amount * 10.0, amount * 6.0) // 最多 +10 dB 低頻、+6 dB 高頻
+    };
+    engine.core.eq_shared.update(|p| {
+        p.loudness_bass_db = bass_db;
+        p.loudness_treble_db = treble_db;
+    });
 }
 
 impl AudioEngine {
     fn new(status: Arc<Mutex<EngineSnapshot>>) -> Result<Self, String> {
         let (_stream, handle) = OutputStream::try_default().map_err(|e| format!("音訊輸出失敗: {e}"))?;
         let sink = Sink::try_new(&handle).map_err(|e| format!("建立 Sink 失敗: {e}"))?;
-        sink.set_volume(0.7);
+        // 初始音量：0.7 (log 曲線換算後的增益)
+        let initial_raw = 0.7;
+        let initial_gain = volume_to_gain(initial_raw, &VolumeCurve::Log);
+        sink.set_volume(initial_gain);
 
         // 取得預設裝置取樣率
         let device_sample_rate = Self::get_default_device_sample_rate().unwrap_or(48000);
@@ -109,7 +149,8 @@ impl AudioEngine {
             device_sample_rate,
             mode: PlayMode::Sequence,
             is_playing: false,
-            volume: 0.7,
+            volume_raw: initial_raw,
+            volume_gain: initial_gain,
             crossfade_ms: 0,
             kind: "idle".into(),
             stream_title: String::new(),
@@ -127,6 +168,7 @@ impl AudioEngine {
             recycle_tx,
             recycle_rx,
             recycle_handle: Some(recycle_handle),
+            cached_volume_db: Some(20.0 * initial_gain.log10()),
         };
 
         // 初始化 EQ processor
@@ -244,7 +286,8 @@ impl AudioEngine {
                 self.get_current_duration()
             };
             s.is_playing = self.is_playing && !self.sink.as_ref().map(|s| s.empty()).unwrap_or(true);
-            s.volume = self.volume;
+            // volume 欄位給 UI 滑桿用：存 raw 值（0–1）
+            s.volume = self.volume_raw;
             s.song_id = self.get_current_song_id().unwrap_or(0);
             s.ended = self.ended;
             s.kind = self.kind.clone();
@@ -271,6 +314,10 @@ impl AudioEngine {
                 PlaybackState::Finished => "Finished",
             }
             .to_string();
+            // volume_db：使用快取值（避免 250ms 輪詢內重複 log10）
+            s.volume_db = self.cached_volume_db;
+            s.volume_curve = eq.volume_curve;
+            s.loudness_compensation = eq.loudness_enabled;
         }
     }
 
@@ -328,7 +375,7 @@ impl AudioEngine {
         // 可能阻塞的建立工作在核心鎖外完成（S5：音訊回呼不卡於裝置初始化）
         let (stream, handle) = OutputStream::try_from_device(&device).map_err(|e| format!("切換輸出裝置失敗: {e}"))?;
         let sink = Sink::try_new(&handle).map_err(|e| format!("建立 Sink 失敗: {e}"))?;
-        sink.set_volume(self.volume);
+        sink.set_volume(self.volume_gain);
         let new_proxy_id = self.core.next_proxy_id();
         let mut new_proxy = OutputProxy::new(self.core.clone(), new_sample_rate, new_proxy_id);
 
@@ -924,10 +971,21 @@ fn audio_loop(
                     }
                 }
                 PlayerCommand::SetVolume { volume } => {
-                    engine.volume = volume.clamp(0.0, 1.0);
+                    let raw = volume.clamp(0.0, 1.0);
+                    let curve = engine.core.eq_shared.get().volume_curve;
+                    engine.volume_raw = raw;
+                    engine.volume_gain = volume_to_gain(raw, &curve);
+                    // 更新快取的 dB 值
+                    engine.cached_volume_db = if engine.volume_gain == 0.0 {
+                        None
+                    } else {
+                        Some(20.0 * engine.volume_gain.log10())
+                    };
                     if let Some(ref sink) = engine.sink {
-                        sink.set_volume(engine.volume);
+                        sink.set_volume(engine.volume_gain);
                     }
+                    // 響度補償係數隨音量重算
+                    update_loudness_params(&engine, raw);
                 }
                 PlayerCommand::SetMode { mode } => {
                     if !matches!(mode, PlayMode::All | PlayMode::Random) {
@@ -996,6 +1054,29 @@ fn audio_loop(
                 PlayerCommand::SetCrossfade { ms } => {
                     engine.crossfade_ms = ms.clamp(0, 12_000);
                     engine.core.set_crossfade_ms(engine.crossfade_ms as u64);
+                }
+                PlayerCommand::SetVolumeCurve { curve } => {
+                    let raw = engine.volume_raw;
+                    engine.core.eq_shared.update(|p| p.volume_curve = curve);
+                    let gain = volume_to_gain(raw, &curve);
+                    engine.volume_gain = gain;
+                    // 更新快取的 dB 值
+                    engine.cached_volume_db = if engine.volume_gain == 0.0 {
+                        None
+                    } else {
+                        Some(20.0 * engine.volume_gain.log10())
+                    };
+                    if let Some(ref sink) = engine.sink {
+                        sink.set_volume(gain);
+                    }
+                    update_loudness_params(&engine, raw);
+                }
+                PlayerCommand::SetLoudnessCompensation { enabled } => {
+                    // 先啟用/關閉旗標，再依當前音量重算補償量（關閉時歸零，確保兩路徑一致）
+                    engine.core.eq_shared.update(|p| p.loudness_enabled = enabled);
+                    update_loudness_params(&engine, engine.volume_raw);
+                    // 觸發濾波器重算（bump 版本號）
+                    let _ = engine.core.eq_shared.version();
                 }
                 PlayerCommand::PlayUrl { url } => engine.play_url(&url),
                 PlayerCommand::SetNext { path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
@@ -1176,5 +1257,129 @@ mod tests {
     fn test_output_device_names() {
         let devices = output_device_names();
         assert!(devices.is_ok() || devices.is_err());
+    }
+
+    /// 對數曲線五節點：0%、25%、50%、75%、100% 對應的 dB 與線性增益
+    #[test]
+    fn test_volume_curve_log_nodes() {
+        // 0% → 靜音 (0.0 增益)
+        assert_eq!(volume_to_gain(0.0, &VolumeCurve::Log), 0.0);
+        // 25% → -45 dB ≈ 0.0056
+        let g25 = volume_to_gain(0.25, &VolumeCurve::Log);
+        assert!((g25 - 0.005623).abs() < 0.0001, "25% gain = {g25}");
+        let db25 = 20.0 * g25.log10();
+        assert!((db25 - (-45.0)).abs() < 0.5, "25% dB = {db25}");
+        // 50% → -30 dB ≈ 0.0316
+        let g50 = volume_to_gain(0.5, &VolumeCurve::Log);
+        assert!((g50 - 0.031623).abs() < 0.0001, "50% gain = {g50}");
+        let db50 = 20.0 * g50.log10();
+        assert!((db50 - (-30.0)).abs() < 0.5, "50% dB = {db50}");
+        // 75% → -15 dB ≈ 0.1778
+        let g75 = volume_to_gain(0.75, &VolumeCurve::Log);
+        assert!((g75 - 0.177828).abs() < 0.0001, "75% gain = {g75}");
+        let db75 = 20.0 * g75.log10();
+        assert!((db75 - (-15.0)).abs() < 0.5, "75% dB = {db75}");
+        // 100% → 0 dB = 1.0
+        assert_eq!(volume_to_gain(1.0, &VolumeCurve::Log), 1.0);
+    }
+
+    /// 線性曲線：直接對應
+    #[test]
+    fn test_volume_curve_linear() {
+        assert_eq!(volume_to_gain(0.0, &VolumeCurve::Linear), 0.0);
+        assert_eq!(volume_to_gain(0.25, &VolumeCurve::Linear), 0.25);
+        assert_eq!(volume_to_gain(0.5, &VolumeCurve::Linear), 0.5);
+        assert_eq!(volume_to_gain(0.75, &VolumeCurve::Linear), 0.75);
+        assert_eq!(volume_to_gain(1.0, &VolumeCurve::Linear), 1.0);
+    }
+
+    /// 響度補償：0 dB (100% 音量) 時 bass/treble 增益為 0
+    #[test]
+    fn test_loudness_zero_at_full_volume() {
+        let eq_shared = std::sync::Arc::new(crate::eq::EqShared::new());
+        // 啟用響度補償
+        eq_shared.update(|p| p.loudness_enabled = true);
+        let mut engine = AudioEngine {
+            core: std::sync::Arc::new(crate::playback_pipeline::PlaybackCore::new(eq_shared.clone())),
+            output_stream: None,
+            output_handle: None,
+            sink: None,
+            proxy_id: 0,
+            device_sample_rate: 48000,
+            mode: PlayMode::Sequence,
+            is_playing: false,
+            volume_raw: 1.0,
+            volume_gain: 1.0, // 0 dB
+            crossfade_ms: 0,
+            kind: "test".into(),
+            stream_title: String::new(),
+            error: String::new(),
+            ended: false,
+            status: std::sync::Arc::new(std::sync::Mutex::new(crate::models::EngineSnapshot::default())),
+            radio_stop: None,
+            next_token_counter: std::sync::atomic::AtomicU64::new(1),
+            next_coord_gen: 0,
+            seq_counter: std::sync::atomic::AtomicU64::new(1),
+            current_decoder: std::sync::Mutex::new(None),
+            current_path: std::sync::Mutex::new(None),
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            recycle_tx: crossbeam_channel::bounded(32).0,
+            recycle_rx: crossbeam_channel::bounded(32).1,
+            recycle_handle: None,
+            cached_volume_db: Some(0.0),
+        };
+        // 觸發重算
+        update_loudness_params(&engine, 1.0);
+        let params = eq_shared.get();
+        assert_eq!(params.loudness_bass_db, 0.0, "bass 應為 0 dB");
+        assert_eq!(params.loudness_treble_db, 0.0, "treble 應為 0 dB");
+    }
+
+    /// 響度補償：關閉時 bass/treble 歸零（旁路）
+    #[test]
+    fn test_loudness_bypass_when_disabled() {
+        let eq_shared = std::sync::Arc::new(crate::eq::EqShared::new());
+        eq_shared.update(|p| {
+            p.loudness_enabled = true;
+            p.loudness_bass_db = 5.0;
+            p.loudness_treble_db = 3.0;
+        });
+        let mut engine = AudioEngine {
+            core: std::sync::Arc::new(crate::playback_pipeline::PlaybackCore::new(eq_shared.clone())),
+            output_stream: None,
+            output_handle: None,
+            sink: None,
+            proxy_id: 0,
+            device_sample_rate: 48000,
+            mode: PlayMode::Sequence,
+            is_playing: false,
+            volume_raw: 0.5,
+            volume_gain: 0.0316, // -30 dB
+            crossfade_ms: 0,
+            kind: "test".into(),
+            stream_title: String::new(),
+            error: String::new(),
+            ended: false,
+            status: std::sync::Arc::new(std::sync::Mutex::new(crate::models::EngineSnapshot::default())),
+            radio_stop: None,
+            next_token_counter: std::sync::atomic::AtomicU64::new(1),
+            next_coord_gen: 0,
+            seq_counter: std::sync::atomic::AtomicU64::new(1),
+            current_decoder: std::sync::Mutex::new(None),
+            current_path: std::sync::Mutex::new(None),
+            cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            recycle_tx: crossbeam_channel::bounded(32).0,
+            recycle_rx: crossbeam_channel::bounded(32).1,
+            recycle_handle: None,
+            cached_volume_db: Some(-30.0),
+        };
+        // 關閉響度補償
+        eq_shared.update(|p| p.loudness_enabled = false);
+        update_loudness_params(&engine, 0.5);
+        let params = eq_shared.get();
+        assert_eq!(params.loudness_bass_db, 0.0, "關閉時 bass 應歸零");
+        assert_eq!(params.loudness_treble_db, 0.0, "關閉時 treble 應歸零");
     }
 }

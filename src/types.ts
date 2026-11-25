@@ -67,6 +67,7 @@ export type PlayMode = 'Sequence' | 'Single' | 'All' | 'Random';
 
 export type ReplayGainMode = 'off' | 'track' | 'album' | 'auto';
 export type VolumeNormalization = 'replaygain' | 'peak' | 'off';
+export type VolumeCurve = 'log' | 'linear';
 
 export interface NewPlaylist {
   name: string;
@@ -100,6 +101,8 @@ export interface AppConfig {
   volume_normalization: VolumeNormalization;
   rg_preamp_has: number;
   rg_preamp_none: number;
+  volume_curve: VolumeCurve;
+  loudness_compensation: boolean;
 }
 
 export interface ScanProgress {
@@ -145,6 +148,9 @@ export interface EngineSnapshot {
   rg_mode: ReplayGainMode;
   volume_norm_mode: VolumeNormalization;
   rg_source: string;
+  volumeDb: number | null;
+  volumeCurve: VolumeCurve;
+  loudnessCompensation: boolean;
 }
 
 export interface LibraryFacet {

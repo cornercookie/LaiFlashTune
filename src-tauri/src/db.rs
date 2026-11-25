@@ -883,6 +883,15 @@ pub fn load_config(conn: &rusqlite::Connection) -> rusqlite::Result<AppConfig> {
     }
     if let Some(v) = get("rg_preamp_has") { config.rg_preamp_has = v.parse().unwrap_or(0.0); }
     if let Some(v) = get("rg_preamp_none") { config.rg_preamp_none = v.parse().unwrap_or(-6.0); }
+    if let Some(v) = get("volume_curve") {
+        config.volume_curve = match v.as_str() {
+            "linear" => crate::models::VolumeCurve::Linear,
+            _ => crate::models::VolumeCurve::Log,
+        };
+    }
+    if let Some(v) = get("loudness_compensation") {
+        config.loudness_compensation = v.parse().unwrap_or(false);
+    }
     Ok(config)
 }
 
@@ -970,6 +979,10 @@ mod tests {
             bitrate: Some(320),
             sample_rate: Some(44100),
             channels: Some(2),
+            replaygain_track_gain: None,
+            replaygain_track_peak: None,
+            replaygain_album_gain: None,
+            replaygain_album_peak: None,
         };
         upsert_song(&conn, &song).unwrap();
 

@@ -27,7 +27,7 @@ use crate::commands::{
     player_load, player_play, player_preload, player_prepare, player_next, player_pause, player_position,
     player_prev, player_seek, player_set_mode,            player_set_volume, player_stop, player_toggle,
             player_status, player_set_eq, player_set_preamp, player_set_eq_enabled, player_set_fx, eq_response_cmd, player_output_devices, player_set_output, player_set_normalize, player_set_crossfade, player_play_url,
-            player_set_next, player_clear_next,
+            player_set_next, player_clear_next, player_set_volume_curve, player_set_loudness_compensation,
     library_facets_cmd, songs_by_field_cmd, list_recent_cmd,
     read_tags_cmd, write_tags_cmd, write_tags_batch_cmd, ffmpeg_available_cmd, convert_audio_cmd, reveal_in_explorer_cmd, browse_folder_cmd, take_opened_file_cmd, song_by_path_cmd, smtc_update_cmd,
     pick_m3u_cmd, pick_m3u_save_cmd, import_m3u_cmd, export_m3u_cmd,
@@ -64,8 +64,15 @@ fn main() {
     let db_conn = crate::db::open_connection(&db_path()).expect("無法開啟資料庫");
     init_db(&db_conn).expect("資料庫初始化失敗");
 
+    // 載入設定（在音訊執行緒啟動前讀取，啟動後套用）
+    let config = crate::db::load_config(&db_conn).unwrap_or_default();
+
     // 啟動音訊執行緒（rodio 輸出 + symphonia 解碼，獨立於 UI 執行緒）
     let (player_tx, status_handle) = start_player_thread();
+
+    // 套用音量曲線與響度補償設定到引擎
+    let _ = player_tx.send(crate::models::PlayerCommand::SetVolumeCurve { curve: config.volume_curve });
+    let _ = player_tx.send(crate::models::PlayerCommand::SetLoudnessCompensation { enabled: config.loudness_compensation });
 
     Builder::default()
         .manage(DbState {
@@ -125,6 +132,8 @@ fn main() {
                     player_set_normalize,
                     player_set_crossfade,
                     player_play_url,
+                    player_set_volume_curve,
+                    player_set_loudness_compensation,
                     library_facets_cmd,
                     songs_by_field_cmd,
                     list_recent_cmd,

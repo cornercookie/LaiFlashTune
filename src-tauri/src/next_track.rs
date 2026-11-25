@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn test_next_coordinator_basic() {
         let coord = NextCoordinator::new();
-        let gen = coord.set_next("/test/path.mp3".to_string(), 1);
+        let gen = coord.set_next("/test/path.mp3".to_string(), 1, None, None, None, None);
         assert_eq!(gen, 1);
         assert_eq!(coord.current_generation(), 1);
     }
@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn test_next_coordinator_clear() {
         let coord = NextCoordinator::new();
-        coord.set_next("/test/path1.mp3".to_string(), 1);
+        coord.set_next("/test/path1.mp3".to_string(), 1, None, None, None, None);
         let gen = coord.clear_next();
         assert_eq!(gen, 2);
         assert!(!coord.has_next());
@@ -751,8 +751,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_generation_increments() {
         let coord = NextCoordinator::new();
-        let g1 = coord.set_next("/test/path1.mp3".to_string(), 1);
-        let g2 = coord.set_next("/test/path2.mp3".to_string(), 2);
+        let g1 = coord.set_next("/test/path1.mp3".to_string(), 1, None, None, None, None);
+        let g2 = coord.set_next("/test/path2.mp3".to_string(), 2, None, None, None, None);
         let g3 = coord.clear_next();
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);

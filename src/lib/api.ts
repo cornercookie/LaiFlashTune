@@ -10,6 +10,7 @@ import type {
   PlayMode,
   ReplayGainMode,
   VolumeNormalization,
+  VolumeCurve,
   NewPlaylist,
   NewPlaylistItem,
   NewMusicFolder,
@@ -109,6 +110,10 @@ export const playerSetCrossfade = (ms: number) => invokeCmd('player_set_crossfad
 export const playerPlayUrl = (url: string) => invokeCmd('player_play_url', { url });
 export const playerSetDefaultPlayer = (enable: boolean) =>
   invokeCmd('player_set_default_player', { enable });
+export const playerSetVolumeCurve = (curve: VolumeCurve) =>
+  invokeCmd('player_set_volume_curve', { curve });
+export const playerSetLoudnessCompensation = (enabled: boolean) =>
+  invokeCmd('player_set_loudness_compensation', { enabled });
 export const playerOutputDevices = () => invokeCmd<string[]>('player_output_devices');
 export const playerSetOutput = (name: string) => invokeCmd('player_set_output', { name });
 export const libraryFacets = (field: string) => invokeCmd<import('../types').LibraryFacet[]>('library_facets_cmd', { field });

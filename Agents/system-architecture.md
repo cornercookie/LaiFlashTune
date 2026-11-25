@@ -96,3 +96,10 @@ flowchart LR
 | PowerShell | 資料夾與檔案對話框（`FolderBrowserDialog`、`OpenFileDialog`） | 回傳錯誤 |
 | `reg` | HKCU 檔案關聯 | 寫入失敗只記 log |
 | WebView2 | 介面 | Windows 10 1803 以上內建 |
+
+## Tauri command 註冊（P1-2 新增）
+
+| command | 註冊位置 | 權限（capabilities/default.json） | 職責 |
+|---|---|---|---|
+| `player_set_volume_curve` | `main.rs` invoke handler、`build.rs` COMMANDS 陣列 | `allow-player-set-volume-curve` | 切換音量曲線：`"log"`（對數，預設，滑桿 0–100% 對應 −60 dB 到 0 dB）或 `"linear"`（線性）。寫入 `EqShared.volume_curve`、持久化 `app_config.volume_curve`、重算 `volume_gain` 並送 `sink.set_volume()`。 |
+| `player_set_loudness_compensation` | `main.rs` invoke handler、`build.rs` COMMANDS 陣列 | `allow-player-set-loudness-compensation` | 開關響度補償（預設關）。開啟時依當前音量在 DSP 鏈（本機與電台皆套用）加低頻/高頻擱架增益，最高約 +10 dB（150 Hz）與 +6 dB（6 kHz）；100% 時補償歸零。寫入 `EqShared.loudness_enabled`、`loudness_bass_db`、`loudness_treble_db`，bump 版本號讓兩路徑濾波器刷新，持久化 `app_config.loudness_compensation`。 |

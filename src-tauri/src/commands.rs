@@ -644,6 +644,37 @@ pub fn player_set_default_player(enable: bool) -> Result<(), String> {
     crate::open_with::set_windows_association(enable)
 }
 
+/// 設定音量曲線：log | linear。持久化並即時生效。
+#[tauri::command]
+pub fn player_set_volume_curve(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    curve: String,
+) -> Result<(), String> {
+    let vol_curve = match curve.as_str() {
+        "log" => crate::models::VolumeCurve::Log,
+        "linear" => crate::models::VolumeCurve::Linear,
+        _ => return Err(format!("無效的音量曲線: {}，僅接受 log 或 linear", curve)),
+    };
+    send_cmd(state, PlayerCommand::SetVolumeCurve { curve: vol_curve })?;
+    // 持久化
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "volume_curve", &curve).map_err(|e| e.to_string())
+}
+
+/// 設定響度補償開關。持久化並即時生效。
+#[tauri::command]
+pub fn player_set_loudness_compensation(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    enabled: bool,
+) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetLoudnessCompensation { enabled })?;
+    // 持久化
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "loudness_compensation", &enabled.to_string()).map_err(|e| e.to_string())
+}
+
 /// 曲庫分面：artist / album / genre / folder。
 #[tauri::command]
 pub fn library_facets_cmd(state: State<'_, DbState>, field: String) -> Result<Vec<crate::models::LibraryFacet>, String> {

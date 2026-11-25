@@ -123,5 +123,7 @@ erDiagram
 | `eq_auto` | `{ enabled, fallback }` | 切換自動套用時 |
 | `playlist_tabs` | 開著的歌單頁籤 id | 開、關頁籤時 |
 | `lyrics_open` | `"0"` 或 `"1"` | 切換歌詞欄時 |
+| `volume_curve` | `"log"`（預設）或 `"linear"` | `player_set_volume_curve` command 呼叫時，由 `save_config_kv` 寫入 |
+| `loudness_compensation` | `"true"` 或 `"false"`（預設 `"false"`） | `player_set_loudness_compensation` command 呼叫時，由 `save_config_kv` 寫入 |
 
-舊資料的相容處理：`session.eq` 與預設如果是 10 段，依對數頻率換算成 18 段（`eq.ts` 的 `migrateBands`）。
+舊資料的相容處理：`session.eq` 與預設如果是 10 段，依對數頻率換算成 18 段（`eq.ts` 的 `migrateBands`）。**新增的兩 key 載入時缺欄回退 Default：`volume_curve = "log"`、`loudness_compensation = false`**（見 `db.rs:load_config` 以 `AppConfig::default()` 開場、缺欄保留預設）。

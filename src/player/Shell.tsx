@@ -13,6 +13,7 @@ import {
   classifyDrop,
   addSmartRule, listSmartRules, smartPlaylistSongs,
   playerSetReplayGainMode, playerSetVolumeNormalization, playerSetRgPreampHas, playerSetRgPreampNone, playerSetAlbumContext,
+  playerSetVolumeCurve, playerSetLoudnessCompensation,
 } from '../lib/api';
 import { TrackTable, type SortKey } from './TrackTable';
 import { ConvertView, EqPanel, RadioView, SettingsView, TagView } from './Tools';
@@ -138,6 +139,9 @@ export default function Shell() {
     const [appliedRgDb, setAppliedRgDb] = useState<number | null>(null);
     const [hasRg, setHasRg] = useState(false);
     const [rgSource, setRgSource] = useState('');
+    const [volumeCurve, setVolumeCurve] = useState<'log' | 'linear'>('log');
+    const [loudnessCompensation, setLoudnessCompensation] = useState(false);
+    const [volumeDb, setVolumeDb] = useState<number | null>(null);
     const [eqPresets, setEqPresets] = useState<EqPreset[]>([]);
   const [presetDraft, setPresetDraft] = useState('');
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
@@ -757,6 +761,11 @@ export default function Shell() {
               if (s.rg_mode !== undefined) setRgMode(s.rg_mode);
               if (s.volume_norm_mode !== undefined) setVolumeNormMode(s.volume_norm_mode);
               if (s.rg_source !== undefined) setRgSource(s.rg_source);
+              // 音量曲線與響度補償同步
+              if (s.volumeCurve !== undefined) setVolumeCurve(s.volumeCurve);
+              if (s.loudnessCompensation !== undefined) setLoudnessCompensation(s.loudnessCompensation);
+              // 音量 dB 同步（靜音為 null）
+              if (s.volumeDb !== undefined) setVolumeDb(s.volumeDb);
               if (s.error) setEngineError(s.error);
               if (s.kind === 'radio') setRadioTitle(s.stream_title);
         if (s.kind !== 'radio' && s.is_playing && hydratedRef.current && Date.now() - lastFlushRef.current >= 5000) {
@@ -969,6 +978,14 @@ export default function Shell() {
     const changeAlbumContext = (on: boolean) => {
       setIsAlbumContext(on);
       playerSetAlbumContext(on).catch((e) => setEngineError(String(e)));
+    };
+    const changeVolumeCurve = (curve: 'log' | 'linear') => {
+      setVolumeCurve(curve);
+      playerSetVolumeCurve(curve).catch((e) => setEngineError(String(e)));
+    };
+    const changeLoudnessCompensation = (enabled: boolean) => {
+      setLoudnessCompensation(enabled);
+      playerSetLoudnessCompensation(enabled).catch((e) => setEngineError(String(e)));
     };
     const closeEq = useCallback(() => setEqOpen(false), []);
   const changeFx = (next: Fx) => {
@@ -1590,6 +1607,7 @@ export default function Shell() {
             </button>
             <input aria-label="音量" aria-valuemin={0} aria-valuemax={100} aria-valuenow={volumePct} aria-valuetext={muted || volume === 0 ? '靜音' : `${volumePct}%`} type="range" min={0} max={1} step={0.01} value={muted ? 0 : volume} className="line w-28" style={{ ['--pct' as string]: `${volumePct}%` }} onChange={(e) => setSliderVolume(Number(e.target.value))} />
             <span className="num text-[11px] w-9 shrink-0 text-right text-[#8a847a]">{muted || volume === 0 ? '靜音' : `${volumePct}%`}</span>
+            <span className="num text-[11px] shrink-0 text-[#8a847a] ml-1">{volumeDb === null ? '靜音' : `${volumeDb.toFixed(1)} dB`}</span>
           </div>
         </div>
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 min-w-0">
@@ -1761,6 +1779,8 @@ export default function Shell() {
                                 rgPreampNone={rgPreampNone} onRgPreampNoneChange={changeRgPreampNone}
                                 isAlbumContext={isAlbumContext} onAlbumContextChange={changeAlbumContext}
                                 appliedRgDb={appliedRgDb} hasRg={hasRg} rgSource={rgSource}
+                                volumeCurve={volumeCurve} onVolumeCurveChange={changeVolumeCurve}
+                                loudnessCompensation={loudnessCompensation} onLoudnessCompensationChange={changeLoudnessCompensation}
                               />
             )}
     </div>

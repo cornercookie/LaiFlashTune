@@ -15,6 +15,7 @@ const COMMANDS: &[&str] = &[
     "player_play_url",
     "player_set_replaygain_mode", "player_set_volume_normalization", "player_set_rg_preamp_has",
     "player_set_rg_preamp_none", "player_set_album_context",
+    "player_set_volume_curve", "player_set_loudness_compensation",
     "player_set_default_player",
     // 音樂庫 / 掃描
     "library_facets_cmd", "songs_by_field_cmd", "list_recent_cmd",

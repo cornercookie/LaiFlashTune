@@ -14,7 +14,7 @@
 | 期 | 資料夾 | 主題 | 狀態 |
 |---|---|---|---|
 | P0 | `P0-daily-blockers/` | 名稱中性化、搜尋、格式、無縫播放 | `[#2]P0-SE7-lofty解析器限制` 已完成（Design v8 審查通過，實作 + cargo test 全過）；`[#3]P0-Imp1Imp3-長檔TrackResampler與DSP鏈` 已完成（Design v10，Spec/Code/Security 三階段審查通過，cargo test 54/54 全過） |
-| P1 | `P1-playback-quality/` | ReplayGain、音量曲線、淡入淡出、CUE、獨佔輸出、20 段等化器 | 待做 |
+| P1 | `P1-playback-quality/` | ReplayGain、音量曲線、淡入淡出、CUE、獨佔輸出、20 段等化器 | `[#5]P1-1-ReplayGain` 已完成（Design v6，Spec/Code/Security 三階段審查通過，cargo test 全過）；`[#6]P1-2-音量曲線與響度補償` 已完成（Design v6，Spec/Code/Security 三階段審查通過，cargo test 全過） |
 | P2 | `P2-library-playlists/` | 歌單分組與顯示、歌單工具、書籤、評分、智慧歌單編輯、快捷鍵 | 待做 |
 | P3 | `P3-tools/` | 標籤編輯補齊、批次轉檔、電台錄音、鬧鐘排程、頻譜視覺化、延伸格式 | 待做 |
 | P4 | （尚未開資料夾） | 連網與架構項目 | 排在 P3 之後 |

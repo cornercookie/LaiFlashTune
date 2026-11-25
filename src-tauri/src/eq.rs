@@ -35,6 +35,18 @@ pub struct EqParams {
     pub rg_peak: Option<f32>,
     /// 等化器以外的音效（速度、殘響…）。跟等化器共用版本號，一起即時生效。
     pub fx: crate::dsp::FxParams,
+    /// 音量曲線：Log / Linear
+    pub volume_curve: crate::models::VolumeCurve,
+    /// 響度補償：是否啟用
+    pub loudness_enabled: bool,
+    /// 響度補償：低頻擱架頻率 (Hz)
+    pub loudness_bass_hz: f32,
+    /// 響度補償：低頻擱架增益
+    pub loudness_bass_db: f32,
+    /// 響度補償：高頻擱架頻率 (Hz)
+    pub loudness_treble_hz: f32,
+    /// 響度補償：高頻擱架增益
+    pub loudness_treble_db: f32,
 }
 
 impl Default for EqParams {
@@ -51,6 +63,12 @@ impl Default for EqParams {
             is_album_playback_context: false,
             rg_peak: None,
             fx: crate::dsp::FxParams::default(),
+            volume_curve: crate::models::VolumeCurve::default(),
+            loudness_enabled: false,
+            loudness_bass_hz: 150.0,
+            loudness_bass_db: 0.0,
+            loudness_treble_hz: 6000.0,
+            loudness_treble_db: 0.0,
         }
     }
 }

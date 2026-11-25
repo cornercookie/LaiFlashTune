@@ -36,6 +36,15 @@ flowchart LR
 - `tauri.conf.json` 列了 dialog、fs、shell、notification，但 `Cargo.toml` 與 `package.json` 都沒有對應的 plugin，不能呼叫。選檔案和資料夾都走 PowerShell 對話框。
 - CSP 是 `null`（沒有限制）。前端只載入打包好的資源，不載入遠端內容。
 
+### P1-2 新增的 command 與權限
+
+| command | capability 權限（`capabilities/default.json`） | `build.rs` COMMANDS | 備註 |
+|---|---|---|---|
+| `player_set_volume_curve` | `allow-player-set-volume-curve` | 已加入 | 切換音量曲線 log/linear，持久化 `volume_curve` |
+| `player_set_loudness_compensation` | `allow-player-set-loudness-compensation` | 已加入 | 開關響度補償，持久化 `loudness_compensation` |
+
+兩個權限皆已加入 `capabilities/default.json` 的 `permissions` 陣列與 `commands` 清單中，並對應 `build.rs` 的 `COMMANDS` 常數宣告，符合 Tauri v2 capability 機制（宣告後必須在 capability 列出）。
+
 ## 不可信的輸入與現有防護
 
 | 來源 | 風險 | 現有防護 | 尚未處理 |
