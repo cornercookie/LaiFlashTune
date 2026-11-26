@@ -47,6 +47,24 @@ pub struct EqParams {
     pub loudness_treble_hz: f32,
     /// 響度補償：高頻擱架增益
     pub loudness_treble_db: f32,
+    /// 淡入時間（播放開始，ms，0 為關）
+    pub fade_play_ms: i64,
+    /// 淡出時間（暫停，ms，0 為關）
+    pub fade_pause_ms: i64,
+    /// 淡入時間（繼續播放，ms，0 為關）
+    pub fade_resume_ms: i64,
+    /// 淡出時間（停止，ms，0 為關）
+    pub fade_stop_ms: i64,
+    /// 淡出時間（拖進度條，ms，0 為關）
+    pub fade_seek_ms: i64,
+    /// 淡出時間（手動切歌，ms，0 為關）
+    pub fade_switch_ms: i64,
+    /// 曲間停頓（ms，0 為關，1–10000）
+    pub gap_ms: i64,
+    /// 交叉淡化（ms，0 為關），與 gap_ms 雙向互斥
+    pub crossfade_ms: i64,
+    /// 去除靜音
+    pub silence_removal: bool,
 }
 
 impl Default for EqParams {
@@ -69,6 +87,15 @@ impl Default for EqParams {
             loudness_bass_db: 0.0,
             loudness_treble_hz: 6000.0,
             loudness_treble_db: 0.0,
+            fade_play_ms: 150,
+            fade_pause_ms: 150,
+            fade_resume_ms: 150,
+            fade_stop_ms: 150,
+            fade_seek_ms: 30,
+            fade_switch_ms: 300,
+            gap_ms: 0,
+            crossfade_ms: 0,
+            silence_removal: false,
         }
     }
 }

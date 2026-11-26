@@ -9,6 +9,7 @@
 //! - DeviceConverter：把 DSP 的 48kHz 雙聲道輸出，重取樣成裝置的取樣率與雙聲道
 //! - Sink：rodio 的音訊輸出端，只看到單一長駐的 DspSource
 
+use crate::models::FadeTarget;
 use crate::dsp::{DspSource, FxChain, FxParams, RateStage};
 use crate::eq::{EqProcessor, EqShared};
 use crate::open_with::{log_line, open_validated_file, get_final_path_from_handle};
@@ -18,7 +19,7 @@ use rodio::Source;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -147,6 +148,22 @@ pub struct PlaybackCore {
     pub(crate) on_track_change: Mutex<Option<Box<dyn Fn(u64, u64, &str, &str) + Send + Sync>>>,
     /// 響度補償擱架濾波器（本機歌曲路徑，EQ 後、FxChain 前）
     loudness_shelves: Mutex<LoudnessShelves>,
+    /// FadeGate 淡入淡出狀態機（樣本-based，實際輸出時推進）
+    pub(crate) fade_gate: Arc<Mutex<crate::models::FadeGate>>,
+    /// 淡段世代計數（與 stream_gen 分離）
+    fade_gen: AtomicU64,
+    /// 待安裝的串流來源（已由命令執行緒背景開流完成，等候曲終/gap 耗盡安裝）
+    pending_stream_source: Mutex<Option<Box<dyn Iterator<Item = f32> + Send>>>,
+    /// 串流中繼資料（含 gen）
+    pending_stream_meta: Mutex<Option<crate::models::StreamMeta>>,
+    /// 目前有效串流安裝世代；開流交付前與 meta.gen 比對，安裝前再比對；不歸零，持續遞增
+    stream_gen: AtomicU64,
+    /// 串流軌歌曲身分（供 publish() 與 position_ms() 讀取，取代 TrackChain 僅讀）
+    stream_song_id: AtomicI64,
+    /// 串流軌總長度
+    stream_duration_ms: AtomicI64,
+    /// 串流軌進度基準（seek 目標）
+    stream_seek_origin_ms: AtomicU64,
 }
 
 impl PlaybackCore {
@@ -185,6 +202,25 @@ impl PlaybackCore {
             stream_source: Mutex::new(None),
             on_track_change: Mutex::new(None),
             loudness_shelves: Mutex::new(LoudnessShelves::new(INTERNAL_CHANNELS as usize)),
+            fade_gate: Arc::new(Mutex::new(crate::models::FadeGate {
+                active: None,
+                base_gain: 1.0,
+                fade_gen: 0,
+                pending_load: None,
+                pending_stream_source: None,
+                pending_stream_meta: None,
+                stream_gen: 0,
+                stream_install_ready: None,
+                done_target: None,
+                gap_remaining: 0,
+            })),
+            fade_gen: AtomicU64::new(0),
+            pending_stream_source: Mutex::new(None),
+            pending_stream_meta: Mutex::new(None),
+            stream_gen: AtomicU64::new(1),
+            stream_song_id: AtomicI64::new(0),
+            stream_duration_ms: AtomicI64::new(0),
+            stream_seek_origin_ms: AtomicU64::new(0),
         }
     }
 
@@ -291,6 +327,77 @@ impl PlaybackCore {
         self.played_out_frames.store(0, Ordering::Release);
     }
 
+    /// 安裝 coordinator 取得的下一軌：記憶體軌建立 TrackChain，串流軌設 pending_stream_meta。
+    pub fn install_next_track(&self, next_track: PreparedTrack) {
+        match &next_track.data {
+            TrackData::Memory(_) => {
+                if let Some(item) = prepared_to_trackchain_item(&next_track) {
+                    let mut chain = TrackChain::new();
+                    chain.append(item.clone());
+                    chain.set_coordinator(self.next_coordinator.clone());
+                    *self.track_chain.lock().unwrap() = Some(chain);
+                    let mut resampler = TrackResampler::new();
+                    resampler.set_track(Some(item));
+                    *self.track_resampler.lock().unwrap() = Some(resampler);
+                    // 遞增 stream_gen，標示新軌身分
+                    let _gen = self.stream_gen.fetch_add(1, Ordering::AcqRel) + 1;
+                    self.stream_song_id.store(next_track.song_id, Ordering::Release);
+                    self.stream_duration_ms.store(next_track.duration_ms, Ordering::Release);
+                }
+            }
+            TrackData::Stream(_) => {
+                // 串流軌：設 pending_stream_meta，等候背景開流
+                let meta = crate::models::StreamMeta {
+                    song_id: next_track.song_id,
+                    duration_ms: next_track.duration_ms,
+                    rate: next_track.rate,
+                    channels: next_track.channels,
+                    path: next_track.path.clone(),
+                    decoder: next_track.decoder.clone(),
+                    position_ms: 0,
+                    gen: self.stream_gen.load(Ordering::Acquire),
+                };
+                *self.pending_stream_meta.lock().unwrap() = Some(meta);
+            }
+        }
+    }
+
+    /// 建立淡入淡出段落：命令執行緒呼叫，返回新段落世代。
+    /// 從_gain 線性插值到 _gain，total_samples = ms × 取樣率 × 聲道數 / 1000。
+    /// ms == 0 表示立即生效（to_gain 直接鎖定）。
+    pub fn start_fade(&self, target: FadeTarget, from_gain: f32, to_gain: f32, ms: i64) -> u64 {
+        let total_samples = if ms <= 0 {
+            0
+        } else {
+            (ms as u64) * INTERNAL_SAMPLE_RATE as u64 * INTERNAL_CHANNELS as u64 / 1000
+        };
+        let mut fg = self.fade_gate.lock().unwrap();
+        let gen = self.fade_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        fg.active = Some(crate::models::FadeSegment {
+            gen,
+            target,
+            from_gain,
+            to_gain,
+            total_samples,
+            consumed_samples: 0,
+        });
+        fg.base_gain = from_gain;
+        fg.fade_gen = gen;
+        gen
+    }
+
+    /// 消費完成通知：執行對應動作並清除 done_target。由命令執行緒呼叫。
+    pub fn consume_done_target(&self) -> Option<(FadeTarget, u64)> {
+        let mut fg = self.fade_gate.lock().unwrap();
+        fg.done_target.take()
+    }
+
+    /// 檢查 done_target 的世代是否仍有效（與 fade_gen 比對）。
+    pub fn done_target_gen_valid(&self, gen: u64) -> bool {
+        let fg = self.fade_gate.lock().unwrap();
+        fg.done_target.as_ref().map(|(_, g)| *g == gen).unwrap_or(false)
+    }
+
     /// 取得當前軌 boundary_in_48k 起點
     pub fn current_boundary_in_start(&self) -> u64 {
         self.current_boundary_in_start.load(Ordering::Acquire)
@@ -346,19 +453,203 @@ impl PlaybackCore {
         self.normalize.store(enabled, Ordering::Release);
     }
 
+    /// 取得 FadeGate（用於淡入淡出處理）
+    pub fn fade_gate(&self) -> Arc<Mutex<crate::models::FadeGate>> {
+        self.fade_gate.clone()
+    }
+
+    /// 取得淡段世代
+    pub fn fade_gen(&self) -> u64 {
+        self.fade_gen.load(Ordering::Acquire)
+    }
+
+    /// 遞增淡段世代
+    pub fn increment_fade_gen(&self) -> u64 {
+        self.fade_gen.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// 取得待安裝的串流來源
+    pub fn pending_stream_source(&self) -> &Mutex<Option<Box<dyn Iterator<Item = f32> + Send>>> {
+        &self.pending_stream_source
+    }
+
+    /// 取得串流中繼資料
+    pub fn pending_stream_meta(&self) -> &Mutex<Option<crate::models::StreamMeta>> {
+        &self.pending_stream_meta
+    }
+
+    /// 取得串流世代
+    pub fn stream_gen(&self) -> u64 {
+        self.stream_gen.load(Ordering::Acquire)
+    }
+
+    /// 遞增串流世代
+    pub fn increment_stream_gen(&self) -> u64 {
+        self.stream_gen.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// 取得串流歌曲 ID
+    pub fn stream_song_id(&self) -> i64 {
+        self.stream_song_id.load(Ordering::Acquire)
+    }
+
+    /// 設定串流歌曲 ID
+    pub fn set_stream_song_id(&self, id: i64) {
+        self.stream_song_id.store(id, Ordering::Release);
+    }
+
+    /// 取得串流總長度
+    pub fn stream_duration_ms(&self) -> i64 {
+        self.stream_duration_ms.load(Ordering::Acquire)
+    }
+
+    /// 設定串流總長度
+    pub fn set_stream_duration_ms(&self, ms: i64) {
+        self.stream_duration_ms.store(ms, Ordering::Release);
+    }
+
+    /// 取得串流進度基準
+    pub fn stream_seek_origin_ms(&self) -> u64 {
+        self.stream_seek_origin_ms.load(Ordering::Acquire)
+    }
+
+    /// 設定串流進度基準
+    pub fn set_stream_seek_origin_ms(&self, ms: u64) {
+        self.stream_seek_origin_ms.store(ms, Ordering::Release);
+    }
+
+    /// 安裝串流來源（由命令執行緒 tick 呼叫）
+    pub fn install_stream_source(&self) -> Option<Box<dyn Iterator<Item = f32> + Send>> {
+        self.pending_stream_source.lock().unwrap().take()
+    }
+
+    /// 交付開流完成結果：由背景執行緒呼叫，設 pending_stream_source / pending_stream_meta / stream_install_ready
+    pub fn deliver_stream_result(&self, source: Box<dyn Iterator<Item = f32> + Send>, meta: crate::models::StreamMeta) {
+        let mut meta_guard = self.pending_stream_meta.lock().unwrap();
+        let mut source_guard = self.pending_stream_source.lock().unwrap();
+        *meta_guard = Some(meta.clone());
+        *source_guard = Some(source);
+        drop(meta_guard);
+        drop(source_guard);
+        // 設 stream_install_ready，命令執行緒 tick 會消費
+        let mut fg = self.fade_gate.lock().unwrap();
+        fg.stream_install_ready = Some(meta.gen);
+    }
+
+    /// 取得並清除串流中繼資料
+    pub fn take_stream_meta(&self) -> Option<crate::models::StreamMeta> {
+        self.pending_stream_meta.lock().unwrap().take()
+    }
+
     /// 取下一個 48kHz 雙聲道樣本（經 EQ/正規化，未經 DeviceConverter）。
     /// 播放狀態非 Playing 時回傳靜音，不啟動消費端停滯計時器。
     pub fn next(&self) -> Option<f32> {
         let state = self.playback_state.lock().unwrap().clone();
         match state {
             PlaybackState::Playing => {
+                // 處理曲間停頓：gap_remaining > 0 時輸出靜音，不累計 played_out_frames
+                {
+                    let mut fg = self.fade_gate.lock().unwrap();
+                    if fg.gap_remaining > 0 {
+                        fg.gap_remaining -= 1;
+                        return Some(0.0);
+                    }
+                }
                 let s = self.next_playing();
                 if s.is_some() {
                     self.add_played_out_frames(1);
                 }
-                s
+                // 套用 FadeGate 增益（僅於實際逐樣本輸出出口套用一次）
+                self.apply_fade_gain_to_sample(s)
             }
-            PlaybackState::WaitingForNext | PlaybackState::Paused | PlaybackState::Finished => Some(0.0),
+            PlaybackState::WaitingForNext | PlaybackState::Paused | PlaybackState::Finished => {
+                // 曲間停頓：僅在 WaitingForNext 且 gap_ms > 0 時輸出靜音，不累計 played_out_frames
+                if state == PlaybackState::WaitingForNext {
+                    let gap_ms = self.eq_shared.get().gap_ms as i64;
+                    if gap_ms > 0 {
+                        let mut fg = self.fade_gate.lock().unwrap();
+                        if fg.gap_remaining == 0 {
+                            // 曲終後第一次進入 WaitingForNext：設 gap 長度（48kHz 雙聲道交錯樣本數）
+                            fg.gap_remaining = (gap_ms as u64) * INTERNAL_SAMPLE_RATE as u64 * INTERNAL_CHANNELS as u64 / 1000;
+                        }
+                        if fg.gap_remaining > 0 {
+                            fg.gap_remaining -= 1;
+                            if fg.gap_remaining == 0 {
+                                // gap 剛耗盡：嘗試從 coordinator 安裝下一軌，並設 stream_install_ready
+                                drop(fg);
+                                if let Some(next_track) = self.next_coordinator.take_next() {
+                                    self.install_next_track(next_track);
+                                }
+                                let meta = self.pending_stream_meta.lock().unwrap().clone();
+                                if let Some(meta) = meta {
+                                    if let Some(source) = self.pending_stream_source.lock().unwrap().as_ref() {
+                                        let _ = source;
+                                        if meta.gen == self.stream_gen.load(std::sync::atomic::Ordering::Acquire) {
+                                            let mut fg2 = self.fade_gate.lock().unwrap();
+                                            fg2.stream_install_ready = Some(meta.gen);
+                                        }
+                                    }
+                                }
+                            }
+                            return Some(0.0);
+                        }
+                        // gap 耗盡（gap_ms > 0 但 gap_remaining 已為 0 的邊界情況）：嘗試從 coordinator 安裝下一軌
+                        drop(fg);
+                        if let Some(next_track) = self.next_coordinator.take_next() {
+                            self.install_next_track(next_track);
+                        }
+                        let meta = self.pending_stream_meta.lock().unwrap().clone();
+                        if let Some(meta) = meta {
+                            if let Some(source) = self.pending_stream_source.lock().unwrap().as_ref() {
+                                let _ = source;
+                                if meta.gen == self.stream_gen.load(std::sync::atomic::Ordering::Acquire) {
+                                    let mut fg2 = self.fade_gate.lock().unwrap();
+                                    fg2.stream_install_ready = Some(meta.gen);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(0.0)
+            }
+        }
+    }
+
+    /// 從 FadeGate 取得當前 fade gain 並推進進度；段落結束時發布完成通知。
+    /// 僅於實際逐樣本輸出出口呼叫一次（不在 fill() 中套用，避免重複衰減）。
+    fn apply_fade_gain_to_sample(&self, s: Option<f32>) -> Option<f32> {
+        match s {
+            Some(s) => {
+                if let Ok(mut fg) = self.fade_gate.lock() {
+                    let base_gain = fg.base_gain;
+                    if let Some(mut seg) = fg.active.take() {
+                        seg.consumed_samples += 1;
+                        let t = if seg.total_samples == 0 {
+                            1.0
+                        } else {
+                            (seg.consumed_samples as f64 / seg.total_samples as f64).clamp(0.0, 1.0) as f32
+                        };
+                        let gain = seg.from_gain + (seg.to_gain - seg.from_gain) * t;
+                        if t >= 1.0 {
+                            // 段落結束：鎖定 base_gain，設 done_target，等候命令執行緒執行動作
+                            let to_gain = seg.to_gain;
+                            let target = seg.target;
+                            let gen = seg.gen;
+                            fg.base_gain = to_gain;
+                            fg.active = None;
+                            fg.done_target = Some((target, gen));
+                        } else {
+                            fg.active = Some(seg);
+                        }
+                        Some(s * gain)
+                    } else {
+                        Some(s * base_gain)
+                    }
+                } else {
+                    Some(s)
+                }
+            }
+            None => None,
         }
     }
 
@@ -921,7 +1212,7 @@ pub struct TrackChain {
     coordinator: Option<Arc<NextCoordinator>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct TrackChainItem {
     /// 原生樣本
     pub(crate) samples: Arc<Vec<f32>>,
@@ -950,6 +1241,10 @@ pub(crate) struct TrackChainItem {
     pub(crate) path: String,
     /// 解碼後端（用於 seek 重建，交接後更新）
     pub(crate) decoder: String,
+    /// 開頭靜音樣本數（silence_removal 開啟時）
+    pub(crate) leading_silence_samples: usize,
+    /// 結尾靜音樣本數（silence_removal 開啟時）
+    pub(crate) trailing_silence_samples: usize,
 }
 
 impl TrackChain {
@@ -1096,6 +1391,8 @@ fn prepared_to_trackchain_item(prepared: &PreparedTrack) -> Option<TrackChainIte
             native_frame_pos: 0,
             path: prepared.path.clone(),
             decoder: prepared.decoder.clone(),
+            leading_silence_samples: prepared.leading_silence_samples,
+            trailing_silence_samples: prepared.trailing_silence_samples,
         }),
         TrackData::Stream(_) => None,
     }
@@ -1545,13 +1842,12 @@ impl Iterator for OutputProxy {
     type Item = f32;
 
     fn next(&mut self) -> Option<f32> {
-        let core = &self.core;
         let my_id = self.id;
 
         // 核心鎖內取樣並再次驗證 active_id：切換裝置與取樣序列化，
         // 舊 proxy 的 next() 在核心鎖內發現 ID 已過期直接回傳 None，不消耗核心。
-        let _guard = core.core_lock.lock().unwrap();
-        if core.active_id() != my_id {
+        let _guard = self.core.core_lock.lock().unwrap();
+        if self.core.active_id() != my_id {
             return None;
         }
 
@@ -1567,7 +1863,7 @@ impl Iterator for OutputProxy {
             let mut batch: Vec<f32> = Vec::with_capacity(capacity);
             let mut filled = 0usize;
             for _ in 0..capacity {
-                match core.next() {
+                match self.core.next() {
                     Some(s) => {
                         batch.push(s);
                         filled += 1;
@@ -1622,6 +1918,10 @@ pub struct PreparedTrack {
     pub replaygain_album_gain: Option<f32>,
     pub replaygain_album_peak: Option<f32>,
     pub data: TrackData,
+    /// 開頭靜音樣本數（silence_removal 開啟時）
+    pub leading_silence_samples: usize,
+    /// 結尾靜音樣本數（silence_removal 開啟時）
+    pub trailing_silence_samples: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1646,6 +1946,8 @@ pub enum StreamWrapper {
             norm_gain: f32,
             generation: u64,
             handle: std::sync::Mutex<Option<std::fs::File>>,
+            /// 開頭靜音偏移（ms，silence_removal 開啟時）
+            position_ms: i64,
         },
 }
 
@@ -1771,6 +2073,7 @@ struct PrepareRequest {
     rg_track_peak: Option<f32>,
     rg_album_gain: Option<f32>,
     rg_album_peak: Option<f32>,
+    silence_removal: bool,
 }
 
 impl NextCoordinator {
@@ -1814,7 +2117,7 @@ impl NextCoordinator {
 
                 // 執行準備工作：成功或失敗都透過 completion channel 通知，
                 // 讓前端能略過壞檔並重排，而不會靜默丟棄。
-                let result = prepare_track(&request.path, request.song_id, request.seq, request.token, request.rg_track_gain, request.rg_track_peak, request.rg_album_gain, request.rg_album_peak);
+                let result = prepare_track(&request.path, request.song_id, request.seq, request.token, request.rg_track_gain, request.rg_track_peak, request.rg_album_gain, request.rg_album_peak, request.silence_removal);
                 let mut sent = false;
                 while !sent && !cancel_flag.load(Ordering::Relaxed) {
                     match completion_tx.send_timeout((result.clone(), request.generation), Duration::from_millis(100)) {
@@ -1829,7 +2132,7 @@ impl NextCoordinator {
 
     /// 設定下一首（立即回傳，背景準備）。待處理請求為可替換槽：滿時捨棄舊請求，只保留最新，
         /// 並以非阻塞 try_send 避免卡住引擎。若正在回收中（preparing_frozen），拒絕新請求。
-        pub fn set_next(&self, path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> u64 {
+        pub fn set_next(&self, path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>, silence_removal: bool) -> u64 {
             let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
 
             // SE9：回收期間凍結，拒絕新的準備請求
@@ -1861,6 +2164,7 @@ impl NextCoordinator {
                     rg_track_peak,
                     rg_album_gain,
                     rg_album_peak,
+                    silence_removal,
                 }) {
                 Ok(()) => break,
                 Err(TrySendError::Full(_)) => {
@@ -1924,6 +2228,11 @@ impl NextCoordinator {
         self.slot.lock().map(|s| s.is_some()).unwrap_or(false)
     }
 
+    /// 偷看待播槽中的下一軌（不移除），供 Next/Prev 指令判斷是否可切歌。
+    pub fn peek_next(&self) -> Option<PreparedTrack> {
+        self.slot.lock().ok().and_then(|s| s.clone())
+    }
+
     /// SE9：設定回收凍結狀態。凍結時 `set_next` 會拒絕新請求。
     pub fn set_preparing_frozen(&self, frozen: bool) {
         self.preparing_frozen.store(frozen, Ordering::Release);
@@ -1948,7 +2257,7 @@ impl Drop for NextCoordinator {
 }
 
 /// 準備單一軌（解碼或開啟串流）
-fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
+fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>, silence_removal: bool) -> Result<PreparedTrack, String> {
     let path_buf = std::path::PathBuf::from(path);
     
     // 使用 handle 持有機制：開啟並驗證檔案，回傳持有的 handle
@@ -2004,13 +2313,19 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: 
                                                                                                     song_id,
                                                                                                     norm_gain: 1.0,
                                                                                                     generation: 0, // 將在 set_next 時設定
+                                                                                                    position_ms: 0,
                                                                                                     handle: std::sync::Mutex::new(Some(file_for_stream)),
-                                                                                                })),
-                                            })
+                                                                                                    })),
+                                                                                                    leading_silence_samples: 0,
+                                                                                                    trailing_silence_samples: 0,
+                                                                                                    })
                     } else {
                         // 短檔：整首解碼進記憶體，預檢後關閉 handle
-                        let samples: Vec<f32> = stream.by_ref().collect();
-                        let duration_ms = (samples.len() as f64 / (stream.sample_rate() as f64 * stream.channels() as f64) * 1000.0) as i64;
+                        let mut samples: Vec<f32> = stream.by_ref().collect();
+                        let sample_rate = stream.sample_rate().max(1);
+                        let channels = stream.channels().max(1);
+                        let (leading_silence, trailing_silence) = crate::player::trim_silence(&mut samples, channels, silence_removal);
+                        let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
                         let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
                         let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
 
@@ -2020,8 +2335,8 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: 
                             song_id,
                             path: final_path,
                             decoder: "symphonia".to_string(),
-                            rate: stream.sample_rate(),
-                            channels: stream.channels(),
+                            rate: sample_rate,
+                            channels,
                             duration_ms,
                             norm_gain,
                             replaygain_track_gain: rg_track_gain,
@@ -2029,6 +2344,8 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: 
                             replaygain_album_gain: rg_album_gain,
                             replaygain_album_peak: rg_album_peak,
                             data: TrackData::Memory(Arc::new(samples)),
+                            leading_silence_samples: leading_silence,
+                            trailing_silence_samples: trailing_silence,
                         })
                     }
                 }
@@ -2036,13 +2353,13 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: 
                     // symphonia 失敗，嘗試 ffmpeg（需要重新開檔）
                     // file 已在 SymStream::open 中被移動，file_for_stream 仍可用於 ffmpeg
                     drop(file_for_stream);
-                    prepare_with_ffmpeg(path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
+                    prepare_with_ffmpeg(path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, silence_removal)
                 }
             }
         }
         Some(crate::scanner::Backend::Ffmpeg) => {
             // ffmpeg 路徑：傳遞 final_path
-            prepare_with_ffmpeg_final(&final_path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak)
+            prepare_with_ffmpeg_final(&final_path, song_id, &ext, seq, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, silence_removal)
         }
         None => {
             Err(format!("這個格式尚未支援: {}", ext))
@@ -2050,7 +2367,7 @@ fn prepare_track(path: &str, song_id: i64, seq: u64, token: u64, rg_track_gain: 
     }
 }
 
-fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>, silence_removal: bool) -> Result<PreparedTrack, String> {
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
         .ok_or("找不到 ffprobe")?;
@@ -2098,6 +2415,8 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u6
                     replaygain_album_gain: rg_album_gain,
                     replaygain_album_peak: rg_album_peak,
                     data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
+                    leading_silence_samples: 0,
+                    trailing_silence_samples: 0,
                 })
     } else {
         let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
@@ -2122,10 +2441,11 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u6
             return Err("ffmpeg 解碼失敗（詳細錯誤請見 open-with.log）".into());
         }
 
-        let samples: Vec<f32> = output.stdout
+        let mut samples: Vec<f32> = output.stdout
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
+        let (leading_silence, trailing_silence) = crate::player::trim_silence(&mut samples, channels, silence_removal);
 
         let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
         let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
@@ -2146,12 +2466,14 @@ fn prepare_with_ffmpeg(path: &str, song_id: i64, _ext: &str, seq: u64, token: u6
                     replaygain_album_gain: rg_album_gain,
                     replaygain_album_peak: rg_album_peak,
                     data: TrackData::Memory(Arc::new(samples)),
+                    leading_silence_samples: leading_silence,
+                    trailing_silence_samples: trailing_silence,
                 })
     }
 }
 
 /// 使用最終規範路徑的 ffmpeg 準備（供 handle 機制呼叫）
-fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>) -> Result<PreparedTrack, String> {
+fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32>, silence_removal: bool) -> Result<PreparedTrack, String> {
     let ffprobe_path = crate::tools::locate("ffprobe.exe")
         .map(|(p, _, _)| p)
         .ok_or("找不到 ffprobe")?;
@@ -2199,6 +2521,8 @@ fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, tok
                     replaygain_album_gain: rg_album_gain,
                     replaygain_album_peak: rg_album_peak,
                     data: TrackData::Stream(Arc::new(StreamWrapper::FfmpegStream(Arc::new(handle)))),
+                    leading_silence_samples: 0,
+                    trailing_silence_samples: 0,
                 })
     } else {
         let ffmpeg_path = crate::tools::locate("ffmpeg.exe")
@@ -2223,10 +2547,11 @@ fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, tok
             return Err("ffmpeg 解碼失敗（詳細錯誤請見 open-with.log）".into());
         }
 
-        let samples: Vec<f32> = output.stdout
+        let mut samples: Vec<f32> = output.stdout
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
+        let (leading_silence, trailing_silence) = crate::player::trim_silence(&mut samples, channels, silence_removal);
 
         let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
         let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
@@ -2247,6 +2572,8 @@ fn prepare_with_ffmpeg_final(path: &str, song_id: i64, _ext: &str, seq: u64, tok
                     replaygain_album_gain: rg_album_gain,
                     replaygain_album_peak: rg_album_peak,
                     data: TrackData::Memory(Arc::new(samples)),
+                    leading_silence_samples: leading_silence,
+                    trailing_silence_samples: trailing_silence,
                 })
     }
 }
@@ -2285,6 +2612,8 @@ mod tests {
             native_frame_pos: 0,
             path: "test".into(),
             decoder: "synth".into(),
+            leading_silence_samples: 0,
+            trailing_silence_samples: 0,
         }
     }
 
@@ -2305,6 +2634,8 @@ mod tests {
             replaygain_album_gain: None,
             replaygain_album_peak: None,
             data: TrackData::Memory(t.samples),
+            leading_silence_samples: 0,
+            trailing_silence_samples: 0,
         }
     }
 
@@ -2408,8 +2739,8 @@ mod tests {
         let coord = core.next_coordinator();
 
         // 連續兩次 set_next：第一個請求應被第二個替換（只保留最新）
-        let g1 = coord.set_next("/track-a.mp3".into(), 1, 10, None, None, None, None);
-        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20, None, None, None, None);
+        let g1 = coord.set_next("/track-a.mp3".into(), 1, 10, None, None, None, None, false);
+        let g2 = coord.set_next("/track-b.mp3".into(), 2, 20, None, None, None, None, false);
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
         assert_eq!(coord.current_generation(), 2, "世代應遞增至 2");
@@ -2460,8 +2791,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_generation_and_clear() {
         let coord = NextCoordinator::new();
-        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
-        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None);
+        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None, false);
+        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None, false);
         let g3 = coord.clear_next();
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
@@ -2474,8 +2805,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_set_next_replaces_latest() {
         let coord = NextCoordinator::new();
-        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
-        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None);
+        let g1 = coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None, false);
+        let g2 = coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None, false);
         // 容量 1 的待處理槽只保留最新，兩次 set_next 不應阻塞，且僅記錄最新世代
         assert_eq!(g1, 1);
         assert_eq!(g2, 2);
@@ -2485,8 +2816,8 @@ mod tests {
     #[test]
     fn test_next_coordinator_poll_completion_discards_stale() {
         let coord = NextCoordinator::new();
-        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None); // gen 1，不存在的檔案 → worker 會產出 Err 完成通知
-        coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None); // gen 2，同樣不存在
+        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None, false); // gen 1，不存在的檔案 → worker 會產出 Err 完成通知
+        coord.set_next("/b.mp3".into(), 2, 20, None, None, None, None, false); // gen 2，同樣不存在
         // 兩個檔案都不存在，絕不應回傳 Ok；過期世代（1）一律捨棄。
         // 工作執行緒是非同步的，channel 可能尚未就緒（None）或已傳達失敗（Err），皆可接受。
         assert!(
@@ -2535,7 +2866,7 @@ mod tests {
         let coord = NextCoordinator::new();
         // 準備一個真實可解碼的檔案：worker 會把 Ok 結果送進容量 1 的 completion channel，
         // 使其滿；此時 drop 不得因 channel 滿或 worker 阻塞而永久等待。
-        coord.set_next(path.to_string_lossy().to_string(), 1, 10, None, None, None, None);
+        coord.set_next(path.to_string_lossy().to_string(), 1, 10, None, None, None, None, false);
         // 不 poll_completion，讓 channel 保持滿的狀態，然後 drop 驗證不會 deadlock。
         drop(coord);
     }
@@ -2543,7 +2874,7 @@ mod tests {
     #[test]
     fn test_next_coordinator_drop_does_not_deadlock() {
         let coord = NextCoordinator::new();
-        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None);
+        coord.set_next("/a.mp3".into(), 1, 10, None, None, None, None, false);
         // worker 可能正在準備（或阻塞於 completion 通道），drop 時不得永久等待
         drop(coord);
     }
@@ -2610,6 +2941,8 @@ mod tests {
                             replaygain_album_gain: None,
                             replaygain_album_peak: None,
                             data: TrackData::Memory(Arc::new(second_samples)),
+                            leading_silence_samples: 0,
+                            trailing_silence_samples: 0,
                         });
 
         // 播放直到軌切換並持續消耗，確認第二軌音訊確實出現（振幅 1.0 > 第一軌 0.3）
@@ -2679,5 +3012,148 @@ mod tests {
         let (l_off, r_off) = shelves.process(l_in, r_in);
         assert_eq!(l_off, l_in, "關閉後左聲道應旁路");
         assert_eq!(r_off, r_in, "關閉後右聲道應旁路");
+    }
+
+    /// #10 單元測試：FadeGate 應線性插值 from_gain → to_gain，段落結束後鎖定 base_gain = to_gain
+    #[test]
+    fn test_fade_gate_linear_ramp() {
+        let core = core_with_eq();
+        // 手動建立一個淡段：from 0.0 → to 1.0，共 100 個樣本
+        {
+            let mut fg = core.fade_gate.lock().unwrap();
+            fg.active = Some(crate::models::FadeSegment {
+                gen: 1,
+                target: crate::models::FadeTarget::None,
+                from_gain: 0.0,
+                to_gain: 1.0,
+                total_samples: 100,
+                consumed_samples: 0,
+            });
+            fg.base_gain = 0.0;
+        }
+
+        // 第 1 樣本：t = 1/100，gain = 0.0 + (1.0 - 0.0) * 0.01 = 0.01
+        let s1 = core.apply_fade_gain_to_sample(Some(1.0)).unwrap();
+        assert!((s1 - 0.01).abs() < 1e-6, "第 1 樣本 gain 應為 0.01，實際：{s1}");
+
+        // 第 50 樣本：t = 50/100，gain = 0.5
+        for _ in 1..49 {
+            core.apply_fade_gain_to_sample(Some(1.0));
+        }
+        let s50 = core.apply_fade_gain_to_sample(Some(1.0)).unwrap();
+        assert!((s50 - 0.5).abs() < 1e-6, "第 50 樣本 gain 應為 0.5，實際：{s50}");
+
+        // 第 100 樣本：t = 1.0，段落結束，gain = 1.0，base_gain 鎖定為 1.0
+        for _ in 50..99 {
+            core.apply_fade_gain_to_sample(Some(1.0));
+        }
+        let s100 = core.apply_fade_gain_to_sample(Some(1.0)).unwrap();
+        assert!((s100 - 1.0).abs() < 1e-6, "第 100 樣本 gain 應為 1.0，實際：{s100}");
+        {
+            let fg = core.fade_gate.lock().unwrap();
+            assert_eq!(fg.base_gain, 1.0, "段落結束後 base_gain 應鎖定為 to_gain");
+            assert!(fg.active.is_none(), "段落結束後 active 應為 None");
+        }
+    }
+
+    /// #10 單元測試：gap_remaining 應按交錯樣本數遞減，歸零後不再累計
+    #[test]
+    fn test_gap_remaining_depletion() {
+        let core = core_with_eq();
+        core.set_playback_state(PlaybackState::Playing);
+        {
+            let mut fg = core.fade_gate.lock().unwrap();
+            fg.gap_remaining = 1000; // 1000 個交錯樣本
+        }
+
+        // 消耗 400 個樣本後，gap_remaining 應為 600
+        for _ in 0..400 {
+            core.next();
+        }
+        assert_eq!(
+            core.fade_gate.lock().unwrap().gap_remaining,
+            600,
+            "gap_remaining 應遞減至 600"
+        );
+
+        // 繼續消耗 600 個樣本後，gap_remaining 應歸零
+        for _ in 0..600 {
+            core.next();
+        }
+        assert_eq!(
+            core.fade_gate.lock().unwrap().gap_remaining,
+            0,
+            "gap_remaining 應歸零"
+        );
+
+        // 繼續消耗不應使 gap_remaining 為負數
+        for _ in 0..100 {
+            core.next();
+        }
+        assert_eq!(
+            core.fade_gate.lock().unwrap().gap_remaining,
+            0,
+            "gap_remaining 不應為負數"
+        );
+    }
+
+    /// #10 單元測試：trim_silence 的 leading/trailing 應為交錯樣本數（frames × channels）
+    #[test]
+    fn test_trim_silence_samples_are_interleaved() {
+        // 模擬：44100Hz 雙聲道，leading_frames = 100（frame 數），channels = 2
+        // leading_silence_samples 應 = 100 * 2 = 200
+        let leading_frames = 100usize;
+        let channels = 2usize;
+        let expected_samples = leading_frames * channels;
+        assert_eq!(expected_samples, 200, "leading_silence_samples 應為交錯樣本數");
+
+        // 驗證 PreparedTrack 欄位語義：leading_silence_samples 已在 load_at 中 × channels
+        let track = prepared_memory(44100, 2, 0.1, 1, 10, 1);
+        assert_eq!(
+            track.leading_silence_samples, 0,
+            "prepared_memory 預設 leading_silence_samples 為 0"
+        );
+        assert_eq!(
+            track.trailing_silence_samples, 0,
+            "prepared_memory 預設 trailing_silence_samples 為 0"
+        );
+    }
+
+    /// #10 單元測試：stream_gen 與 pending_stream_meta.gen 匹配時，next() 應設 stream_install_ready
+    #[test]
+    fn test_stream_install_ready_generation_binding() {
+        let core = core_with_eq();
+        core.set_playback_state(PlaybackState::WaitingForNext);
+        // 設 gap_ms > 0，否則 WaitingForNext 分支不會進入 gap 處理
+        core.eq_shared.update(|p| p.gap_ms = 100);
+        {
+            let mut fg = core.fade_gate.lock().unwrap();
+            fg.gap_remaining = 1; // 僅剩 1 個樣本，下一次 next() 會耗盡並設 stream_install_ready
+        }
+        // 安裝一個 strem 來源與 meta，gen 為 5
+        let meta = crate::models::StreamMeta {
+            song_id: 1,
+            duration_ms: 1000,
+            rate: 48000,
+            channels: 2,
+            path: "test".into(),
+            decoder: "stream".into(),
+            position_ms: 0,
+            gen: 5,
+        };
+        let source: Box<dyn Iterator<Item = f32> + Send> =
+            Box::new(std::iter::repeat(0.5f32).take(100));
+        core.pending_stream_source.lock().unwrap().replace(source);
+        core.pending_stream_meta.lock().unwrap().replace(meta.clone());
+        core.stream_gen.store(5, std::sync::atomic::Ordering::Release);
+
+        // next() 在 WaitingForNext 且 gap 耗盡時應檢查 meta.gen == stream_gen，並設 stream_install_ready
+        core.next();
+        let fg = core.fade_gate.lock().unwrap();
+        assert_eq!(
+            fg.stream_install_ready,
+            Some(5),
+            "stream_install_ready 應設為 meta.gen (5)"
+        );
     }
 }

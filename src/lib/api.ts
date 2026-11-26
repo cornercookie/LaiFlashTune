@@ -114,6 +114,12 @@ export const playerSetVolumeCurve = (curve: VolumeCurve) =>
   invokeCmd('player_set_volume_curve', { curve });
 export const playerSetLoudnessCompensation = (enabled: boolean) =>
   invokeCmd('player_set_loudness_compensation', { enabled });
+export const playerSetFadeSettings = (playMs: number, pauseMs: number, resumeMs: number, stopMs: number, seekMs: number, switchMs: number) =>
+  invokeCmd('player_set_fade_settings', { playMs, pauseMs, resumeMs, stopMs, seekMs, switchMs });
+export const playerSetGapMs = (ms: number) =>
+  invokeCmd('player_set_gap_ms', { ms });
+export const playerSetSilenceRemoval = (enabled: boolean) =>
+  invokeCmd('player_set_silence_removal', { enabled });
 export const playerOutputDevices = () => invokeCmd<string[]>('player_output_devices');
 export const playerSetOutput = (name: string) => invokeCmd('player_set_output', { name });
 export const libraryFacets = (field: string) => invokeCmd<import('../types').LibraryFacet[]>('library_facets_cmd', { field });

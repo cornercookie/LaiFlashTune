@@ -623,8 +623,19 @@ pub fn player_set_album_context(state: State<'_, PlayerState>, is_album_context:
 
 /// 交叉淡化毫秒數。0 為關閉。只作用於本地檔案。
 #[tauri::command]
-pub fn player_set_crossfade(state: State<'_, PlayerState>, ms: i64) -> Result<(), String> {
-    send_cmd(state, PlayerCommand::SetCrossfade { ms })
+pub fn player_set_crossfade(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    ms: i64,
+) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetCrossfade { ms })?;
+    // 持久化（互斥：ms > 0 時 gap_ms = 0）
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "crossfade_ms", &ms.to_string()).map_err(|e| e.to_string())?;
+    if ms > 0 {
+        save_config_kv(&conn, "gap_ms", "0").map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// 播放使用者貼上的 HTTP 音訊串流。不是電台目錄。
@@ -673,6 +684,69 @@ pub fn player_set_loudness_compensation(
     // 持久化
     let conn = db_lock(&db_state);
     save_config_kv(&conn, "loudness_compensation", &enabled.to_string()).map_err(|e| e.to_string())
+}
+
+/// 設定六項淡入淡出時間（ms，0 為關）。參數：playMs, pauseMs, resumeMs, stopMs, seekMs, switchMs（各 0–5000）。
+#[tauri::command]
+pub fn player_set_fade_settings(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    playMs: i64,
+    pauseMs: i64,
+    resumeMs: i64,
+    stopMs: i64,
+    seekMs: i64,
+    switchMs: i64,
+) -> Result<(), String> {
+    // 參數邊界驗證
+    for (name, val) in [("playMs", playMs), ("pauseMs", pauseMs), ("resumeMs", resumeMs), ("stopMs", stopMs), ("seekMs", seekMs), ("switchMs", switchMs)] {
+        if !(0..=5000).contains(&val) {
+            return Err(format!("{} 超出範圍 0–5000: {}", name, val));
+        }
+    }
+    send_cmd(state, PlayerCommand::SetFadeSettings { play_ms: playMs, pause_ms: pauseMs, resume_ms: resumeMs, stop_ms: stopMs, seek_ms: seekMs, switch_ms: switchMs })?;
+    // 持久化六個 key
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "fade_play_ms", &playMs.to_string()).map_err(|e| e.to_string())?;
+    save_config_kv(&conn, "fade_pause_ms", &pauseMs.to_string()).map_err(|e| e.to_string())?;
+    save_config_kv(&conn, "fade_resume_ms", &resumeMs.to_string()).map_err(|e| e.to_string())?;
+    save_config_kv(&conn, "fade_stop_ms", &stopMs.to_string()).map_err(|e| e.to_string())?;
+    save_config_kv(&conn, "fade_seek_ms", &seekMs.to_string()).map_err(|e| e.to_string())?;
+    save_config_kv(&conn, "fade_switch_ms", &switchMs.to_string()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 設定曲間停頓（ms，0 為關，1–10000）。ms > 0 時自動將 crossfade_ms 歸 0。
+#[tauri::command]
+pub fn player_set_gap_ms(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    ms: i64,
+) -> Result<(), String> {
+    if !(0..=10000).contains(&ms) {
+        return Err(format!("gap_ms 超出範圍 0–10000: {}", ms));
+    }
+    send_cmd(state, PlayerCommand::SetGapMs { ms })?;
+    // 持久化（互斥邏輯在命令 handler 內處理）
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "gap_ms", &ms.to_string()).map_err(|e| e.to_string())?;
+    if ms > 0 {
+        save_config_kv(&conn, "crossfade_ms", "0").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 設定去除靜音開關。
+#[tauri::command]
+pub fn player_set_silence_removal(
+    state: State<'_, PlayerState>,
+    db_state: State<'_, DbState>,
+    enabled: bool,
+) -> Result<(), String> {
+    send_cmd(state, PlayerCommand::SetSilenceRemoval { enabled })?;
+    // 持久化
+    let conn = db_lock(&db_state);
+    save_config_kv(&conn, "silence_removal", &enabled.to_string()).map_err(|e| e.to_string())
 }
 
 /// 曲庫分面：artist / album / genre / folder。

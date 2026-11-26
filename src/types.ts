@@ -103,6 +103,15 @@ export interface AppConfig {
   rg_preamp_none: number;
   volume_curve: VolumeCurve;
   loudness_compensation: boolean;
+  fade_play_ms: number;
+  fade_pause_ms: number;
+  fade_resume_ms: number;
+  fade_stop_ms: number;
+  fade_seek_ms: number;
+  fade_switch_ms: number;
+  gap_ms: number;
+  crossfade_ms: number;
+  silence_removal: boolean;
 }
 
 export interface ScanProgress {
@@ -151,6 +160,14 @@ export interface EngineSnapshot {
   volumeDb: number | null;
   volumeCurve: VolumeCurve;
   loudnessCompensation: boolean;
+  fadePlayMs: number;
+  fadePauseMs: number;
+  fadeResumeMs: number;
+  fadeStopMs: number;
+  fadeSeekMs: number;
+  fadeSwitchMs: number;
+  gapMs: number;
+  silenceRemoval: boolean;
 }
 
 export interface LibraryFacet {

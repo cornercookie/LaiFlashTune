@@ -14,6 +14,7 @@ import {
   addSmartRule, listSmartRules, smartPlaylistSongs,
   playerSetReplayGainMode, playerSetVolumeNormalization, playerSetRgPreampHas, playerSetRgPreampNone, playerSetAlbumContext,
   playerSetVolumeCurve, playerSetLoudnessCompensation,
+  playerSetFadeSettings, playerSetGapMs, playerSetSilenceRemoval,
 } from '../lib/api';
 import { TrackTable, type SortKey } from './TrackTable';
 import { ConvertView, EqPanel, RadioView, SettingsView, TagView } from './Tools';
@@ -141,6 +142,14 @@ export default function Shell() {
     const [rgSource, setRgSource] = useState('');
     const [volumeCurve, setVolumeCurve] = useState<'log' | 'linear'>('log');
     const [loudnessCompensation, setLoudnessCompensation] = useState(false);
+    const [fadePlayMs, setFadePlayMs] = useState(150);
+    const [fadePauseMs, setFadePauseMs] = useState(150);
+    const [fadeResumeMs, setFadeResumeMs] = useState(150);
+    const [fadeStopMs, setFadeStopMs] = useState(150);
+    const [fadeSeekMs, setFadeSeekMs] = useState(30);
+    const [fadeSwitchMs, setFadeSwitchMs] = useState(300);
+    const [gapMs, setGapMs] = useState(0);
+    const [silenceRemoval, setSilenceRemoval] = useState(false);
     const [volumeDb, setVolumeDb] = useState<number | null>(null);
     const [eqPresets, setEqPresets] = useState<EqPreset[]>([]);
   const [presetDraft, setPresetDraft] = useState('');
@@ -597,7 +606,7 @@ export default function Shell() {
     tokenSongRef.current.set(token, { songId, fromQueue: false });
     try {
       await playerLoad(song.path, songId, token); // C1：帶 token
-      await playerPlay().catch(() => {}); // 保險：確保啟動音訊
+      // 保險 playerPlay() 已移除：後端在淡出歸零後自動播放（由 done_target / SwitchLoad 處理）
       await playerSetVolume(volRef.current || 0.7);
       positionRef.current = 0;
       void flushNowRef.current();
@@ -764,6 +773,15 @@ export default function Shell() {
               // 音量曲線與響度補償同步
               if (s.volumeCurve !== undefined) setVolumeCurve(s.volumeCurve);
               if (s.loudnessCompensation !== undefined) setLoudnessCompensation(s.loudnessCompensation);
+              // 淡入淡出、曲間停頓、去除靜音同步
+              if (s.fadePlayMs !== undefined) setFadePlayMs(s.fadePlayMs);
+              if (s.fadePauseMs !== undefined) setFadePauseMs(s.fadePauseMs);
+              if (s.fadeResumeMs !== undefined) setFadeResumeMs(s.fadeResumeMs);
+              if (s.fadeStopMs !== undefined) setFadeStopMs(s.fadeStopMs);
+              if (s.fadeSeekMs !== undefined) setFadeSeekMs(s.fadeSeekMs);
+              if (s.fadeSwitchMs !== undefined) setFadeSwitchMs(s.fadeSwitchMs);
+              if (s.gapMs !== undefined) setGapMs(s.gapMs);
+              if (s.silenceRemoval !== undefined) setSilenceRemoval(s.silenceRemoval);
               // 音量 dB 同步（靜音為 null）
               if (s.volumeDb !== undefined) setVolumeDb(s.volumeDb);
               if (s.error) setEngineError(s.error);
@@ -986,6 +1004,28 @@ export default function Shell() {
     const changeLoudnessCompensation = (enabled: boolean) => {
       setLoudnessCompensation(enabled);
       playerSetLoudnessCompensation(enabled).catch((e) => setEngineError(String(e)));
+    };
+    const changeFadeSettings = (playMs: number, pauseMs: number, resumeMs: number, stopMs: number, seekMs: number, switchMs: number) => {
+      setFadePlayMs(playMs);
+      setFadePauseMs(pauseMs);
+      setFadeResumeMs(resumeMs);
+      setFadeStopMs(stopMs);
+      setFadeSeekMs(seekMs);
+      setFadeSwitchMs(switchMs);
+      playerSetFadeSettings(playMs, pauseMs, resumeMs, stopMs, seekMs, switchMs).catch((e) => setEngineError(String(e)));
+    };
+    const changeGapMs = (ms: number) => {
+      setGapMs(ms);
+      // gap_ms 與 crossfade 雙向互斥
+      if (ms > 0) {
+        setCrossfade(0);
+        playerSetCrossfade(0).catch((e) => setEngineError(String(e)));
+      }
+      playerSetGapMs(ms).catch((e) => setEngineError(String(e)));
+    };
+    const changeSilenceRemoval = (enabled: boolean) => {
+      setSilenceRemoval(enabled);
+      playerSetSilenceRemoval(enabled).catch((e) => setEngineError(String(e)));
     };
     const closeEq = useCallback(() => setEqOpen(false), []);
   const changeFx = (next: Fx) => {
@@ -1781,6 +1821,14 @@ export default function Shell() {
                                 appliedRgDb={appliedRgDb} hasRg={hasRg} rgSource={rgSource}
                                 volumeCurve={volumeCurve} onVolumeCurveChange={changeVolumeCurve}
                                 loudnessCompensation={loudnessCompensation} onLoudnessCompensationChange={changeLoudnessCompensation}
+                                fadePlayMs={fadePlayMs} onFadePlayMsChange={setFadePlayMs}
+                                fadePauseMs={fadePauseMs} onFadePauseMsChange={setFadePauseMs}
+                                fadeResumeMs={fadeResumeMs} onFadeResumeMsChange={setFadeResumeMs}
+                                fadeStopMs={fadeStopMs} onFadeStopMsChange={setFadeStopMs}
+                                fadeSeekMs={fadeSeekMs} onFadeSeekMsChange={setFadeSeekMs}
+                                fadeSwitchMs={fadeSwitchMs} onFadeSwitchMsChange={setFadeSwitchMs}
+                                gapMs={gapMs} onGapMsChange={setGapMs}
+                                silenceRemoval={silenceRemoval} onSilenceRemovalChange={setSilenceRemoval}
                               />
             )}
     </div>

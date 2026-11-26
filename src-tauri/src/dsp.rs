@@ -6,11 +6,12 @@
 //! 播放位置以「已消耗的輸入 frame」計算，改速度時進度條仍對應歌曲時間。
 
 use crate::eq::{EqProcessor, EqShared};
+use crate::models::FadeGate;
 use rodio::Source;
 use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -624,6 +625,8 @@ pub struct DspSource<S: Iterator<Item = f32>> {
     loudness_treble: Vec<Bq>,
     /// 上次套用響度補償時的 EqShared 版本號
     loudness_seen: u64,
+    /// FadeGate 淡入淡出狀態機（電台路徑）
+    fade_gate: Option<Arc<Mutex<FadeGate>>>,
 }
 
 impl<S: Iterator<Item = f32>> DspSource<S> {
@@ -636,6 +639,7 @@ impl<S: Iterator<Item = f32>> DspSource<S> {
         norm_gain: f32,
         total: Option<Duration>,
         allow_rate: bool,
+        fade_gate: Option<Arc<Mutex<FadeGate>>>,
     ) -> (Self, Arc<AtomicU64>) {
         let ch = channels.max(1) as usize;
         let played = Arc::new(AtomicU64::new(0));
@@ -659,6 +663,7 @@ impl<S: Iterator<Item = f32>> DspSource<S> {
             loudness_bass: vec![Bq::default(); ch],
             loudness_treble: vec![Bq::default(); ch],
             loudness_seen: 0,
+            fade_gate,
         };
         s.refresh();
         (s, played)
@@ -747,8 +752,34 @@ impl<S: Iterator<Item = f32>> Iterator for DspSource<S> {
         if self.pos >= self.out.len() && !self.fill() {
             return None;
         }
-        let s = self.out[self.pos];
+        let mut s = self.out[self.pos];
         self.pos += 1;
+
+        // 套用 FadeGate 增益（電台路徑在實際輸出取樣出口推進淡段進度）
+        if let Some(ref fade_gate) = self.fade_gate {
+            if let Ok(mut fg) = fade_gate.lock() {
+                let base_gain = fg.base_gain;
+                if let Some(ref mut seg) = fg.active {
+                    seg.consumed_samples += 1;
+                    let t = if seg.total_samples == 0 { 1.0 }
+                            else { (seg.consumed_samples as f64 / seg.total_samples as f64).clamp(0.0, 1.0) as f32 };
+                    let gain = seg.from_gain + (seg.to_gain - seg.from_gain) * t;
+                    s *= gain;
+                    if t >= 1.0 {
+                        // 段落結束：鎖定 base_gain = to_gain，設 done_target
+                        let to_gain = seg.to_gain;
+                        let target = seg.target;
+                        let gen = seg.gen;
+                        fg.base_gain = to_gain;
+                        fg.active = None;
+                        fg.done_target = Some((target, gen));
+                    }
+                } else {
+                    s *= base_gain;
+                }
+            }
+        }
+
         Some(s)
     }
 }
@@ -777,7 +808,7 @@ mod tests {
     fn run(input: Vec<f32>, ch: u16, fx: FxParams) -> (Vec<f32>, u64) {
         let shared = Arc::new(EqShared::new());
         shared.update(|p| p.fx = fx.sanitized());
-        let (src, played) = DspSource::new(input.into_iter(), ch, SR, &shared, 1.0, None, true);
+        let (src, played) = DspSource::new(input.into_iter(), ch, SR, &shared, 1.0, None, true, None);
         let out: Vec<f32> = src.collect();
         (out, played.load(Ordering::Relaxed))
     }
@@ -860,7 +891,7 @@ mod tests {
     fn live_param_change_mid_stream() {
         let shared = Arc::new(EqShared::new());
         let input = tone(440.0, 4.0, 2);
-        let (mut src, _) = DspSource::new(input.clone().into_iter(), 2, SR, &shared, 1.0, None, true);
+        let (mut src, _) = DspSource::new(input.clone().into_iter(), 2, SR, &shared, 1.0, None, true, None);
         let mut out = Vec::new();
         for _ in 0..input.len() / 2 {
             out.push(src.next().unwrap());

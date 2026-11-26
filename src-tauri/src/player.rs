@@ -1,4 +1,4 @@
-use crate::models::{EngineSnapshot, PlayerCommand, PlayMode, VolumeCurve};
+use crate::models::{EngineSnapshot, FadeTarget, PlayerCommand, PlayMode, VolumeCurve};
 use crate::playback_pipeline::{
     BLOCK_FRAMES, BLOCK_BYTES, CHANNEL_CAPACITY_BYTES, CHANNEL_CAPACITY_CHUNKS, DeviceConverter,
     OutputProxy, PlaybackCore, PlaybackState, PreparedTrack, RecycleItem,
@@ -28,8 +28,69 @@ const STREAM_OVER_MS: i64 = 15 * 60 * 1000;
 /// SE6：每軌整首解碼進記憶體的 PCM 上限（400 MB；48kHz 立體聲約 17 分鐘）。
 const PCM_MAX_BYTES: usize = 400 * 1024 * 1024;
 
+/// 靜音門檻：−60 dBFS（振幅 0.001）
+const SILENCE_THRESHOLD: f32 = 0.001;
+
+/// 去除靜音：以完整聲道 frame 為單位從頭尾尋找非靜音段落，回傳裁切後樣本與頭尾靜音 frame 數。
+/// 僅在 silence_removal 開啟時呼叫。
+pub fn trim_silence(samples: &mut Vec<f32>, channels: u16, silence_removal: bool) -> (usize, usize) {
+    if !silence_removal || samples.is_empty() || channels == 0 {
+        return (0, 0);
+    }
+    let ch = channels as usize;
+    let frames = samples.len() / ch;
+    if frames == 0 {
+        return (0, 0);
+    }
+
+    // 找頭部第一個非靜音 frame
+    let mut head = 0usize;
+    for i in 0..frames {
+        let mut is_silence = true;
+        for c in 0..ch {
+            if samples[i * ch + c].abs() > SILENCE_THRESHOLD {
+                is_silence = false;
+                break;
+            }
+        }
+        if !is_silence {
+            break;
+        }
+        head += 1;
+    }
+
+    // 找尾部最後一個非靜音 frame
+    let mut tail = 0usize;
+    for i in (0..frames).rev() {
+        let mut is_silence = true;
+        for c in 0..ch {
+            if samples[i * ch + c].abs() > SILENCE_THRESHOLD {
+                is_silence = false;
+                break;
+            }
+        }
+        if !is_silence {
+            break;
+        }
+        tail += 1;
+    }
+
+    // 若全是靜音，不裁切
+    if head + tail >= frames {
+        return (0, 0);
+    }
+
+    // 裁切樣本
+    let start = head * ch;
+    let end = (frames - tail) * ch;
+    let trimmed = samples[start..end].to_vec();
+    *samples = trimmed;
+
+    (head, tail)
+}
+
 /// 以 400 MB 上限收集 f32 樣本，超過則拒絕（改由呼叫端走串流）。
-fn collect_pcm_limit(iter: impl Iterator<Item = f32>) -> Result<Vec<f32>, String> {
+fn collect_pcm_limit(iter: impl Iterator<Item = f32>, sample_rate: u32, channels: u16, silence_removal: bool) -> Result<(Vec<f32>, usize, usize), String> {
     let mut samples = Vec::new();
     for s in iter {
         if samples.len() * 4 >= PCM_MAX_BYTES {
@@ -37,7 +98,8 @@ fn collect_pcm_limit(iter: impl Iterator<Item = f32>) -> Result<Vec<f32>, String
         }
         samples.push(s);
     }
-    Ok(samples)
+    let (leading, trailing) = trim_silence(&mut samples, channels, silence_removal);
+    Ok((samples, leading, trailing))
 }
 
 /// 音訊引擎：管理長駐管線與輸出
@@ -273,7 +335,22 @@ impl AudioEngine {
             // played_out_frames 以樣本數累計（每次 next() 回傳一個 f32 樣本），
             // 立體聲兩個樣本為一個 frame，故除以 (取樣率 × 聲道數) 換算成毫秒
             let played_ms = (played_samples * 1000 / (INTERNAL_SAMPLE_RATE as i64 * INTERNAL_CHANNELS as i64)).max(0);
-            seek_origin + played_ms
+            // 加上開頭靜音偏移（若 silence_removal 開啟且有導靜音）
+            let leading_ms = {
+                let chain_guard = self.core.track_chain.lock().unwrap();
+                if let Some(cur) = chain_guard.as_ref().and_then(|c| c.current()) {
+                    if cur.leading_silence_samples > 0 {
+                        let sample_rate = cur.sample_rate.max(1) as i64;
+                        let channels = cur.channels.max(1) as i64;
+                        (cur.leading_silence_samples as i64 * 1000 / (sample_rate * channels)).max(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }
+            };
+            seek_origin + played_ms + leading_ms
         }
     }
 
@@ -318,6 +395,14 @@ impl AudioEngine {
             s.volume_db = self.cached_volume_db;
             s.volume_curve = eq.volume_curve;
             s.loudness_compensation = eq.loudness_enabled;
+            s.fade_play_ms = eq.fade_play_ms;
+            s.fade_pause_ms = eq.fade_pause_ms;
+            s.fade_resume_ms = eq.fade_resume_ms;
+            s.fade_stop_ms = eq.fade_stop_ms;
+            s.fade_seek_ms = eq.fade_seek_ms;
+            s.fade_switch_ms = eq.fade_switch_ms;
+            s.gap_ms = eq.gap_ms;
+            s.silence_removal = eq.silence_removal;
         }
     }
 
@@ -482,6 +567,8 @@ impl AudioEngine {
                                 native_frame_pos: 0,
                                 path: path.to_string(),
                                 decoder: "stream".to_string(),
+                                leading_silence_samples: 0,
+                                trailing_silence_samples: 0,
                             }));
                             *self.core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
                             (
@@ -491,8 +578,12 @@ impl AudioEngine {
                                 "stream".to_string(),
                             )
                         } else {
-                            let samples = collect_pcm_limit(stream.by_ref())?;
-                            let duration_ms = (samples.len() as f64 / (sample_rate as f64 * channels as f64) * 1000.0) as i64;
+                            let silence_removal = self.core.eq_shared.get().silence_removal;
+                            let (samples, leading_frames, trailing_frames) = collect_pcm_limit(stream.by_ref(), sample_rate, channels, silence_removal)?;
+                            // 修剪後樣本為 frame 數；leading/trailing_silence_samples 應為交錯樣本數（× channels）
+                            let leading_silence = (leading_frames as usize) * (channels as usize);
+                            let trailing_silence = (trailing_frames as usize) * (channels as usize);
+                            // duration_ms 保留原始總長度（line 536 已取自 stream.duration_ms()），不因修剪而重算
                             let peak = samples.iter().map(|s| s.abs()).fold(0f32, f32::max);
                             let norm_gain = if peak > 0.0001 { (0.89 / peak).clamp(0.05, 6.0) } else { 1.0 };
 
@@ -513,6 +604,8 @@ impl AudioEngine {
                                 native_frame_pos: 0,
                                 path: path.to_string(),
                                 decoder: "symphonia".to_string(),
+                                leading_silence_samples: leading_silence,
+                                trailing_silence_samples: trailing_silence,
                             });
                             chain.set_coordinator(self.core.next_coordinator());
 
@@ -624,6 +717,8 @@ impl AudioEngine {
                 native_frame_pos: 0,
                 path: path.to_string(),
                 decoder: "stream".to_string(),
+                leading_silence_samples: 0,
+                trailing_silence_samples: 0,
             }));
             *self.core.rate_stage.lock().unwrap() = Some(RateStage::new(INTERNAL_CHANNELS as usize, INTERNAL_SAMPLE_RATE));
             Ok((chain, resampler, stream_source, "stream".to_string()))
@@ -656,10 +751,12 @@ impl AudioEngine {
                 return Err("ffmpeg 解碼失敗".into());
             }
 
-            let samples = collect_pcm_limit(
+            let silence_removal = self.core.eq_shared.get().silence_removal;
+            let (samples, leading_silence, trailing_silence) = collect_pcm_limit(
                 output.stdout.chunks_exact(4).map(|chunk| {
                     f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
                 }),
+                final_sr, final_ch, silence_removal
             )?;
 
             let duration_ms = (samples.len() as f64 / (final_sr as f64 * final_ch as f64) * 1000.0) as i64;
@@ -683,6 +780,8 @@ impl AudioEngine {
                 native_frame_pos: 0,
                 path: path.to_string(),
                 decoder: "ffmpeg".to_string(),
+                leading_silence_samples: leading_silence,
+                trailing_silence_samples: trailing_silence,
             });
             chain.set_coordinator(self.core.next_coordinator());
 
@@ -857,7 +956,8 @@ impl AudioEngine {
 
         let (dsp, played) = DspSource::new(
             LiveSource { rx, pending: Vec::new(), pos: 0 },
-            2, 44100, &self.core.eq_shared, 1.0, None, false
+            2, 44100, &self.core.eq_shared, 1.0, None, false,
+            Some(self.core.fade_gate.clone())
         );
         self.played = played;
         if let Some(ref sink) = self.sink {
@@ -887,7 +987,63 @@ fn audio_loop(
 
     loop {
         match rx.recv_timeout(Duration::from_millis(80)) {
-            Ok(command) => match command {
+            Ok(command) => {
+                // 消費 FadeGate 完成通知：執行淡出段落結束後的動作（Pause/Stop/Seek/SwitchLoad/StreamInstalled）
+                let done_target = {
+                    let mut fg = engine.core.fade_gate.lock().unwrap();
+                    fg.done_target.take()
+                };
+                if let Some((target, target_gen)) = done_target {
+                    // 僅處理尚未過期的完成通知（gen 與 fade_gen 匹配）
+                    let gen_valid = {
+                        let fg = engine.core.fade_gate.lock().unwrap();
+                        target_gen == fg.fade_gen
+                    };
+                    if gen_valid {
+                        match target {
+                            FadeTarget::Pause => {
+                                if let Some(ref sink) = engine.sink {
+                                    sink.pause();
+                                }
+                                engine.core.set_playback_state(PlaybackState::Paused);
+                            }
+                            FadeTarget::Stop => {
+                                if let Some(ref sink) = engine.sink {
+                                    sink.stop();
+                                }
+                                engine.core.set_playback_state(PlaybackState::Finished);
+                            }
+                            FadeTarget::Seek => {
+                                // Seek 的 restart_from 與淡入已在 Seek 指令中處理，這裡僅確認狀態
+                            }
+                            FadeTarget::SwitchLoad => {
+                                // 執行 pending_load：先在鎖內取出資料，釋放鎖後再載入
+                                let pending = {
+                                    let mut fg = engine.core.fade_gate.lock().unwrap();
+                                    fg.pending_load.take()
+                                };
+                                if let Some(pending) = pending {
+                                    let _ = engine.load(&pending.path, pending.song_id, pending.rg);
+                                    engine.core.set_now_identity(engine.core.now_seq(), pending.token);
+                                    if let Some(ref sink) = engine.sink {
+                                        sink.play();
+                                    }
+                                    engine.is_playing = true;
+                                    engine.core.set_playback_state(PlaybackState::Playing);
+                                }
+                            }
+                            FadeTarget::StreamInstalled => {
+                                if let Some(ref sink) = engine.sink {
+                                    sink.play();
+                                }
+                                engine.core.set_playback_state(PlaybackState::Playing);
+                            }
+                            FadeTarget::None => {}
+                        }
+                    }
+                }
+
+                match command {
                 PlayerCommand::Load { path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
                     let rg = (rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak);
                     if let Err(e) = engine.load(&path, song_id, rg) {
@@ -923,6 +1079,10 @@ fn audio_loop(
                 }
                 PlayerCommand::Play => {
                     log_line("CMD PLAY executing");
+                    // 建立淡入段落：0 → 音量，ms = fade_play_ms
+                    let eq = engine.core.eq_shared.get();
+                    let fade_ms = eq.fade_play_ms;
+                    engine.core.start_fade(FadeTarget::None, 0.0, engine.volume_gain, fade_ms);
                     if let Some(ref sink) = engine.sink {
                         sink.play();
                     }
@@ -931,11 +1091,12 @@ fn audio_loop(
                     engine.core.set_playback_state(PlaybackState::Playing);
                 }
                 PlayerCommand::Pause => {
-                    if let Some(ref sink) = engine.sink {
-                        sink.pause();
-                    }
+                    // 建立淡出段落：音量 → 0，ms = fade_pause_ms；淡出結束後由命令迴圈執行 sink.pause()
+                    let eq = engine.core.eq_shared.get();
+                    let fade_ms = eq.fade_pause_ms;
+                    engine.core.start_fade(FadeTarget::Pause, engine.volume_gain, 0.0, fade_ms);
                     engine.is_playing = false;
-                    engine.core.set_playback_state(PlaybackState::Paused);
+                    // 不立即呼叫 sink.pause()，等淡出歸零後由 done_target 處理
                 }
                 PlayerCommand::Toggle => {
                     if engine.is_playing {
@@ -955,18 +1116,58 @@ fn audio_loop(
                 }
                 PlayerCommand::Stop => {
                     engine.halt_radio();
-                    if let Some(ref sink) = engine.sink {
-                        sink.stop();
-                    }
+                    // 建立淡出段落：音量 → 0，ms = fade_stop_ms；淡出結束後由命令迴圈執行 sink.stop()
+                    let eq = engine.core.eq_shared.get();
+                    let fade_ms = eq.fade_stop_ms;
+                    engine.core.start_fade(FadeTarget::Stop, engine.volume_gain, 0.0, fade_ms);
                     engine.is_playing = false;
                     engine.kind = "idle".into();
                     engine.ended = false;
-                    engine.core.set_playback_state(PlaybackState::Finished);
+                    // 不立即呼叫 sink.stop()，等淡出歸零後由 done_target 處理
+                }
+                PlayerCommand::SetFadeSettings { play_ms, pause_ms, resume_ms, stop_ms, seek_ms, switch_ms } => {
+                    engine.core.eq_shared.update(|p| {
+                        p.fade_play_ms = play_ms;
+                        p.fade_pause_ms = pause_ms;
+                        p.fade_resume_ms = resume_ms;
+                        p.fade_stop_ms = stop_ms;
+                        p.fade_seek_ms = seek_ms;
+                        p.fade_switch_ms = switch_ms;
+                    });
+                    log_line(&format!("CMD SET_FADE play={play_ms} pause={pause_ms} resume={resume_ms} stop={stop_ms} seek={seek_ms} switch={switch_ms}"));
+                }
+                PlayerCommand::SetGapMs { ms } => {
+                    if ms > 0 {
+                        engine.core.eq_shared.update(|p| {
+                            p.gap_ms = ms;
+                            p.crossfade_ms = 0;
+                        });
+                        engine.crossfade_ms = 0;
+                        engine.core.set_crossfade_ms(0);
+                    } else {
+                        engine.core.eq_shared.update(|p| {
+                            p.gap_ms = 0;
+                        });
+                    }
+                    log_line(&format!("CMD SET_GAP_MS ms={ms}"));
+                }
+                PlayerCommand::SetSilenceRemoval { enabled } => {
+                    engine.core.eq_shared.update(|p| {
+                        p.silence_removal = enabled;
+                    });
+                    log_line(&format!("CMD SET_SILENCE_REMOVAL enabled={enabled}"));
                 }
                 PlayerCommand::Seek { position_ms } => {
                     if engine.kind == "file" {
                         let play = engine.is_playing;
+                        // 建立淡出段落：音量 → 0，ms = fade_seek_ms；淡出結束後重新啟動並淡入
+                        let eq = engine.core.eq_shared.get();
+                        let fade_ms = eq.fade_seek_ms;
+                        engine.core.start_fade(FadeTarget::Seek, engine.volume_gain, 0.0, fade_ms);
                         engine.restart_from(position_ms, play);
+                        // 淡入段落：0 → 音量，ms = fade_play_ms
+                        let fade_in_ms = eq.fade_play_ms;
+                        engine.core.start_fade(FadeTarget::None, 0.0, engine.volume_gain, fade_in_ms);
                         engine.ended = false;
                     }
                 }
@@ -1052,8 +1253,15 @@ fn audio_loop(
                                                                     engine.core.eq_shared.update(|p| p.is_album_playback_context = is_album_context);
                                                                 }
                 PlayerCommand::SetCrossfade { ms } => {
-                    engine.crossfade_ms = ms.clamp(0, 12_000);
+                    let ms = ms.clamp(0, 12_000);
+                    engine.crossfade_ms = ms;
                     engine.core.set_crossfade_ms(engine.crossfade_ms as u64);
+                    // 雙向互斥：交叉淡化開啟時清零 gap
+                    if ms > 0 {
+                        engine.core.eq_shared.update(|p| {
+                            p.gap_ms = 0;
+                        });
+                    }
                 }
                 PlayerCommand::SetVolumeCurve { curve } => {
                     let raw = engine.volume_raw;
@@ -1081,7 +1289,8 @@ fn audio_loop(
                 PlayerCommand::PlayUrl { url } => engine.play_url(&url),
                 PlayerCommand::SetNext { path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak } => {
                                     // 共用 PlaybackCore 的待播協調器（與 TrackChain 唯一交接點同一實例）
-                                    let gen = engine.core.next_coordinator().set_next(path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak);
+                                    let silence_removal = engine.core.eq_shared.get().silence_removal;
+                                    let gen = engine.core.next_coordinator().set_next(path, song_id, token, rg_track_gain, rg_track_peak, rg_album_gain, rg_album_peak, silence_removal);
                                     engine.next_coord_gen = gen;
                                     engine.core.set_next_token(token);
                                     log_line(&format!("CMD set_next gen={} token={}", gen, token));
@@ -1095,8 +1304,28 @@ fn audio_loop(
                     engine.core.increment_next_clear_epoch();
                     log_line("CMD clear_next");
                 }
-                PlayerCommand::Next | PlayerCommand::Prev => {}
-            },
+                PlayerCommand::Next | PlayerCommand::Prev => {
+                    // 如果待播槽有下一軌，建立淡出段落並設 pending_load；否則回錯「無下一首」
+                    if let Some(next_track) = engine.core.next_coordinator().peek_next() {
+                        let eq = engine.core.eq_shared.get();
+                        let fade_ms = eq.fade_switch_ms;
+                        engine.core.start_fade(FadeTarget::SwitchLoad, engine.volume_gain, 0.0, fade_ms);
+                        let mut fg = engine.core.fade_gate.lock().unwrap();
+                        fg.pending_load = Some(crate::models::PendingLoad {
+                            path: next_track.path.clone(),
+                            song_id: next_track.song_id,
+                            token: next_track.token,
+                            rg: (
+                                next_track.replaygain_track_gain,
+                                next_track.replaygain_track_peak,
+                                next_track.replaygain_album_gain,
+                                next_track.replaygain_album_peak,
+                            ),
+                        });
+                    }
+                }
+            }
+        },
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -1109,7 +1338,110 @@ fn audio_loop(
                         "CMD poll_completion seq={} token={} song_id={}",
                         track.seq, track.token, track.song_id
                     ));
-                }
+                    // 若為串流軌，背景開流並設 stream_install_ready
+                    if matches!(&track.data, crate::playback_pipeline::TrackData::Stream(_)) {
+                        let path = track.path.clone();
+                        let song_id = track.song_id;
+                        let rate = track.rate;
+                        let channels = track.channels;
+                        let duration_ms = track.duration_ms;
+                        let decoder = track.decoder.clone();
+                        let token = track.token;
+                        let seq = track.seq;
+                        let core = engine.core.clone();
+                        std::thread::spawn(move || {
+                            let result: Result<Box<dyn Iterator<Item = f32> + Send>, String> =
+                                (|| {
+                                    let mut file = std::fs::File::open(&path)
+                                        .map_err(|e| format!("開啟檔案失敗: {e}"))?;
+                                    let path_buf = std::path::PathBuf::from(&path);
+                                    match decoder.as_str() {
+                                        "symphonia" | "stream" => {
+                                            // #6：長檔開頭靜音掃描 — 先從開頭讀取掃描連續靜音，再從靜音結尾處開流
+                                            let mut probe =
+                                                crate::audio_decode::SymStream::open(
+                                                    &mut file, &path_buf, 0,
+                                                )?;
+                                            let scan_limit_samples =
+                                                (rate as usize) * (channels as usize) * 5; // 掃描前 5 秒
+                                            let mut leading_samples = 0usize;
+                                            let mut scanned = 0usize;
+                                            for sample in probe.by_ref().take(scan_limit_samples) {
+                                                scanned += 1;
+                                                if sample.abs() < 0.001 {
+                                                    leading_samples += 1;
+                                                } else {
+                                                    leading_samples = 0; // 非靜音重置，只計連續開頭靜音
+                                                }
+                                                // 連續靜音超過 500ms 視為開頭靜音結束
+                                                if leading_samples
+                                                    > (rate as usize * channels as usize / 2)
+                                                {
+                                                    break;
+                                                }
+                                            }
+                                            let leading_ms =
+                                                if scanned > 0 && leading_samples > 0 {
+                                                    (leading_samples as f64
+                                                        / (rate as f64 * channels as f64)
+                                                        * 1000.0) as i64
+                                                } else {
+                                                    0
+                                                };
+                                            // 重新打開檔案，從 leading_ms 處開始開流
+                                            let mut file2 = std::fs::File::open(&path)
+                                                .map_err(|e| format!("開啟檔案失敗: {e}"))?;
+                                            let mut stream =
+                                                crate::audio_decode::SymStream::open(
+                                                    &mut file2, &path_buf, leading_ms,
+                                                )?;
+                                            Ok(
+                                                Box::new(stream)
+                                                    as Box<dyn Iterator<Item = f32> + Send>,
+                                            )
+                                        }
+                                        "ffmpeg" => {
+                                            let ext = path_buf
+                                                .extension()
+                                                .and_then(|e| e.to_str())
+                                                .map(|e| e.to_lowercase())
+                                                .unwrap_or_default();
+                                            let ffmpeg_path =
+                                                crate::tools::locate("ffmpeg.exe")
+                                                    .map(|(p, _, _)| p)
+                                                    .ok_or("找不到 ffmpeg")?;
+                                            let stream = crate::audio_decode::FfmpegStream::new(
+                                                &ffmpeg_path, &path, rate, channels, duration_ms,
+                                            )?;
+                                            let handle = stream.open_with_seek(0)?;
+                                            Ok(handle)
+                                        }
+                                        _ => Err(format!("不支援的解碼器: {decoder}")),
+                                    }
+                                })();
+                                match result {
+                                    Ok(source) => {
+                                        let meta = crate::models::StreamMeta {
+                                            song_id,
+                                            duration_ms,
+                                            rate,
+                                            channels,
+                                            path,
+                                            decoder,
+                                            position_ms: 0,
+                                            gen: core.stream_gen(),
+                                        };
+                                        core.deliver_stream_result(source, meta);
+                                    }
+                                    Err(e) => {
+                                        crate::open_with::log_load_error(&format!(
+                                            "串流開流失敗 song_id={song_id}: {e}"
+                                        ));
+                                    }
+                                }
+                            });
+                        }
+                    }
                 Err(e) => {
                     // 準備失敗（壞檔、缺工具）：記錄並讓前端能透過錯誤欄位知悉、略過並重排
                     crate::open_with::log_load_error(&format!("prepare_next failed: {e}"));

@@ -28,6 +28,7 @@ use crate::commands::{
     player_prev, player_seek, player_set_mode,            player_set_volume, player_stop, player_toggle,
             player_status, player_set_eq, player_set_preamp, player_set_eq_enabled, player_set_fx, eq_response_cmd, player_output_devices, player_set_output, player_set_normalize, player_set_crossfade, player_play_url,
             player_set_next, player_clear_next, player_set_volume_curve, player_set_loudness_compensation,
+            player_set_fade_settings, player_set_gap_ms, player_set_silence_removal,
     library_facets_cmd, songs_by_field_cmd, list_recent_cmd,
     read_tags_cmd, write_tags_cmd, write_tags_batch_cmd, ffmpeg_available_cmd, convert_audio_cmd, reveal_in_explorer_cmd, browse_folder_cmd, take_opened_file_cmd, song_by_path_cmd, smtc_update_cmd,
     pick_m3u_cmd, pick_m3u_save_cmd, import_m3u_cmd, export_m3u_cmd,
@@ -70,9 +71,25 @@ fn main() {
     // 啟動音訊執行緒（rodio 輸出 + symphonia 解碼，獨立於 UI 執行緒）
     let (player_tx, status_handle) = start_player_thread();
 
-    // 套用音量曲線與響度補償設定到引擎
+    // 套用音量曲線、響度補償、淡入淡出、曲間停頓、去除靜音設定到引擎
     let _ = player_tx.send(crate::models::PlayerCommand::SetVolumeCurve { curve: config.volume_curve });
     let _ = player_tx.send(crate::models::PlayerCommand::SetLoudnessCompensation { enabled: config.loudness_compensation });
+    let _ = player_tx.send(crate::models::PlayerCommand::SetFadeSettings { 
+        play_ms: config.fade_play_ms, 
+        pause_ms: config.fade_pause_ms, 
+        resume_ms: config.fade_resume_ms, 
+        stop_ms: config.fade_stop_ms, 
+        seek_ms: config.fade_seek_ms, 
+        switch_ms: config.fade_switch_ms 
+    });
+    // gap_ms 與 crossfade_ms 互斥：啟動時以 app_config 為準，後寫者勝
+    let mut gap_ms = config.gap_ms;
+    let mut crossfade_ms = config.crossfade_ms;
+    if crossfade_ms > 0 { gap_ms = 0; }
+    else if gap_ms > 0 { crossfade_ms = 0; }
+    let _ = player_tx.send(crate::models::PlayerCommand::SetGapMs { ms: gap_ms });
+    let _ = player_tx.send(crate::models::PlayerCommand::SetCrossfade { ms: crossfade_ms });
+    let _ = player_tx.send(crate::models::PlayerCommand::SetSilenceRemoval { enabled: config.silence_removal });
 
     Builder::default()
         .manage(DbState {
@@ -134,6 +151,9 @@ fn main() {
                     player_play_url,
                     player_set_volume_curve,
                     player_set_loudness_compensation,
+                    player_set_fade_settings,
+                    player_set_gap_ms,
+                    player_set_silence_removal,
                     library_facets_cmd,
                     songs_by_field_cmd,
                     list_recent_cmd,

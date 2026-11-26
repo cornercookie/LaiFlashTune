@@ -63,6 +63,14 @@ export function EqPanel({
   appliedRgDb, hasRg, rgSource,
   volumeCurve, onVolumeCurveChange,
   loudnessCompensation, onLoudnessCompensationChange,
+  fadePlayMs, onFadePlayMsChange,
+  fadePauseMs, onFadePauseMsChange,
+  fadeResumeMs, onFadeResumeMsChange,
+  fadeStopMs, onFadeStopMsChange,
+  fadeSeekMs, onFadeSeekMsChange,
+  fadeSwitchMs, onFadeSwitchMsChange,
+  gapMs, onGapMsChange,
+  silenceRemoval, onSilenceRemovalChange,
 }: {
   bands: number[];
   preamp: number;
@@ -108,6 +116,22 @@ export function EqPanel({
   onVolumeCurveChange: (v: VolumeCurve) => void;
   loudnessCompensation: boolean;
   onLoudnessCompensationChange: (v: boolean) => void;
+  fadePlayMs: number;
+  onFadePlayMsChange: (v: number) => void;
+  fadePauseMs: number;
+  onFadePauseMsChange: (v: number) => void;
+  fadeResumeMs: number;
+  onFadeResumeMsChange: (v: number) => void;
+  fadeStopMs: number;
+  onFadeStopMsChange: (v: number) => void;
+  fadeSeekMs: number;
+  onFadeSeekMsChange: (v: number) => void;
+  fadeSwitchMs: number;
+  onFadeSwitchMsChange: (v: number) => void;
+  gapMs: number;
+  onGapMsChange: (v: number) => void;
+  silenceRemoval: boolean;
+  onSilenceRemovalChange: (v: boolean) => void;
 }) {
   const [tab, setTab] = useState<PanelTab>('eq');
   const [curve, setCurve] = useState<Array<[number, number]>>([]);
@@ -510,6 +534,68 @@ export function EqPanel({
                       <span className="text-[13px] text-[#f4f0e8]">響度補償（音量越小自動增強低頻與高頻）</span>
                     </label>
                     <p className="text-[10px] text-[#8a847a] mt-1">100% 時不作用；越小聲自動提升低頻 +10 dB、高頻 +6 dB</p>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">淡入淡出時間 (ms，0 為關)</div>
+                    <div className="grid gap-2" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">播放開始</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadePlayMs} onChange={(e) => onFadePlayMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">暫停</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadePauseMs} onChange={(e) => onFadePauseMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">繼續播放</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadeResumeMs} onChange={(e) => onFadeResumeMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">停止</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadeStopMs} onChange={(e) => onFadeStopMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">拖進度條</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadeSeekMs} onChange={(e) => onFadeSeekMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] text-[#8a847a]">手動切歌</label>
+                        <input type="number" min="0" max="5000" step="10" value={fadeSwitchMs} onChange={(e) => onFadeSwitchMsChange(Number(e.target.value))} className="field text-[12px]" />
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-[#8a847a] mt-1">預設：播放/暫停/繼續/停止 150 ms、進度條 30 ms、切歌 300 ms</p>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <div className="text-[11px] tracking-widest text-[#8a847a] mb-2">曲間停頓</div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min="0"
+                        max="10000"
+                        step="100"
+                        value={gapMs}
+                        onChange={(e) => onGapMsChange(Number(e.target.value))}
+                        className="line flex-1 accent-[#e23b2f]"
+                        style={{ ['--pct' as string]: `${(gapMs / 10000) * 100}%` }}
+                      />
+                      <span className="num text-[12px] text-[#e23b2f] w-16 shrink-0 text-right">{gapMs} ms</span>
+                    </div>
+                    <p className="text-[10px] text-[#8a847a] mt-1">0 為關閉；開啟時自動關閉交叉淡化；停頓期間進度條不前進</p>
+                  </div>
+
+                  <div className="border border-[#2a2723] rounded-sm p-3">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={silenceRemoval}
+                        onChange={(e) => onSilenceRemovalChange(e.target.checked)}
+                        className="accent-[#e23b2f]"
+                      />
+                      <span className="text-[13px] text-[#f4f0e8]">去除靜音（頭尾低於 −60 dBFS 的段落）</span>
+                    </label>
+                    <p className="text-[10px] text-[#8a847a] mt-1">記憶體軌頭尾裁切；長檔串流僅開頭；進度條時間仍對應原檔</p>
                   </div>
 
                   <div className="grid gap-3" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>

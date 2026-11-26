@@ -892,6 +892,15 @@ pub fn load_config(conn: &rusqlite::Connection) -> rusqlite::Result<AppConfig> {
     if let Some(v) = get("loudness_compensation") {
         config.loudness_compensation = v.parse().unwrap_or(false);
     }
+    if let Some(v) = get("fade_play_ms") { config.fade_play_ms = v.parse().unwrap_or(150); }
+    if let Some(v) = get("fade_pause_ms") { config.fade_pause_ms = v.parse().unwrap_or(150); }
+    if let Some(v) = get("fade_resume_ms") { config.fade_resume_ms = v.parse().unwrap_or(150); }
+    if let Some(v) = get("fade_stop_ms") { config.fade_stop_ms = v.parse().unwrap_or(150); }
+    if let Some(v) = get("fade_seek_ms") { config.fade_seek_ms = v.parse().unwrap_or(30); }
+    if let Some(v) = get("fade_switch_ms") { config.fade_switch_ms = v.parse().unwrap_or(300); }
+    if let Some(v) = get("gap_ms") { config.gap_ms = v.parse().unwrap_or(0); }
+    if let Some(v) = get("crossfade_ms") { config.crossfade_ms = v.parse().unwrap_or(0); }
+    if let Some(v) = get("silence_removal") { config.silence_removal = v.parse().unwrap_or(false); }
     Ok(config)
 }
 

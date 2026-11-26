@@ -161,6 +161,24 @@ pub struct AppConfig {
     pub rg_preamp_none: f32,
     pub volume_curve: VolumeCurve,
     pub loudness_compensation: bool,
+    /// 淡入時間（播放開始，ms，0 為關）
+    pub fade_play_ms: i64,
+    /// 淡出時間（暫停，ms，0 為關）
+    pub fade_pause_ms: i64,
+    /// 淡入時間（繼續播放，ms，0 為關）
+    pub fade_resume_ms: i64,
+    /// 淡出時間（停止，ms，0 為關）
+    pub fade_stop_ms: i64,
+    /// 淡出時間（拖進度條，ms，0 為關）
+    pub fade_seek_ms: i64,
+    /// 淡出時間（手動切歌，ms，0 為關）
+    pub fade_switch_ms: i64,
+    /// 曲間停頓（ms，0 為關，1–10000）
+    pub gap_ms: i64,
+    /// 交叉淡化（ms，0 為關），與 gap_ms 雙向互斥
+    pub crossfade_ms: i64,
+    /// 去除靜音
+    pub silence_removal: bool,
 }
 
 impl Default for AppConfig {
@@ -175,6 +193,15 @@ impl Default for AppConfig {
             rg_preamp_none: -6.0,
             volume_curve: VolumeCurve::default(),
             loudness_compensation: false,
+            fade_play_ms: 150,
+            fade_pause_ms: 150,
+            fade_resume_ms: 150,
+            fade_stop_ms: 150,
+            fade_seek_ms: 30,
+            fade_switch_ms: 300,
+            gap_ms: 0,
+            crossfade_ms: 0,
+            silence_removal: false,
         }
     }
 }
@@ -294,6 +321,22 @@ pub struct EngineSnapshot {
     pub volume_curve: VolumeCurve,
     /// 響度補償
     pub loudness_compensation: bool,
+    /// 淡入時間（播放開始）
+    pub fade_play_ms: i64,
+    /// 淡出時間（暫停）
+    pub fade_pause_ms: i64,
+    /// 淡入時間（繼續播放）
+    pub fade_resume_ms: i64,
+    /// 淡出時間（停止）
+    pub fade_stop_ms: i64,
+    /// 淡出時間（拖進度條）
+    pub fade_seek_ms: i64,
+    /// 淡出時間（手動切歌）
+    pub fade_switch_ms: i64,
+    /// 曲間停頓（ms）
+    pub gap_ms: i64,
+    /// 去除靜音
+    pub silence_removal: bool,
 }
 
 impl Default for EngineSnapshot {
@@ -331,6 +374,14 @@ impl Default for EngineSnapshot {
             volume_db: None,
             volume_curve: VolumeCurve::default(),
             loudness_compensation: false,
+            fade_play_ms: 150,
+            fade_pause_ms: 150,
+            fade_resume_ms: 150,
+            fade_stop_ms: 150,
+            fade_seek_ms: 30,
+            fade_switch_ms: 300,
+            gap_ms: 0,
+            silence_removal: false,
         }
     }
 }
@@ -339,6 +390,64 @@ impl Default for EngineSnapshot {
 pub struct PlayerState {
     pub tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<PlayerCommand>>>,
     pub status: std::sync::Arc<std::sync::Mutex<EngineSnapshot>>,
+}
+
+/// 淡段目標動作
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FadeTarget {
+    None,
+    Pause,
+    Stop,
+    Seek,
+    SwitchLoad,
+    StreamInstalled,
+}
+
+/// 執行中的淡段，由命令執行緒建立、OutputProxy 每輸出樣本消耗
+#[derive(Debug, Clone)]
+pub struct FadeSegment {
+    pub gen: u64,                 // 淡段世代識別，新指令遞增，舊段落 gen 不符即捨棄
+    pub target: FadeTarget,       // 段落結束後待執行的動作
+    pub from_gain: f32,
+    pub to_gain: f32,
+    pub total_samples: u64,       // 0 表示立即生效（to_gain 直接套用）
+    pub consumed_samples: u64,    // 已輸出的樣本數
+}
+
+/// 待載入資料（SwitchLoad 淡出歸零後由命令迴圈執行 Load）
+#[derive(Debug, Clone)]
+pub struct PendingLoad {
+    pub path: String,
+    pub song_id: i64,
+    pub token: u64,
+    pub rg: (Option<f32>, Option<f32>, Option<f32>, Option<f32>),
+}
+
+/// 待安裝的串流來源（已由命令執行緒背景開流完成，等候曲終/gap 耗盡安裝）
+#[derive(Debug, Clone)]
+pub struct StreamMeta {
+    pub song_id: i64,
+    pub duration_ms: i64,
+    pub rate: u32,
+    pub channels: u16,
+    pub path: String,
+    pub decoder: String,
+    pub position_ms: i64,
+    pub gen: u64,                 // 開流啟動時攜帶的世代，交付與安裝前均與 stream_gen 比對
+}
+
+/// FadeGate 淡入淡出狀態機
+pub struct FadeGate {
+    pub active: Option<FadeSegment>, // 目前執行中的淡段
+    pub base_gain: f32,              // 段落結束後鎖定的增益（預設 1.0，段落結束後設為 to_gain）
+    pub fade_gen: u64,               // 下一個淡段分配的世代（與串流來源世代分開）
+    pub pending_load: Option<PendingLoad>,   // SwitchLoad 淡出完成後待載入的軌
+    pub pending_stream_source: Option<Box<dyn Iterator<Item = f32> + Send>>, // 已開流來源
+    pub pending_stream_meta: Option<StreamMeta>, // 串流中繼資料（含 gen）
+    pub stream_gen: u64,             // 目前有效串流安裝世代；開流交付前與 meta.gen 比對，安裝前再比對；不歸零，持續遞增
+    pub stream_install_ready: Option<u64>,   // 由 next() 在回呼中設定，攜帶當時的 stream_gen；命令執行緒 tick 在同一同步區段核對世代、交接狀態及 gap，再取出來源並消費 ready（僅消費一次）
+    pub done_target: Option<(FadeTarget, u64)>, // (動作, 完成世代)，命令迴圈處理
+    pub gap_remaining: u64,          // 曲間停頓剩餘樣本數（固定 48 kHz 雙聲道交錯樣本），不累計 played_out_frames
 }
 
 /// 播放控制命令（音訊執行緒透過 mpsc 接收，避免在 UI 執行緒解碼）
@@ -375,6 +484,12 @@ pub enum PlayerCommand {
     PlayUrl { url: String },
     SetVolumeCurve { curve: VolumeCurve },
     SetLoudnessCompensation { enabled: bool },
+    /// 設定六項淡入淡出時間（ms）
+    SetFadeSettings { play_ms: i64, pause_ms: i64, resume_ms: i64, stop_ms: i64, seek_ms: i64, switch_ms: i64 },
+    /// 設定曲間停頓（ms，0 為關，1–10000）
+    SetGapMs { ms: i64 },
+    /// 設定去除靜音開關
+    SetSilenceRemoval { enabled: bool },
 }
 
 /// 歌詞解析結果
