@@ -22,11 +22,31 @@ import { SEED_VERSION, flatBands, mergeSeeds, parsePresets, type EqPreset, type 
 import { FX_DEFAULT, parseAuto, pickAutoPreset, sceneFx, type AutoEq, type Fx, type Scene } from './fx';
 import { sessionRestoreActions } from './openWithRestore';
 import { emptySession, parseSession, type Session } from './session';
-import { decideNext, PLAY_MODE, type DecideNextInput, type DecideNextOutput } from './nextTrack';
+import { decideNext, nextRequestAction, type DecideNextInput } from './nextTrack';
 
 type View = 'all' | 'artists' | 'albums' | 'genres' | 'folders' | 'playlist' | 'queue' | 'recent' | 'radio' | 'tags' | 'convert' | 'settings';
 
 type OpenTab = { key: string; kind: 'all' | 'recent' | 'queue' | 'playlist'; playlistId?: number; name: string };
+
+type NextTrackRequest = {
+  songId: number;
+  token: number;
+  fromQueue: boolean;
+  capacityAtSend: number;
+};
+
+type NextTrackPlan = {
+  playSeq: number;
+  songId: number;
+  order: Song[];
+  queue: Song[];
+  mode: PlayMode;
+  stopAfterCurrent: boolean;
+  clearEpoch: number;
+  declaredAbsent: boolean;
+  failed: Set<string>;
+  randomPreselected: string | null;
+};
 
 const ALL_TAB: OpenTab = { key: 'all', kind: 'all', name: '全部歌曲' };
 
@@ -138,6 +158,7 @@ export default function Shell() {
     const [rgPreampNone, setRgPreampNone] = useState(-6);
     const [isAlbumContext, setIsAlbumContext] = useState(false);
     const [appliedRgDb, setAppliedRgDb] = useState<number | null>(null);
+    const [appliedPreampDb, setAppliedPreampDb] = useState<number>(0);
     const [hasRg, setHasRg] = useState(false);
     const [rgSource, setRgSource] = useState('');
     const [volumeCurve, setVolumeCurve] = useState<'log' | 'linear'>('log');
@@ -165,6 +186,8 @@ export default function Shell() {
   const [batchDraft, setBatchDraft] = useState<{ artist: string; album: string; genre: string; year: string }>({ artist: '', album: '', genre: '', year: '' });
   const [sleepSeconds, setSleepSeconds] = useState(0);
   const [stopAfterCurrent, setStopAfterCurrent] = useState(false);
+  const stopAfterCurrentRef = useRef(stopAfterCurrent);
+  stopAfterCurrentRef.current = stopAfterCurrent;
   const sleepRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [outputDevices, setOutputDevices] = useState<string[]>([]);
   const [outputDevice, setOutputDevice] = useState('');
@@ -208,14 +231,14 @@ export default function Shell() {
   const openPlaylistRef = useRef<(id: number, name?: string) => Promise<void>>(async () => {});
 
   // SP3：新流程的狀態
-  const nextRequestedRef = useRef<{ songId: number; token: number; fromQueue: boolean } | null>(null);
-  const requestedTokenRef = useRef<number | null>(null);      // 上一次送出 set_next 的 token（不論引擎是否準備好）
-  const nextClearEpochRef = useRef(0);                         // 引擎自行清除下一首的 epoch
-  const tokenSongRef = useRef<Map<number, { songId: number; fromQueue: boolean }>>(new Map());
-  const failedRef = useRef<Set<number>>(new Set());            // 這階段解碼/播放失敗的歌曲 id
-  const consecutiveFailuresRef = useRef(0);
-  const stopEnqueueingRef = useRef(false);
-  const playSeqRef = useRef<number | null>(null);              // 上一次處理過的 play_seq（避免重複副作用）
+  const nextRequestedRef = useRef<NextTrackRequest | null>(null);
+  const nextAcceptedRef = useRef<NextTrackRequest | null>(null);
+  const nextPlanRef = useRef<NextTrackPlan | null>(null);
+  const playSeqRef = useRef<number | null>(null);              // 已認領的最大 play_seq（避免重複副作用；手動播放不歸零）
+  const pollBusyRef = useRef(false);
+  const pendingManualRef = useRef<{ token: number } | null>(null); // 手動載入等待 ack（token 相符才釋放）
+  const reqTokenRef = useRef(0);                               // 手動載入＋自動預取共用的請求者單調計數器
+  const reqSeedPromiseRef = useRef<Promise<void> | null>(null); // 首次取號前以收到的最大 token 種入（只做一次）
 
   const snapshot = (): Session => ({
     volume: volRef.current,
@@ -584,13 +607,43 @@ export default function Shell() {
     };
   }, []);
 
+  function observeRequestTokens(status: EngineSnapshot) {
+    reqTokenRef.current = Math.max(
+      reqTokenRef.current, status.nowToken, status.nextToken, status.manualLoadTokenHighWater,
+      status.lastManualLoadResult?.token ?? 0, status.nextRequestResult?.token ?? 0,
+    );
+  }
+
+  async function nextRequestToken() {
+    if (!reqSeedPromiseRef.current) {
+      reqSeedPromiseRef.current = playerStatus().then(s => {
+        observeRequestTokens(s);
+      }).catch(e => { reqSeedPromiseRef.current = null; throw e; });
+    }
+    await reqSeedPromiseRef.current;
+    return ++reqTokenRef.current;
+  }
+
+  async function manualLoad(path: string, id: number) {
+    const intent = resumeToken.current;
+    nextRequestedRef.current = null;
+    nextAcceptedRef.current = null;
+    nextPlanRef.current = null;
+    pendingManualRef.current = null;
+    const token = await nextRequestToken();
+    if (intent !== resumeToken.current) return;
+    pendingManualRef.current = {token};
+    try { await playerLoad(path,id,token); }
+    catch(e) { if (pendingManualRef.current?.token === token) pendingManualRef.current = null; throw e; }
+  }
+
   const playSong = async (song: Song, list = shown) => {
     if (song.missing) {
       setEngineError(`缺檔，無法播放：${song.path}`);
       setPlaying(false);
       return;
     }
-    resumeToken.current += 1;
+    const intent = ++resumeToken.current;
     setOrder(list);
     orderRef.current = list;
     activeRef.current = song.id;
@@ -600,21 +653,20 @@ export default function Shell() {
     setRadioTitle('');
     endedRef.current = false;
     // SP3：不提前記歷史/消耗佇列；副作用改在新 play_seq 出現時統一處理
-    const token = resumeToken.current;
     const songId = song.id > 0 ? song.id : 0;
-    requestedTokenRef.current = token;
-    tokenSongRef.current.set(token, { songId, fromQueue: false });
     try {
-      await playerLoad(song.path, songId, token); // C1：帶 token
+      await manualLoad(song.path, songId);
       // 保險 playerPlay() 已移除：後端在淡出歸零後自動播放（由 done_target / SwitchLoad 處理）
-      await playerSetVolume(volRef.current || 0.7);
+      if (intent !== resumeToken.current) return;
+      await playerSetVolume(mutedRef.current ? 0 : volRef.current);
+      if (intent !== resumeToken.current) return;
       positionRef.current = 0;
       void flushNowRef.current();
     } catch (e) {
+      if (intent !== resumeToken.current) return;
       setEngineError(e instanceof Error ? e.message : String(e));
       setPlaying(false);
     }
-    playSeqRef.current = null; // 重新播放，下一次 play_seq 變動才做副作用
   };
   playSongRef.current = playSong;
 
@@ -641,9 +693,7 @@ export default function Shell() {
         setPlaying(true);
         setRadioTitle('');
         setEngineError('');
-        await playerLoad(path, 0, resumeToken.current);
-        await playerPlay().catch(() => {});
-        await playerSetVolume(volRef.current || 0.7);
+        await manualLoad(path, 0);
       } catch (e) {
         setEngineError(e instanceof Error ? e.message : String(e));
         setPlaying(false);
@@ -713,63 +763,138 @@ export default function Shell() {
   }, []);
 
   useEffect(() => {
-    const enqueueNext = async (current: Song, status: EngineSnapshot) => {
+    const matchesNextPlan = (plan: NextTrackPlan, status: EngineSnapshot) =>
+      plan.playSeq === status.playSeq &&
+      plan.songId === status.songId &&
+      plan.order === orderRef.current &&
+      plan.queue === queueRef.current &&
+      plan.mode === modeRef.current &&
+      plan.stopAfterCurrent === stopAfterCurrentRef.current;
+
+    const planNext = (status: EngineSnapshot) => {
+      const current = nextPlanRef.current;
+      if (current && matchesNextPlan(current, status)) return current;
+      const plan: NextTrackPlan = {
+        playSeq: status.playSeq, songId: status.songId,
+        order: orderRef.current, queue: queueRef.current,
+        mode: modeRef.current, stopAfterCurrent: stopAfterCurrentRef.current,
+        clearEpoch: status.nextClearEpoch, declaredAbsent: false,
+        failed: new Set(), randomPreselected: null,
+      };
+      nextPlanRef.current = plan;
+      nextRequestedRef.current = null;
+      return plan;
+    };
+
+    const enqueueNext = async (status: EngineSnapshot, isCurrent: () => boolean) => {
+      if (status.kind !== 'file' || status.playSeq <= 0) return;
+      const plan = planNext(status);
+      const stillCurrent = () => isCurrent() && nextPlanRef.current === plan && matchesNextPlan(plan, status);
+      if (plan.declaredAbsent || !stillCurrent()) return;
+
+      const capacityEpoch = status.nextCapacityEpoch ?? 0;
+      const requested = nextRequestedRef.current;
+      if (status.nextClearEpoch > plan.clearEpoch) {
+        plan.clearEpoch = status.nextClearEpoch;
+        nextRequestedRef.current = null;
+      } else if (requested) {
+        const action = nextRequestAction(requested, status.nextRequestResult, capacityEpoch);
+        if (action === 'hold') return;
+        if (action === 'skip') plan.failed.add(String(requested.songId));
+        nextRequestedRef.current = null;
+      }
+
       const input: DecideNextInput = {
-        reason: status.playback_state === 'Finished' ? 'ended' : 'user',
-        playlist: orderRef.current.map((s) => String(s.id)),
-        queue: queueRef.current.map((s) => String(s.id)),
-        mode: MODE_TO_NEXT[modeRef.current],
-        playAfterEnd: stopAfterCurrent,
-        currentSong: String(current.id),
-        randomPreselected: null,
-        failed: new Set([...failedRef.current].map(String)),
+        reason: 'ended',
+        playlist: plan.order.map((song) => String(song.id)),
+        queue: plan.queue.map((song) => String(song.id)),
+        mode: MODE_TO_NEXT[plan.mode],
+        playAfterEnd: plan.stopAfterCurrent,
+        currentSong: String(plan.songId),
+        randomPreselected: plan.randomPreselected,
+        failed: plan.failed,
       };
       const result = decideNext(input);
-      consecutiveFailuresRef.current = result.consecutiveFailures;
-      stopEnqueueingRef.current = result.stopEnqueueing;
-      for (const id of result.removedFromQueue) {
-        const nid = Number(id);
-        queueRef.current = queueRef.current.filter((s) => s.id !== nid);
+      plan.randomPreselected = result.randomPreselected;
+      if (!stillCurrent()) return;
+      if (result.removedFromQueue.length > 0) {
+        const removed = new Set(result.removedFromQueue);
+        const queue = plan.queue.filter((song) => !removed.has(String(song.id)));
+        plan.queue = queue;
+        queueRef.current = queue;
+        setQueue(queue);
       }
-      setQueue(queueRef.current);
 
-      if (result.song == null || stopEnqueueingRef.current) {
-        await playerClearNext().catch(() => {});
-        requestedTokenRef.current = 0;
-        nextClearEpochRef.current = status.next_clear_epoch;
-        nextRequestedRef.current = null;
+      if (result.song == null || result.stopEnqueueing) {
+        await playerClearNext(true, plan.playSeq);
+        if (stillCurrent()) plan.declaredAbsent = true;
         return;
       }
 
       const songId = Number(result.song);
-      const fromQueue = Boolean(result.fromQueue);
-      const nextSong =
-        orderRef.current.find((x) => x.id === songId) ?? queueRef.current.find((x) => x.id === songId);
-      if (!nextSong) return;
+      const nextSong = plan.order.find((song) => song.id === songId)
+        ?? plan.queue.find((song) => song.id === songId);
+      if (!nextSong || nextSong.missing) {
+        plan.failed.add(result.song);
+        return;
+      }
 
-      const nextToken = (requestedTokenRef.current ?? 0) + 1;
-      requestedTokenRef.current = nextToken;
-      tokenSongRef.current.set(nextToken, { songId, fromQueue });
-      await playerSetNext(nextSong.path, songId, nextToken).catch(() => {});
-      nextRequestedRef.current = { songId, token: nextToken, fromQueue };
+      const token = await nextRequestToken();
+      if (!stillCurrent()) return;
+      try {
+        await playerSetNext(nextSong.path, songId, token, plan.playSeq);
+      } catch (error) {
+        if (stillCurrent()) plan.failed.add(result.song);
+        throw error;
+      }
+      if (stillCurrent()) {
+        nextRequestedRef.current = { songId, token, fromQueue: result.fromQueue, capacityAtSend: capacityEpoch };
+      }
     };
 
+    let disposed = false;
     const t = setInterval(async () => {
+      if (pollBusyRef.current || disposed) return;
+      pollBusyRef.current = true;
+      const intent = resumeToken.current;
+      const currentPoll = () => !disposed && resumeToken.current === intent;
       try {
-              const s = await playerStatus();
-              setPosition(s.position_ms);
+        const s = await playerStatus();
+        if (!currentPoll()) return;
+        observeRequestTokens(s);
+        const pending = pendingManualRef.current;
+        if (pending) {
+          const receipt = s.lastManualLoadResult;
+          if (receipt?.token === pending.token) {
+            pendingManualRef.current = null;
+            if (receipt.outcome === 'failed') {
+              playSeqRef.current = Math.max(playSeqRef.current ?? 0, s.playSeq);
+              setEngineError(s.error || '載入失敗');
+              setPlaying(false);
+              return;
+            }
+          } else if (s.manualLoadTokenHighWater > pending.token) {
+            pendingManualRef.current = null;
+          } else {
+            return;
+          }
+        }
+        const observedNext = nextRequestedRef.current;
+        if (observedNext?.token === s.nextToken) nextAcceptedRef.current = observedNext;
+              setPosition(s.positionMs);
               if (s.kind !== 'radio') {
-                positionRef.current = s.position_ms;
-                setDuration(s.duration_ms);
+                positionRef.current = s.positionMs;
+                setDuration(s.durationMs);
               }
-              setPlaying(s.is_playing);
-              setGain(s.applied_gain);
+              setPlaying(s.isPlaying);
+              setGain(s.appliedGain);
               // ReplayGain 狀態同步
-              if (s.applied_replaygain_db !== undefined) setAppliedRgDb(s.applied_replaygain_db);
-              if (s.has_replaygain !== undefined) setHasRg(s.has_replaygain);
-              if (s.rg_mode !== undefined) setRgMode(s.rg_mode);
-              if (s.volume_norm_mode !== undefined) setVolumeNormMode(s.volume_norm_mode);
-              if (s.rg_source !== undefined) setRgSource(s.rg_source);
+              if (s.appliedReplaygainDb !== undefined) setAppliedRgDb(s.appliedReplaygainDb);
+              if (s.appliedPreampDb !== undefined) setAppliedPreampDb(s.appliedPreampDb);
+              if (s.hasReplaygain !== undefined) setHasRg(s.hasReplaygain);
+              if (s.rgMode !== undefined) setRgMode(s.rgMode);
+              if (s.volumeNormMode !== undefined) setVolumeNormMode(s.volumeNormMode);
+              if (s.rgSource !== undefined) setRgSource(s.rgSource);
               // 音量曲線與響度補償同步
               if (s.volumeCurve !== undefined) setVolumeCurve(s.volumeCurve);
               if (s.loudnessCompensation !== undefined) setLoudnessCompensation(s.loudnessCompensation);
@@ -785,81 +910,60 @@ export default function Shell() {
               // 音量 dB 同步（靜音為 null）
               if (s.volumeDb !== undefined) setVolumeDb(s.volumeDb);
               if (s.error) setEngineError(s.error);
-              if (s.kind === 'radio') setRadioTitle(s.stream_title);
-        if (s.kind !== 'radio' && s.is_playing && hydratedRef.current && Date.now() - lastFlushRef.current >= 5000) {
+              setRadioTitle(s.kind === 'radio' ? s.streamTitle : '');
+        if (s.kind !== 'radio' && s.isPlaying && hydratedRef.current && Date.now() - lastFlushRef.current >= 5000) {
           void flushNowRef.current().catch(() => {});
         }
 
         // SP3：以 play_seq 變動為唯一副作用觸發點（歷史、佇列消耗、下一首一次到位）；不再輪詢 ended 重載
         if (
           s.kind !== 'radio' &&
-          s.song_id &&
-          s.song_id !== activeRef.current &&
-          s.play_seq != null &&
-          s.play_seq !== playSeqRef.current
+          s.songId &&
+          s.playSeq > 0 &&
+          s.playSeq != null &&
+          s.playSeq > (playSeqRef.current ?? 0)
         ) {
-          playSeqRef.current = s.play_seq;
+          playSeqRef.current = s.playSeq;
           const found =
-            orderRef.current.find((x) => x.id === s.song_id) ??
-            queueRef.current.find((x) => x.id === s.song_id) ??
-            songs.find((x) => x.id === s.song_id);
+            orderRef.current.find((x) => x.id === s.songId) ??
+            queueRef.current.find((x) => x.id === s.songId) ??
+            songs.find((x) => x.id === s.songId);
           if (found) {
-            activeRef.current = s.song_id;
-            setActiveId(s.song_id);
-            setOrder([found, ...orderRef.current.filter((x) => x.id !== s.song_id)]);
+            activeRef.current = s.songId;
+            setActiveId(s.songId);
+            if (!orderRef.current.some((song) => song.id === s.songId)) {
+              const order = [found, ...orderRef.current];
+              orderRef.current = order;
+              setOrder(order);
+            }
             setDuration(found.duration_ms || 0);
+            const completed = [nextRequestedRef.current, nextAcceptedRef.current]
+              .find((request) => request?.token === s.nowToken && request.songId === s.songId);
+            if (completed?.fromQueue && queueRef.current[0]?.id === s.songId) {
+              queueRef.current = queueRef.current.slice(1);
+              setQueue(queueRef.current);
+            }
+            nextRequestedRef.current = null;
+            nextAcceptedRef.current = null;
+            await enqueueNext(s, currentPoll).catch(() => {});
+            if (!currentPoll()) return;
             // 記播放（只一次）；歌詞若已過期則丟棄
-            await songPlayed(s.song_id).catch(() => {});
-            const lyric = await getLyrics(s.song_id);
+            await songPlayed(s.songId).catch(() => {});
+            if (!currentPoll()) return;
+            const lyric = await getLyrics(s.songId);
+            if (!currentPoll() || activeRef.current !== s.songId || playSeqRef.current !== s.playSeq) return;
             setLines(lyric?.lines ?? []);
             setLyricOffset(lyric?.offset_ms ?? 0);
-            // 佇列來的歌：此時才消耗佇列
-            if (nextRequestedRef.current?.songId === s.song_id) {
-              const head = queueRef.current[0];
-              if (head && head.id === s.song_id) {
-                queueRef.current = queueRef.current.slice(1);
-                setQueue(queueRef.current);
-              }
-              nextRequestedRef.current = null;
-            }
-            await enqueueNext(found, s);
-
-            // SP3：引擎自行清除了下一首（seek/換裝置/player_load）會遞增 next_clear_epoch。
-            // 若前端仍有「已要求的 token」且尚未成歌，就重新送出一次 set_next；
-            // 比對對象是「已要求的 token」，不是快照的 next_token（可能還在準備中）。
-            if (
-              s.next_clear_epoch !== nextClearEpochRef.current &&
-              requestedTokenRef.current !== null
-            ) {
-              const pending = nextRequestedRef.current;
-              if (pending) {
-                const nextSong =
-                  orderRef.current.find((x) => x.id === pending.songId) ??
-                  queueRef.current.find((x) => x.id === pending.songId);
-                if (nextSong) {
-                  const nextToken = (requestedTokenRef.current ?? 0) + 1;
-                  requestedTokenRef.current = nextToken;
-                  tokenSongRef.current.set(nextToken, {
-                    songId: pending.songId,
-                    fromQueue: pending.fromQueue,
-                  });
-                  await playerSetNext(nextSong.path, pending.songId, nextToken).catch(() => {});
-                  nextRequestedRef.current = {
-                    songId: pending.songId,
-                    token: nextToken,
-                    fromQueue: pending.fromQueue,
-                  };
-                }
-              }
-              nextClearEpochRef.current = s.next_clear_epoch;
-            }
           }
+        } else if (s.kind === 'file' && s.playSeq > 0) {
+          await enqueueNext(s, currentPoll).catch(() => {});
         }
         if (!s.ended) endedRef.current = false;
       } catch { /* 視窗還沒接上後端時不刷錯誤 */ }
+      finally { pollBusyRef.current = false; }
     }, 250);
-    return () => clearInterval(t);
-  }, [queue]);
+    return () => { disposed = true; clearInterval(t); };
+  }, [songs]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1179,8 +1283,7 @@ export default function Shell() {
         setPlaying(true);
         setRadioTitle('');
         setEngineError('');
-        await playerLoad(first, 0, resumeToken.current);
-        await playerSetVolume(mutedRef.current ? 0 : volRef.current);
+        await manualLoad(first, 0);
       }
       for (let i = 1; i < filePaths.length; i++) {
         const f = await songByPath(filePaths[i]);
@@ -1655,9 +1758,10 @@ export default function Shell() {
                   {radioTitle ? `直播　${radioTitle}` : (active ? `${techLine(active)}　${active.path}` : '尚未選擇檔案')}
                 </div>
                 {/* ReplayGain 狀態列 */}
-                {!radioTitle && hasRg && appliedRgDb !== null && (
+                {!radioTitle && (rgSource === 'RG_None' || (appliedRgDb !== null && (rgSource === 'RG_Track' || rgSource === 'RG_Album' || rgSource === 'RG_Track_Fallback'))) && (
                   <div className="flex items-center gap-2 text-[11px] text-[#e23b2f] shrink-0" title={`來源：${rgSource} | 模式：${rgMode} | 正規化：${volumeNormMode} | 專輯上下文：${isAlbumContext ? '開' : '關'}`}>
-                    <span>RG: <b>{appliedRgDb > 0 ? '+' : ''}{appliedRgDb.toFixed(2)} dB</b></span>
+                    {appliedRgDb !== null && <span>RG: <b>{appliedRgDb > 0 ? '+' : ''}{appliedRgDb.toFixed(2)} dB</b></span>}
+                    {rgSource === 'RG_None' && <span className="text-[#e23b2f] ml-1">(無標籤)</span>}
                     <span className="text-[#8a847a]">|</span>
                     <span>{rgMode}</span>
                     <span className="text-[#8a847a]">|</span>
@@ -1818,7 +1922,7 @@ export default function Shell() {
                                 rgPreampHas={rgPreampHas} onRgPreampHasChange={changeRgPreampHas}
                                 rgPreampNone={rgPreampNone} onRgPreampNoneChange={changeRgPreampNone}
                                 isAlbumContext={isAlbumContext} onAlbumContextChange={changeAlbumContext}
-                                appliedRgDb={appliedRgDb} hasRg={hasRg} rgSource={rgSource}
+                                appliedRgDb={appliedRgDb} appliedPreampDb={appliedPreampDb} hasRg={hasRg} rgSource={rgSource}
                                 volumeCurve={volumeCurve} onVolumeCurveChange={changeVolumeCurve}
                                 loudnessCompensation={loudnessCompensation} onLoudnessCompensationChange={changeLoudnessCompensation}
                                 fadePlayMs={fadePlayMs} onFadePlayMsChange={setFadePlayMs}

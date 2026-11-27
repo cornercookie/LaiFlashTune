@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { decideNext, PLAY_MODE } from './nextTrack.ts';
+import { decideNext, nextRequestAction, PLAY_MODE } from './nextTrack.ts';
 
 const failed = (ids) => new Set(ids);
 
@@ -152,6 +152,19 @@ function run(overrides) {
 {
   const r = run({ reason: 'ended', mode: PLAY_MODE.All, playlist: ['A', 'B'], currentSong: 'B' });
   assert.equal(r.song, 'A', '全部循環播到尾繞回第一首');
+}
+
+{
+  const request = { token: 8, capacityAtSend: 3 };
+  const rejected = { token: 8, state: 'rejected' };
+  assert.equal(nextRequestAction(request, { token: 7, state: 'failed' }, 4), 'hold');
+  assert.equal(nextRequestAction(request, rejected, 2), 'hold');
+  assert.equal(nextRequestAction(request, rejected, 3), 'hold');
+  assert.equal(nextRequestAction(request, rejected, 4), 'retry');
+  assert.equal(nextRequestAction({ token: 9, capacityAtSend: 4 }, { token: 9, state: 'rejected' }, 4), 'hold');
+  assert.equal(nextRequestAction(request, { token: 8, state: 'accepted' }, 4), 'hold');
+  assert.equal(nextRequestAction(request, { token: 8, state: 'ready' }, 4), 'hold');
+  assert.equal(nextRequestAction(request, { token: 8, state: 'failed' }, 3), 'skip');
 }
 
 console.log('nextTrack tests ok');

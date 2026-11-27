@@ -60,7 +60,7 @@ export function EqPanel({
   rgPreampHas, onRgPreampHasChange,
   rgPreampNone, onRgPreampNoneChange,
   isAlbumContext, onAlbumContextChange,
-  appliedRgDb, hasRg, rgSource,
+  appliedRgDb, appliedPreampDb, hasRg, rgSource,
   volumeCurve, onVolumeCurveChange,
   loudnessCompensation, onLoudnessCompensationChange,
   fadePlayMs, onFadePlayMsChange,
@@ -110,6 +110,7 @@ export function EqPanel({
   isAlbumContext: boolean;
   onAlbumContextChange: (v: boolean) => void;
   appliedRgDb: number | null;
+  appliedPreampDb: number;
   hasRg: boolean;
   rgSource: string;
   volumeCurve: VolumeCurve;
@@ -435,8 +436,8 @@ export function EqPanel({
                 <div className="mb-3 p-3 bg-[#12110f] border border-[#2a2723] rounded-sm">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-[13px] font-bold text-[#f4f0e8]">ReplayGain 狀態</span>
-                    <span className={`text-[11px] px-2 py-0.5 rounded ${hasRg ? 'bg-[#1a3a1a] text-[#4ade80]' : 'bg-[#3a1a1a] text-[#f87171]'}`}>
-                      {hasRg ? '檔案有 RG 標籤' : '檔案無 RG 標籤'}
+                    <span className={`text-[11px] px-2 py-0.5 rounded ${(rgSource === 'RG_Track' || rgSource === 'RG_Album' || rgSource === 'RG_Track_Fallback') ? 'bg-[#1a3a1a] text-[#4ade80]' : 'bg-[#3a1a1a] text-[#f87171]'}`}>
+                      {(rgSource === 'RG_Track' || rgSource === 'RG_Album' || rgSource === 'RG_Track_Fallback') ? `正在套用 ${rgSource}` : rgSource === 'RG_None' ? '套用無標籤前級' : '未套用 RG'}
                     </span>
                   </div>
                   <div className="grid gap-1 text-[12px] text-[#c8c2b8]" style={{ gridTemplateColumns: 'repeat(2, 1fr)' }}>
@@ -445,7 +446,8 @@ export function EqPanel({
                     <div>模式：<span className="text-[#e23b2f] font-mono">{rgMode}</span></div>
                     <div>音量正規化：<span className="text-[#e23b2f] font-mono">{volumeNormMode}</span></div>
                     <div>專輯播放上下文：<span className="text-[#e23b2f] font-mono">{isAlbumContext ? '開' : '關'}</span></div>
-                    <div>RG 前級：<span className="text-[#e23b2f] font-mono">{hasRg ? `${rgPreampHas > 0 ? '+' : ''}${rgPreampHas} dB` : `${rgPreampNone > 0 ? '+' : ''}${rgPreampNone} dB`}</span></div>
+                    <div>RG 前級：<span className="text-[#e23b2f] font-mono">{appliedPreampDb !== null && appliedPreampDb !== undefined ? `${appliedPreampDb > 0 ? '+' : ''}${appliedPreampDb.toFixed(2)} dB` : '—'}</span></div>
+                    {rgSource === 'RG_None' && <div className="col-span-2 text-[#e23b2f] text-[11px]">無標籤：僅套用無標籤前級</div>}
                   </div>
                 </div>
 

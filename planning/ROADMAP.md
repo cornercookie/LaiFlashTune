@@ -21,6 +21,10 @@
 
 每期資料夾內有 `Design.md`（設計與實作步驟、圖、完成條件）與 `Review.md`（分階段審查紀錄），流程見根目錄 `AGENTS.md`。期內順序以各 Design.md 開頭寫的為準；跨期依賴寫在項目裡。
 
+## Hermes #1～#7 修復交付
+
+2026-11-27 完成 #1～#7 本次修復、獨立複審與 Windows Release 自動驗收。Rust 187 項及前端 5 項測試全數通過，x64 執行檔、MSI 和 NSIS 安裝包已產生並核對雜湊。#6、#7 的實機聽感依原規劃另行驗收。範圍及證據見 [Design.md](hermes-1-7-remediation/Design.md) 與 [Review.md](hermes-1-7-remediation/Review.md)。
+
 ## P4 待辦（尚未展開）
 
 | 項目 | 備註 |

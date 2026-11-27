@@ -8,12 +8,14 @@ mod audio_decode;
 mod dsp;
 mod eq;
 mod player;
+mod radio;
 mod extras;
 mod open_with;
 mod transport;
 mod tools;
 mod next_track;
 mod playback_pipeline;
+mod prefetch_stream;
 
 use crate::commands::{
     add_music_folder_cmd, add_song_to_playlist_cmd, app_paths, create_playlist_cmd,

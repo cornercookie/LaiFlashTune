@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-player-set-gap-ms"
+description = "Enables the player_set_gap_ms command without any pre-configured scope."
+commands.allow = ["player_set_gap_ms"]
+
+[[permission]]
+identifier = "deny-player-set-gap-ms"
+description = "Denies the player_set_gap_ms command without any pre-configured scope."
+commands.deny = ["player_set_gap_ms"]

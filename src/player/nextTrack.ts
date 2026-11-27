@@ -23,6 +23,22 @@ export const PLAY_MODE = {
 
 export type PlayMode = (typeof PLAY_MODE)[keyof typeof PLAY_MODE];
 
+export type NextRequestReceipt = {
+  token: number;
+  state: 'accepted' | 'ready' | 'rejected' | 'failed';
+};
+
+export function nextRequestAction(
+  request: { token: number; capacityAtSend: number },
+  receipt: NextRequestReceipt | null | undefined,
+  capacityEpoch: number,
+): 'hold' | 'retry' | 'skip' {
+  if (receipt?.token !== request.token) return 'hold';
+  if (receipt.state === 'failed') return 'skip';
+  if (receipt.state === 'rejected' && capacityEpoch > request.capacityAtSend) return 'retry';
+  return 'hold';
+}
+
 export interface DecideNextInput {
   reason: 'ended' | 'user';
   playlist: string[];       // 播放清單歌曲 id 依序

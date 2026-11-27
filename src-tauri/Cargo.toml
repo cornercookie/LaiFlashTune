@@ -48,3 +48,10 @@ tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[patch.crates-io]
+lofty = { path = "vendor/lofty" }
+symphonia-format-isomp4 = { path = "vendor/symphonia-format-isomp4" }
+symphonia-format-ogg = { path = "vendor/symphonia-format-ogg" }
+symphonia-bundle-flac = { path = "vendor/symphonia-bundle-flac" }
+symphonia-format-riff = { path = "vendor/symphonia-format-riff" }

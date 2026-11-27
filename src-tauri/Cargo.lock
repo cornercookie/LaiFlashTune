@@ -2513,8 +2513,6 @@ dependencies = [
 [[package]]
 name = "lofty"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8242df2d720c7f2e23bb7829da4447e5a762ccf0a361a01efe1433f554a48400"
 dependencies = [
  "base64 0.13.1",
  "byteorder",
@@ -4432,8 +4430,6 @@ dependencies = [
 [[package]]
 name = "symphonia-bundle-flac"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c91565e180aea25d9b80a910c546802526ffd0072d0b8974e3ebe59b686c9976"
 dependencies = [
  "log",
  "symphonia-core",
@@ -4511,8 +4507,6 @@ dependencies = [
 [[package]]
 name = "symphonia-format-isomp4"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243739585d11f81daf8dac8d9f3d18cc7898f6c09a259675fc364b382c30e0a5"
 dependencies = [
  "encoding_rs",
  "log",
@@ -4524,8 +4518,6 @@ dependencies = [
 [[package]]
 name = "symphonia-format-ogg"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b4955c67c1ed3aa8ae8428d04ca8397fbef6a19b2b051e73b5da8b1435639cb"
 dependencies = [
  "log",
  "symphonia-core",
@@ -4536,8 +4528,6 @@ dependencies = [
 [[package]]
 name = "symphonia-format-riff"
 version = "0.5.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2d7c3df0e7d94efb68401d81906eae73c02b40d5ec1a141962c592d0f11a96f"
 dependencies = [
  "extended",
  "log",

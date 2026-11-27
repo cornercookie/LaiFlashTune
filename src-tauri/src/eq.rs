@@ -309,6 +309,7 @@ pub struct EqProcessor {
     has_rg: bool,
     is_album_playback_context: bool,
     current_rg_preamp_db: f32,
+    current_rg_effective_gain_db: Option<f32>,
     current_rg_source: String,
 }
 
@@ -339,6 +340,7 @@ impl EqProcessor {
                     has_rg: false,
                     is_album_playback_context: params.is_album_playback_context,
                     current_rg_preamp_db: 0.0,
+                    current_rg_effective_gain_db: None,
                     current_rg_source: "Unknown".to_string(),
                 };
         p.refresh();
@@ -371,7 +373,8 @@ impl EqProcessor {
                 let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
                 self.gain_target = self.norm_gain * eq_preamp;
                 self.has_rg = false;
-                self.current_rg_preamp_db = params.preamp_db;
+                self.current_rg_preamp_db = 0.0;
+                self.current_rg_effective_gain_db = None;
                 self.current_rg_source = "Peak".to_string();
             }
             crate::models::VolumeNormalization::Off => {
@@ -379,6 +382,7 @@ impl EqProcessor {
                 self.gain_target = 1.0 * eq_preamp;
                 self.has_rg = false;
                 self.current_rg_preamp_db = 0.0;
+                self.current_rg_effective_gain_db = None;
                 self.current_rg_source = "Off".to_string();
             }
             crate::models::VolumeNormalization::Replaygain => {
@@ -387,6 +391,7 @@ impl EqProcessor {
                     self.gain_target = 1.0 * eq_preamp;
                     self.has_rg = false;
                     self.current_rg_preamp_db = 0.0;
+                    self.current_rg_effective_gain_db = None;
                     self.current_rg_source = "RG_Off".to_string();
                 } else {
                     let (selected_gain_db, selected_peak, rg_source, has_rg) = match self.rg_mode {
@@ -420,24 +425,29 @@ impl EqProcessor {
                         crate::models::ReplayGainMode::Off => unreachable!(),
                     };
 
-                    let (requested_gain_linear, rg_preamp_db) = if has_rg {
+                    let (requested_gain_linear, rg_preamp_db, effective_gain_db) = if has_rg {
                         let gain_with_preamp = selected_gain_db.unwrap_or(0.0) + self.rg_preamp_has;
-                        (db_to_linear(gain_with_preamp), self.rg_preamp_has)
+                        let requested = db_to_linear(gain_with_preamp);
+                        let norm_gain_final = if let Some(peak) = selected_peak {
+                            let max_gain = 1.0 / peak.max(0.0001);
+                            requested.min(max_gain)
+                        } else {
+                            requested
+                        };
+                        let effective_db = 20.0 * (norm_gain_final as f64).log10() as f32;
+                        (norm_gain_final, self.rg_preamp_has, Some(effective_db))
                     } else {
-                        (db_to_linear(self.rg_preamp_none), self.rg_preamp_none)
-                    };
-
-                    let norm_gain_final = if let Some(peak) = selected_peak {
-                        let max_gain = 1.0 / peak.max(0.0001);
-                        requested_gain_linear.min(max_gain)
-                    } else {
-                        requested_gain_linear
+                        // RG_None：無標籤，只套用 rg_preamp_none
+                        let norm_gain_final = db_to_linear(self.rg_preamp_none);
+                        let effective_db = self.rg_preamp_none;
+                        (norm_gain_final, self.rg_preamp_none, Some(effective_db))
                     };
 
                     let eq_preamp = if params.enabled { db_to_linear(params.preamp_db) } else { 1.0 };
-                    self.gain_target = norm_gain_final * eq_preamp;
+                    self.gain_target = requested_gain_linear * eq_preamp;
                     self.has_rg = has_rg;
                     self.current_rg_preamp_db = rg_preamp_db;
+                    self.current_rg_effective_gain_db = effective_gain_db;
                     self.current_rg_source = rg_source;
                 }
             }
@@ -455,6 +465,12 @@ impl EqProcessor {
             self.chains = (0..self.channels).map(|_| chain.clone()).collect();
         }
         self.enabled = params.enabled;
+    }
+
+    /// 公開供 crate 內部呼叫：強制重新整理已發布狀態（即使暫停不處理音訊，RG 發布狀態仍需更新）。
+    /// 不增益平滑（gain_now 不動），只更新 has_rg / current_rg_* 等發布欄位。
+    pub(crate) fn refresh_published(&mut self) {
+        self.refresh();
     }
 
     pub fn set_rg_context(&mut self, track_gain: Option<f32>, track_peak: Option<f32>,
@@ -478,9 +494,16 @@ impl EqProcessor {
         self.seen = 0;
     }
 
+    /// 取得當前軌的峰值正規化增益（供測試/檢查用）。
+    pub fn current_norm_gain(&self) -> f32 { self.norm_gain }
+
+    /// 取得 ReplayGain context 中儲存的 norm_gain（與 current_norm_gain 相同，語意上用於 RG 上下文檢查）。
+    pub fn current_rg_context_norm_gain(&self) -> f32 { self.norm_gain }
+
     pub fn gain_target(&self) -> f32 { self.gain_target }
     pub fn has_rg(&self) -> bool { self.has_rg }
     pub fn current_rg_preamp_db(&self) -> f32 { self.current_rg_preamp_db }
+    pub fn current_rg_effective_gain_db(&self) -> Option<f32> { self.current_rg_effective_gain_db }
     pub fn current_rg_source(&self) -> String { self.current_rg_source.clone() }
     pub fn rg_mode(&self) -> crate::models::ReplayGainMode { self.rg_mode }
     pub fn volume_norm_mode(&self) -> crate::models::VolumeNormalization { self.volume_norm_mode }
@@ -583,5 +606,165 @@ mod tests {
         let mut p = EqProcessor::new(shared, 44100, 2, 1.0);
         let y = p.process(0.5);
         assert!((y - 0.5 * db_to_linear(-6.0)).abs() < 1e-3);
+    }
+
+    /// RG 峰值夾擊：實際增益（norm_gain_final）應被 peak 限制，而非未削減的 requested。
+    #[test]
+    fn rg_peak_clamps_actual_vs_display() {
+        let shared = std::sync::Arc::new(EqShared::new());
+        shared.update(|e| {
+            e.rg_preamp_has = 0.0;
+            e.rg_mode = crate::models::ReplayGainMode::Track;
+            e.volume_norm_mode = crate::models::VolumeNormalization::Replaygain;
+        });
+        let mut p = EqProcessor::new(shared.clone(), 44100, 2, 1.0);
+        // +6 dB 增益（≈1.995 linear），peak 0.7 → max_gain ≈ 1.428，應被夾擊
+        p.set_rg_context(Some(6.0), Some(0.7), None, None,
+            crate::models::ReplayGainMode::Track,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Track");
+        let eff = p.current_rg_effective_gain_db().unwrap();
+        // 夾擊後：20*log10(1.428) ≈ 3.1 dB，遠小於未削減的 +6 dB
+        assert!((eff - 3.1).abs() < 0.5, "峰值夾擊後實際增益應約 3.1 dB，實際 {eff:.2} dB");
+    }
+
+    /// 專輯 vs 曲目 vs 無標籤 vs 關閉：ReplayGain 模式選擇與來源標籤。
+    #[test]
+    fn rg_album_vs_track_vs_no_tag_vs_off() {
+        let shared = std::sync::Arc::new(EqShared::new());
+
+        // Track 模式、有曲目標籤
+        shared.update(|e| {
+            e.rg_mode = crate::models::ReplayGainMode::Track;
+            e.volume_norm_mode = crate::models::VolumeNormalization::Replaygain;
+        });
+        let mut p = EqProcessor::new(shared.clone(), 44100, 2, 1.0);
+        p.set_rg_context(Some(-3.0), Some(0.8), None, None,
+            crate::models::ReplayGainMode::Track,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Track");
+
+        // Album 模式、有專輯標籤（無曲目標籤）
+        shared.update(|e| e.rg_mode = crate::models::ReplayGainMode::Album);
+        p.set_rg_context(None, None, Some(-5.0), Some(0.6),
+            crate::models::ReplayGainMode::Album,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Album");
+
+        // Album 模式、無專輯標籤但有曲目標籤 → Track fallback
+        p.set_rg_context(Some(-2.0), Some(0.9), None, None,
+            crate::models::ReplayGainMode::Album,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Track_Fallback");
+
+        // 無標籤 → RG_None
+        p.set_rg_context(None, None, None, None,
+            crate::models::ReplayGainMode::Track,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(!p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_None");
+
+        // RG Off 模式
+        shared.update(|e| e.rg_mode = crate::models::ReplayGainMode::Off);
+        p.set_rg_context(Some(-3.0), Some(0.8), None, None,
+            crate::models::ReplayGainMode::Off,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(!p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Off");
+    }
+
+    /// 啟用中的 EQ 前級必須改變 gain_target，但不得污染 RG 發布欄位
+    /// （current_rg_effective_gain_db 只反映 RG 本身的 dB，不含 EQ 前級）。
+    #[test]
+    fn eq_preamp_changes_target_but_not_rg_effective_gain() {
+        let shared = std::sync::Arc::new(EqShared::new());
+        shared.update(|e| {
+            e.enabled = true;
+            e.rg_preamp_has = 0.0;
+            e.rg_mode = crate::models::ReplayGainMode::Track;
+            e.volume_norm_mode = crate::models::VolumeNormalization::Replaygain;
+        });
+        let mut p = EqProcessor::new(shared.clone(), 44100, 2, 1.0);
+        p.set_rg_context(Some(-3.0), Some(0.8), None, None,
+            crate::models::ReplayGainMode::Track,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        let target_before = p.gain_target();
+        let eff_before = p.current_rg_effective_gain_db();
+        assert!(p.has_rg());
+        assert_eq!(eff_before, Some(-3.0));
+
+        // 非零 EQ 前級（EQ 維持啟用）
+        shared.update(|e| e.preamp_db = -6.0);
+        p.refresh_published();
+
+        let pre = db_to_linear(-6.0);
+        assert!(
+            (p.gain_target() - target_before * pre).abs() < 1e-6,
+            "gain_target 應乘上 EQ 前級，before={target_before} after={}",
+            p.gain_target()
+        );
+        // RG 發布欄位不受 EQ 前級影響
+        assert_eq!(p.current_rg_effective_gain_db(), eff_before);
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Track");
+    }
+
+    /// 暫停式（不 process 任何樣本）refresh_published：在 Replaygain 模式下 set_norm_gain
+    /// （對應 apply_eq_rg_gain 改為一律呼叫），shared 切到 Peak 後應使用該軌儲存的
+    /// norm_gain，並清除 RG 發布欄位。
+    #[test]
+    fn refresh_published_after_peak_switch_uses_stored_norm_gain() {
+        let shared = std::sync::Arc::new(EqShared::new());
+        shared.update(|e| {
+            e.rg_mode = crate::models::ReplayGainMode::Track;
+            e.volume_norm_mode = crate::models::VolumeNormalization::Replaygain;
+        });
+        let mut p = EqProcessor::new(shared.clone(), 44100, 2, 1.0);
+        p.set_rg_context(Some(-3.0), Some(0.8), None, None,
+            crate::models::ReplayGainMode::Track,
+            crate::models::VolumeNormalization::Replaygain,
+            false);
+        p.refresh_published();
+        assert!(p.has_rg());
+        assert_eq!(p.current_rg_source(), "RG_Track");
+
+        // 模擬新的 apply_eq_rg_gain：Replaygain 模式下也一律更新當前軌 norm_gain
+        let stored_norm_gain = 0.85f32;
+        p.set_norm_gain(stored_norm_gain);
+
+        // 暫停中：不 process 樣本，只改 shared 模式並強制刷新發布狀態
+        shared.update(|e| e.volume_norm_mode = crate::models::VolumeNormalization::Peak);
+        p.refresh_published();
+
+        // Peak 分支：gain_target = norm_gain × EQ 前級（前級 0 dB → 等於 norm_gain），
+        // 且必須使用剛儲存的當前軌值，而非建構時的 1.0
+        assert!(
+            (p.gain_target() - stored_norm_gain).abs() < 1e-6,
+            "gain_target 應使用儲存的 norm_gain {stored_norm_gain}，實際 {}",
+            p.gain_target()
+        );
+        assert!(!p.has_rg());
+        assert_eq!(p.current_rg_source(), "Peak");
+        assert_eq!(p.current_rg_effective_gain_db(), None);
+        assert_eq!(p.current_rg_preamp_db(), 0.0);
+        assert_eq!(p.volume_norm_mode(), crate::models::VolumeNormalization::Peak);
     }
 }

@@ -54,7 +54,8 @@ flowchart LR
 | commands | Tauri 執行緒池 | `DbState.conn: Mutex<Connection>` 一條連線 |
 | AudioEngine | 專屬執行緒，以 80ms `recv_timeout` 輪詢 | `PlayerCommand`（mpsc）進；`EngineSnapshot`（`Arc<Mutex>`）出 |
 | DspSource | cpal 輸出回呼（rodio 拉取） | 讀 `EqShared` 的版本號；寫 `played` 計數器（AtomicU64） |
-| 電台解碼 | 每台一條執行緒，跑 ffmpeg 子程序 | mpsc 傳 PCM 區塊；`AtomicBool` 停止 |
+| 本機音訊準備 | 背景工作負責直接載入、Seek 與待播 | 目前軌、待播及回收共用三份來源配額。自然交接使用預建的重取樣與速率處理狀態 |
+| 電台解碼 | 背景工作管理 curl 與 FFmpeg 子程序 | curl 經管道傳輸 HTTP／HTTPS 串流，FFmpeg 輸出 PCM。切台或停止時取消與回收子程序 |
 | 單一實例監聽 | 背景執行緒 | TCP 收路徑 → 發 `open-file` 事件 |
 | 系統匣 / SMTC | Tauri / souvlaki | 發 `transport` 事件（toggle / prev / next） |
 

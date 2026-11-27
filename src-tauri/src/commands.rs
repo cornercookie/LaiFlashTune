@@ -58,6 +58,7 @@ pub fn player_set_next(
     path: String,
     song_id: i64,
     token: u64,
+    play_seq: Option<u64>,
 ) -> Result<(), String> {
     crate::open_with::log_line(&format!("CMD player_set_next path={path} song_id={song_id} token={token}"));
     let rg = {
@@ -68,6 +69,7 @@ pub fn player_set_next(
         path,
         song_id,
         token,
+        play_seq,
         rg_track_gain: rg.0,
         rg_track_peak: rg.1,
         rg_album_gain: rg.2,
@@ -80,9 +82,11 @@ pub fn player_set_next(
 #[tauri::command]
 pub fn player_clear_next(
     state: State<'_, PlayerState>,
+    no_next: Option<bool>,
+    play_seq: Option<u64>,
 ) -> Result<(), String> {
     crate::open_with::log_line("CMD player_clear_next");
-    send_cmd(state, PlayerCommand::ClearNext)
+    send_cmd(state, PlayerCommand::ClearNext { no_next: no_next.unwrap_or(false), play_seq })
 }
 
 /// 預載下一首（用於無縫切歌，gapless）。保留相容性，內部轉為 SetNext。
@@ -102,6 +106,7 @@ pub fn player_preload(
         path,
         song_id,
         token,
+        play_seq: None,
         rg_track_gain: rg.0,
         rg_track_peak: rg.1,
         rg_album_gain: rg.2,

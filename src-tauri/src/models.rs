@@ -277,6 +277,43 @@ pub struct DbState {
     pub conn: std::sync::Mutex<rusqlite::Connection>,
 }
 
+/// 手動載入終態（序列化為小寫 loaded / failed）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ManualLoadOutcome {
+    Loaded,
+    Failed,
+}
+
+/// 手動載入回執：手動 Load 以確切 token 記錄終態，前端用 token 比對自己要求的載入
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualLoadResult {
+    /// 手動 Load 指令攜帶的 token（原樣記錄）
+    pub token: u64,
+    /// 終態：loaded（成功）或 failed（失敗）
+    pub outcome: ManualLoadOutcome,
+}
+
+/// 下一個請求狀態
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NextRequestState {
+    Accepted,
+    Ready,
+    Rejected,
+    Failed,
+}
+
+/// 下一個請求回執
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NextRequestResult {
+    /// 請求 token
+    pub token: u64,
+    /// 請求狀態
+    pub state: NextRequestState,
+}
+
 /// 音訊執行緒回報的即時狀態。player_position 固定回 0，前端改讀這個。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -315,6 +352,9 @@ pub struct EngineSnapshot {
     pub playback_state: String, // "Playing" | "WaitingForNext" | "Paused" | "Finished"
     /// 下一首清除 epoch（引擎自行清除時遞增）
     pub next_clear_epoch: u64,
+    pub next_request_result: Option<NextRequestResult>,
+    #[serde(default)]
+    pub next_capacity_epoch: u64,
     /// 真實音量增益 dB（靜音為 None，前端顯示「靜音」）
     pub volume_db: Option<f32>,
     /// 音量曲線
@@ -337,6 +377,10 @@ pub struct EngineSnapshot {
     pub gap_ms: i64,
     /// 去除靜音
     pub silence_removal: bool,
+    /// 最近一次手動載入回執（null 表示尚無；保留至下一次手動載入終態被記錄）
+    pub last_manual_load_result: Option<ManualLoadResult>,
+    /// 手動載入最高受理 token 水位（前端據此捨棄過期或亂序的手動 Load 意圖；預設 0）
+    pub manual_load_token_high_water: u64,
 }
 
 impl Default for EngineSnapshot {
@@ -371,6 +415,8 @@ impl Default for EngineSnapshot {
             next_token: 0,
             playback_state: "Finished".into(),
             next_clear_epoch: 0,
+            next_request_result: None,
+            next_capacity_epoch: 0,
             volume_db: None,
             volume_curve: VolumeCurve::default(),
             loudness_compensation: false,
@@ -382,6 +428,8 @@ impl Default for EngineSnapshot {
             fade_switch_ms: 300,
             gap_ms: 0,
             silence_removal: false,
+            last_manual_load_result: None,
+            manual_load_token_high_water: 0,
         }
     }
 }
@@ -421,6 +469,9 @@ pub struct PendingLoad {
     pub song_id: i64,
     pub token: u64,
     pub rg: (Option<f32>, Option<f32>, Option<f32>, Option<f32>),
+    /// 手動載入意圖：SwitchLoad 淡出由手動載入發起時為 true，淡出完成執行 Load 後
+    /// 以確切 token 記錄終態回執；非手動來源（auto）為 false，不發布回執
+    pub manual: bool,
 }
 
 /// 待安裝的串流來源（已由命令執行緒背景開流完成，等候曲終/gap 耗盡安裝）
@@ -463,9 +514,9 @@ pub enum PlayerCommand {
     Next,
     Prev,
     /// 設定下一首（立即回傳，背景準備）
-    SetNext { path: String, song_id: i64, token: u64, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32> },
+    SetNext { path: String, song_id: i64, token: u64, play_seq: Option<u64>, rg_track_gain: Option<f32>, rg_track_peak: Option<f32>, rg_album_gain: Option<f32>, rg_album_peak: Option<f32> },
     /// 清除下一首
-    ClearNext,
+    ClearNext { no_next: bool, play_seq: Option<u64> },
     Seek { position_ms: i64 },
     SetVolume { volume: f32 },
     SetMode { mode: PlayMode },
@@ -606,4 +657,107 @@ pub struct ConvertRequest {
     pub output_dir: String,
     #[serde(default)]
     pub bitrate_kbps: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_request_snapshot_serializes_receipt_and_capacity() {
+        let mut snapshot = EngineSnapshot::default();
+        snapshot.next_request_result = Some(NextRequestResult {
+            token: 42,
+            state: NextRequestState::Ready,
+        });
+        snapshot.next_capacity_epoch = 8;
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["nextRequestResult"], serde_json::json!({"token": 42, "state": "ready"}));
+        assert_eq!(json["nextCapacityEpoch"], 8);
+        let _ = json.as_object_mut().unwrap().remove("nextRequestResult");
+        let _ = json.as_object_mut().unwrap().remove("nextCapacityEpoch");
+        let deserialized: EngineSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.next_request_result, None);
+        assert_eq!(deserialized.next_capacity_epoch, 0);
+    }
+
+    #[test]
+    fn engine_snapshot_serde_keys_exact() {
+        let snapshot = EngineSnapshot::default();
+        let json = serde_json::to_string(&snapshot).unwrap();
+        // 驗證 camelCase 鍵名（與 #[serde(rename_all = "camelCase")] 對應）
+        assert!(json.contains("\"positionMs\""), "positionMs 鍵缺失");
+        assert!(json.contains("\"durationMs\""), "durationMs 鍵缺失");
+        assert!(json.contains("\"isPlaying\""), "isPlaying 鍵缺失");
+        assert!(json.contains("\"appliedReplaygainDb\""), "appliedReplaygainDb 鍵缺失");
+        assert!(json.contains("\"appliedPreampDb\""), "appliedPreampDb 鍵缺失");
+        assert!(json.contains("\"hasReplaygain\""), "hasReplaygain 鍵缺失");
+        assert!(json.contains("\"rgMode\""), "rgMode 鍵缺失");
+        assert!(json.contains("\"volumeNormMode\""), "volumeNormMode 鍵缺失");
+        assert!(json.contains("\"rgSource\""), "rgSource 鍵缺失");
+        assert!(json.contains("\"playSeq\""), "playSeq 鍵缺失");
+        assert!(json.contains("\"nowToken\""), "nowToken 鍵缺失");
+        assert!(json.contains("\"nextToken\""), "nextToken 鍵缺失");
+        assert!(json.contains("\"playbackState\""), "playbackState 鍵缺失");
+        assert!(json.contains("\"nextClearEpoch\""), "nextClearEpoch 鍵缺失");
+        assert!(json.contains("\"lastManualLoadResult\""), "lastManualLoadResult 鍵缺失");
+        assert!(
+            json.contains("\"manualLoadTokenHighWater\""),
+            "manualLoadTokenHighWater 鍵缺失"
+        );
+    }
+
+    /// 手動載入回執：camelCase 鍵名、預設 null、終態小寫 loaded/failed、可回讀
+    #[test]
+    fn engine_snapshot_manual_load_result_serde() {
+        // 預設值：鍵存在且為 null
+        let json = serde_json::to_string(&EngineSnapshot::default()).unwrap();
+        assert!(json.contains("\"lastManualLoadResult\":null"), "lastManualLoadResult 預設應為 null");
+
+        // loaded 終態：camelCase 鍵 + 小寫 outcome + 確切 token
+        let mut snapshot = EngineSnapshot::default();
+        snapshot.last_manual_load_result = Some(ManualLoadResult { token: 42, outcome: ManualLoadOutcome::Loaded });
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            json.contains("\"lastManualLoadResult\":{\"token\":42,\"outcome\":\"loaded\"}"),
+            "loaded 回執序列化不符: {json}"
+        );
+
+        // failed 終態
+        snapshot.last_manual_load_result = Some(ManualLoadResult { token: 43, outcome: ManualLoadOutcome::Failed });
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"outcome\":\"failed\""), "failed 終態序列化不符: {json}");
+
+        // 回讀：token 與終態原樣還原
+        let back: EngineSnapshot = serde_json::from_str(&json).unwrap();
+        let receipt = back.last_manual_load_result.expect("回執應存在");
+        assert_eq!(receipt.token, 43);
+        assert_eq!(receipt.outcome, ManualLoadOutcome::Failed);
+    }
+
+    /// 手動載入 token 高水位：camelCase 鍵、預設 0、可回讀
+    #[test]
+    fn engine_snapshot_manual_load_token_high_water_serde() {
+        // 預設為 0 且鍵存在
+        let json = serde_json::to_string(&EngineSnapshot::default()).unwrap();
+        assert!(
+            json.contains("\"manualLoadTokenHighWater\":0"),
+            "manualLoadTokenHighWater 預設應為 0: {json}"
+        );
+
+        // 設定後序列化與回讀
+        let mut snapshot = EngineSnapshot::default();
+        snapshot.manual_load_token_high_water = 123;
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            json.contains("\"manualLoadTokenHighWater\":123"),
+            "manualLoadTokenHighWater 序列化不符: {json}"
+        );
+
+        let back: EngineSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.manual_load_token_high_water, 123,
+            "manualLoadTokenHighWater 回讀不符"
+        );
+    }
 }

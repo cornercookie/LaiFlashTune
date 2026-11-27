@@ -392,10 +392,10 @@ fn ffprobe_meta(path: &Path) -> Result<FfprobeMeta, String> {
 /// SE7：標籤大小上限（單欄 4 KB、總計 16 KB），超長則截斷並記錯誤
 const TAG_FIELD_MAX: usize = 4 * 1024;
 const TAG_TOTAL_MAX: usize = 16 * 1024;
-const SAMPLE_RATE_MIN: i32 = 8000;
-const SAMPLE_RATE_MAX: i32 = 384000;
-const CHANNELS_MIN: i32 = 1;
-const CHANNELS_MAX: i32 = 8;
+pub(crate) const SAMPLE_RATE_MIN: i32 = 8000;
+pub(crate) const SAMPLE_RATE_MAX: i32 = 384000;
+pub(crate) const CHANNELS_MIN: i32 = 1;
+pub(crate) const CHANNELS_MAX: i32 = 8;
 
 /// SE7：掃描單一檔案的結果契約
 #[derive(Debug, Clone)]
@@ -693,29 +693,85 @@ fn limited_tag(tag: &Tag, key: &ItemKey, total: &mut usize) -> Result<Option<Str
 }
 
 /// 處理單一音樂檔案。沒有標籤或時長讀不到仍入庫，用檔名當歌名，失敗記入錯誤清單。
+fn native_bounded_for_scan(path: &std::path::Path, masked: &str) -> Result<Option<lofty::TaggedFile>, ScanResult> {
+    use std::io::{Read, Seek};
+    let skipped = || ScanResult::Skipped(vec![ScanError {path: masked.to_owned(),reason:"無法讀取音訊標頭".into()}]);
+
+    let mut f = crate::open_with::open_validated_file(path).map_err(|_| skipped())?;
+
+    let metadata = f.metadata().map_err(|_| skipped())?;
+    if metadata.len() > 50 * 1024 * 1024 {
+        return Ok(None);
+    }
+
+    let mut buf = [0u8; 4];
+    f.rewind().map_err(|_| skipped())?;
+    f.read_exact(&mut buf).map_err(|_| skipped())?;
+
+    f.rewind().map_err(|_| skipped())?;
+    let (result, reason) = match &buf {
+        b"fLaC" => (lofty::flac::scan::read_native_flac_for_scan(&mut f).map(Some), "FLAC 中繼資料無效"),
+        b"OggS" => (lofty::ogg::scan::read_ogg_for_scan(&mut f), "Ogg 中繼資料無效"),
+        b"MAC " => (lofty::ape::read_ape_for_scan(&mut f).map(Some), "APE 中繼資料無效"),
+        b"wvpk" => (lofty::wavpack::read_wavpack_for_scan(&mut f).map(Some), "WavPack 中繼資料無效"),
+        b"RIFF" | b"FORM" => (lofty::iff::scan::read_iff_for_scan(&mut f), "WAV／AIFF 中繼資料無效"),
+        _ if &buf[..3] == b"ID3" || (buf[0] == 0xff && (buf[1] & 0xe0) == 0xe0) => {
+            let kind = lofty::Probe::new(&mut f).guess_file_type()
+                .map_err(|_| skipped())?.file_type();
+            f.rewind().map_err(|_| skipped())?;
+            match kind {
+                Some(lofty::FileType::MPEG) => (lofty::mpeg::read_mpeg_for_scan(&mut f).map(Some), "MP3 中繼資料無效"),
+                Some(lofty::FileType::AAC) => (lofty::aac::read_adts_for_scan(&mut f).map(Some), "AAC 中繼資料無效"),
+                Some(lofty::FileType::FLAC) => (lofty::flac::scan::read_native_flac_for_scan(&mut f).map(Some), "FLAC 中繼資料無效"),
+                Some(lofty::FileType::APE) => (lofty::ape::read_ape_for_scan(&mut f).map(Some), "APE 中繼資料無效"),
+                _ => return Ok(None),
+            }
+        }
+        _ => {
+            if metadata.len() < 8 {
+                return Ok(None);
+            }
+            let mut header = [0; 8];
+            f.read_exact(&mut header).map_err(|_| skipped())?;
+            if &header[4..8] != b"ftyp" {
+                return Ok(None);
+            }
+            f.rewind().map_err(|_| skipped())?;
+            (lofty::mp4::scan::read_mp4_for_scan(&mut f).map(Some), "MP4 中繼資料無效")
+        }
+    };
+    result.map_err(|_| ScanResult::Rejected(vec![ScanError {
+        path: masked.to_owned(),
+        reason: reason.to_owned(),
+    }]))
+}
+
 fn process_single_file(path: &Path) -> ScanResult {
+    // XF2：錯誤輸出統一使用遮蔽後的本機路徑，每檔只計算一次共用。
+    // 檔案系統存取與 NewSong 的曲庫路徑仍使用原始路徑，不受遮蔽影響。
+    let masked_path = crate::open_with::mask_local_path(&path.to_string_lossy());
     // SE1：首次檔案系統存取前必須先驗證本機路徑
     if validate_local_path(path).is_err() {
         return ScanResult::Skipped(vec![ScanError {
-            path: path.to_string_lossy().to_string(),
+            path: masked_path.clone(),
             reason: "路徑驗證失敗，跳過".to_string(),
         }]);
     }
     let Ok(metadata) = std::fs::metadata(path) else {
         return ScanResult::Skipped(vec![ScanError {
-            path: path.to_string_lossy().to_string(),
+            path: masked_path.clone(),
             reason: "無法讀取檔案 metadata，跳過".to_string(),
         }]);
     };
     let Ok(modified) = metadata.modified() else {
         return ScanResult::Skipped(vec![ScanError {
-            path: path.to_string_lossy().to_string(),
+            path: masked_path.clone(),
             reason: "無法讀取檔案修改時間，跳過".to_string(),
         }]);
     };
     let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
         return ScanResult::Skipped(vec![ScanError {
-            path: path.to_string_lossy().to_string(),
+            path: masked_path.clone(),
             reason: "檔案修改時間異常，跳過".to_string(),
         }]);
     };
@@ -726,26 +782,35 @@ fn process_single_file(path: &Path) -> ScanResult {
 
     let mut errors = Vec::new();
 
-    // SE7：封面預檢（在 lofty::read_from_path 之前偵測嵌入圖片；偵測到則直接拒絕入庫）
-    match has_embedded_cover_precheck(path) {
-        Ok(CoverStatus::HasCover) => {
+    let native = match native_bounded_for_scan(path, &masked_path) {
+        Ok(result) => result,
+        Err(outcome) => return outcome,
+    };
+    let use_legacy_lofty = !matches!(
+        format.as_deref().and_then(meta_backend_for), Some(MetaBackend::Ffprobe),
+    );
+    if native.is_none() && use_legacy_lofty {
+        // SE7：封面預檢（在 lofty::read_from_path 之前偵測嵌入圖片；偵測到則直接拒絕入庫）
+        match has_embedded_cover_precheck(path) {
+            Ok(CoverStatus::HasCover) => {
+                errors.push(ScanError {
+                    path: masked_path.clone(),
+                    reason: "檔案包含嵌入封面，拒絕入庫".to_string(),
+                });
+                return ScanResult::Rejected(errors);
+            }
+            // NoCover / CheckFailed：fail-open，交由 lofty/ffprobe 後續處理；驗證失敗不自動拒絕
+            Ok(CoverStatus::NoCover) | Ok(CoverStatus::CheckFailed) | Err(_) => {}
+        }
+
+        // SE7：配置前標籤大小預檢（在 lofty::read_from_path 之前；總標籤超標則拒絕整檔）
+        if let Err(reason) = precheck_tag_budget(path) {
             errors.push(ScanError {
-                path: path.to_string_lossy().to_string(),
-                reason: "檔案包含嵌入封面，拒絕入庫".to_string(),
+                path: masked_path.clone(),
+                reason,
             });
             return ScanResult::Rejected(errors);
         }
-        // NoCover / CheckFailed：fail-open，交由 lofty/ffprobe 後續處理；驗證失敗不自動拒絕
-        Ok(CoverStatus::NoCover) | Ok(CoverStatus::CheckFailed) | Err(_) => {}
-    }
-
-    // SE7：配置前標籤大小預檢（在 lofty::read_from_path 之前；總標籤超標則拒絕整檔）
-    if let Err(reason) = precheck_tag_budget(path) {
-        errors.push(ScanError {
-            path: path.to_string_lossy().to_string(),
-            reason,
-        });
-        return ScanResult::Rejected(errors);
     }
 
     let mut duration_ms = 0i64;
@@ -758,7 +823,9 @@ fn process_single_file(path: &Path) -> ScanResult {
     const LOFTY_MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50 MB
 
     // 嘗試 lofty 讀取（≤ 50 MB，且未偵測到嵌入封面）
-    let lofty_result = if metadata.len() <= LOFTY_MAX_FILE_SIZE {
+    let lofty_result = if native.is_some() {
+        native
+    } else if use_legacy_lofty && metadata.len() <= LOFTY_MAX_FILE_SIZE {
         lofty::read_from_path(path).ok()
     } else {
         None
@@ -779,8 +846,8 @@ fn process_single_file(path: &Path) -> ScanResult {
                 (ItemKey::AlbumArtist, "album_artist"),
                 (ItemKey::Genre, "genre"),
                 (ItemKey::Year, "date"),
-                (ItemKey::TrackNumber, "track_number"),
-                (ItemKey::DiscNumber, "disc_number"),
+                (ItemKey::TrackNumber, "track"),
+                (ItemKey::DiscNumber, "disc"),
             ] {
                 match limited_tag(tag, &key, &mut total_tag_bytes) {
                     Ok(Some(s)) => {
@@ -791,9 +858,10 @@ fn process_single_file(path: &Path) -> ScanResult {
                     }
                     Err(_) => {
                         // 第二層裁切：單欄超長或總長超標，記錄 ScanError，繼續其他欄位
+                        // XF2：reason 不回顯標籤鍵名，改用靜態訊息
                         errors.push(ScanError {
-                            path: path.to_string_lossy().to_string(),
-                            reason: format!("標籤欄位 {:?} 超過大小上限，已捨棄", key),
+                            path: masked_path.clone(),
+                            reason: "標籤欄位超過大小上限，已捨棄".to_string(),
                         });
                     }
                 }
@@ -846,15 +914,16 @@ fn process_single_file(path: &Path) -> ScanResult {
             Ok(meta) => {
                 for (k, v) in meta.tags {
                     if v.len() > TAG_FIELD_MAX {
+                        // XF2：reason 不回顯來自檔案的標籤鍵名，改用靜態訊息
                         errors.push(ScanError {
-                            path: path.to_string_lossy().to_string(),
-                            reason: format!("ffprobe 標籤欄位 {k} 超過 {TAG_FIELD_MAX} bytes 上限，已捨棄"),
+                            path: masked_path.clone(),
+                            reason: format!("ffprobe 標籤欄位超過 {TAG_FIELD_MAX} bytes 上限，已捨棄"),
                         });
                         continue;
                     }
                     if total_tag_bytes + v.len() > TAG_TOTAL_MAX {
                         errors.push(ScanError {
-                            path: path.to_string_lossy().to_string(),
+                            path: masked_path.clone(),
                             reason: "ffprobe 標籤總長超過上限，已捨棄後續欄位".to_string(),
                         });
                         break;
@@ -874,8 +943,10 @@ fn process_single_file(path: &Path) -> ScanResult {
                 bitrate = meta.bitrate;
             }
             Err(e) => {
+                // XF2：ffprobe 錯誤字串皆為既定的通用訊息（找不到執行檔、逾時、配額、JSON 解析失敗等），
+                // 不含子程序原始輸出，直接沿用
                 errors.push(ScanError {
-                    path: path.to_string_lossy().to_string(),
+                    path: masked_path.clone(),
                     reason: e,
                 });
                 return ScanResult::Rejected(errors);
@@ -888,14 +959,14 @@ fn process_single_file(path: &Path) -> ScanResult {
     match sample_rate {
         Some(0) => {
             errors.push(ScanError {
-                path: path.to_string_lossy().to_string(),
+                path: masked_path.clone(),
                 reason: "取樣率為 0，視為非法值".to_string(),
             });
             rejected = true;
         }
         Some(sr) if sr < SAMPLE_RATE_MIN || sr > SAMPLE_RATE_MAX => {
             errors.push(ScanError {
-                path: path.to_string_lossy().to_string(),
+                path: masked_path.clone(),
                 reason: format!("取樣率 {sr} Hz 超出有效範圍"),
             });
             rejected = true;
@@ -905,14 +976,14 @@ fn process_single_file(path: &Path) -> ScanResult {
     match channels {
         Some(0) => {
             errors.push(ScanError {
-                path: path.to_string_lossy().to_string(),
+                path: masked_path.clone(),
                 reason: "聲道為 0，視為非法值".to_string(),
             });
             rejected = true;
         }
         Some(ch) if ch < CHANNELS_MIN || ch > CHANNELS_MAX => {
             errors.push(ScanError {
-                path: path.to_string_lossy().to_string(),
+                path: masked_path.clone(),
                 reason: format!("聲道 {ch} 超出有效範圍"),
             });
             rejected = true;
@@ -1140,5 +1211,318 @@ mod tests {
         assert!(oversized.len() > TAG_FIELD_MAX);
         assert!(within.len() <= TAG_FIELD_MAX);
         assert!(within.len() <= TAG_TOTAL_MAX);
+    }
+
+    /// XF2：早期拒絕（遠端路徑）時，ScanError.path 應為遮蔽後路徑，不外洩使用者目錄。
+    /// 選 UNC 路徑是因為 validate_local_path 的步驟 1 在任何檔案系統存取前就以字串檢查拒絕，
+    /// 測試結果與本機暫存檔或使用者檔案無關，任何環境下都一致。
+    #[test]
+    fn test_process_single_file_masks_path_on_early_unsupported() {
+        let path = Path::new(r"\\server\Users\alice\Music\song.mp3");
+        match process_single_file(path) {
+            ScanResult::Skipped(errors) => {
+                assert_eq!(errors.len(), 1, "遠端路徑應產生一筆 Skipped 錯誤");
+                assert_eq!(
+                    errors[0].path,
+                    r"\\server\Users\%USER%\Music\song.mp3",
+                    "使用者目錄應遮蔽為 %USER%"
+                );
+                assert_eq!(errors[0].reason, "路徑驗證失敗，跳過");
+            }
+            other => panic!("遠端路徑應走 Skipped，實際為 {:?}", other),
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生跨頁註解的 Ogg Vorbis 與 Opus"]
+    fn bounded_ogg_scan_keeps_normal_tags_after_discarding_long_comments() {
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        let metadata = folder.path().join("normal.ffmetadata");
+        std::fs::write(&metadata, format!(
+            ";FFMETADATA1\ncomment={}\ntitle=Ogg scan fixture\nREPLAYGAIN_TRACK_GAIN=-7.25 dB\n",
+            "q".repeat(270 * 1024),
+        )).unwrap();
+
+        for (name, codec) in [("comments.ogg", "libvorbis"), ("comments.opus", "libopus")] {
+            let path = folder.path().join(name);
+            let mut generate = std::process::Command::new(&ffmpeg);
+            generate.args([
+                "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.3", "-f", "ffmetadata", "-i",
+            ]).arg(&metadata).args(["-map_metadata", "1", "-c:a", codec]).arg(&path)
+                .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                generate.creation_flags(0x0800_0000);
+            }
+            assert!(generate.status().unwrap().success(), "failed to generate {name}");
+            assert!(path.metadata().unwrap().len() > 256 * 1024);
+            let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+            let tag = tagged.primary_tag().unwrap();
+            assert_eq!(tag.get_string(&lofty::ItemKey::TrackTitle), Some("Ogg scan fixture"));
+            assert_eq!(tag.get_string(&lofty::ItemKey::Comment), None);
+            assert!(tagged.properties().audio_bitrate().is_some_and(|bitrate| bitrate <= 256));
+
+            match process_single_file(&path) {
+                ScanResult::Song(song, errors) => {
+                    assert!(errors.is_empty());
+                    assert_eq!(song.title.as_deref(), Some("Ogg scan fixture"));
+                    assert_eq!(song.sample_rate, Some(48_000));
+                    assert_eq!(song.channels, Some(1));
+                    assert_eq!(song.replaygain_track_gain, Some(-7.25));
+                    assert!((290..=310).contains(&song.duration_ms), "{name}: {}", song.duration_ms);
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生帶有正常 APEv2 標籤的 WavPack"]
+    fn bounded_ape_tags_keep_wavpack_audio_properties_and_short_fields() {
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("fixture.wv");
+        let comment = format!("comment={}", "w".repeat(8_192));
+        let mut generate = std::process::Command::new(&ffmpeg);
+        generate.args([
+            "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.3", "-c:a", "wavpack",
+            "-metadata", &comment, "-metadata", "title=WavPack scan fixture",
+            "-metadata", "REPLAYGAIN_TRACK_GAIN=-6.5 dB",
+        ]).arg(&path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            generate.creation_flags(0x0800_0000);
+        }
+        assert!(generate.status().unwrap().success());
+        let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert_eq!(tag.get_string(&lofty::ItemKey::Comment), None);
+        match process_single_file(&path) {
+            ScanResult::Song(song, errors) => {
+                assert!(errors.is_empty());
+                assert_eq!(song.title.as_deref(), Some("WavPack scan fixture"));
+                assert_eq!(song.sample_rate, Some(48_000));
+                assert_eq!(song.channels, Some(1));
+                assert_eq!(song.replaygain_track_gain, Some(-6.5));
+                assert_eq!(song.duration_ms, 300);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生合成 ID3v2.3 與 ID3v2.4 MP3"]
+    fn bounded_id3_tags_keep_mpeg_title_and_properties() {
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        for version in ["3", "4"] {
+            let path = folder.path().join(format!("fixture-v{version}.mp3"));
+            let comment = format!("comment={}", "m".repeat(8_192));
+            let mut generate = std::process::Command::new(&ffmpeg);
+            generate.args([
+                "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=44100:duration=0.3", "-c:a", "libmp3lame",
+                "-id3v2_version", version, "-metadata", &comment, "-metadata", "title=MP3 scan fixture",
+                "-metadata", "REPLAYGAIN_TRACK_GAIN=-5.0 dB",
+            ]).arg(&path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                generate.creation_flags(0x0800_0000);
+            }
+            assert!(generate.status().unwrap().success());
+            let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+            let tag = tagged.primary_tag().unwrap();
+            assert_eq!(tag.get_string(&lofty::ItemKey::Comment), None);
+            match process_single_file(&path) {
+                ScanResult::Song(song, errors) => {
+                    assert!(errors.is_empty());
+                    assert_eq!(song.title.as_deref(), Some("MP3 scan fixture"));
+                    assert_eq!(song.sample_rate, Some(44_100));
+                    assert_eq!(song.channels, Some(1));
+                    assert_eq!(song.replaygain_track_gain, Some(-5.0));
+                    assert!((285..=370).contains(&song.duration_ms));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生合成 WAV 與 AIFF"]
+    fn bounded_iff_scan_keeps_audio_properties_and_short_id3_fields() {
+        use lofty::TagExt;
+
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        let mut tags = lofty::Tag::new(lofty::TagType::ID3v2);
+        assert!(tags.insert_text(lofty::ItemKey::TrackTitle, "IFF scan fixture".into()));
+        assert!(tags.insert_text(lofty::ItemKey::Comment, "t".repeat(8_192)));
+        let mut tag_bytes = Vec::new();
+        tags.dump_to(&mut tag_bytes).unwrap();
+        assert!(tag_bytes.len() > 4_096);
+
+        for (name, codec, little_endian) in [
+            ("tagged.wav", "pcm_s16le", true),
+            ("tagged.aiff", "pcm_s16be", false),
+        ] {
+            let path = folder.path().join(name);
+            let mut generate = std::process::Command::new(&ffmpeg);
+            generate.args([
+                "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.3", "-c:a", codec,
+            ]).arg(&path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                generate.creation_flags(0x0800_0000);
+            }
+            assert!(generate.status().unwrap().success());
+            let size_bytes = |size: usize| {
+                let size = u32::try_from(size).unwrap();
+                if little_endian { size.to_le_bytes() } else { size.to_be_bytes() }
+            };
+            let mut audio = std::fs::read(&path).unwrap();
+            audio.extend_from_slice(b"ID3 ");
+            audio.extend_from_slice(&size_bytes(tag_bytes.len()));
+            audio.extend_from_slice(&tag_bytes);
+            if tag_bytes.len() % 2 != 0 {
+                audio.push(0);
+            }
+            let size = size_bytes(audio.len() - 8);
+            audio[4..8].copy_from_slice(&size);
+            std::fs::write(&path, audio).unwrap();
+            let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+            assert_eq!(tagged.primary_tag().unwrap().get_string(&lofty::ItemKey::Comment), None);
+            match process_single_file(&path) {
+                ScanResult::Song(song, errors) => {
+                    assert!(errors.is_empty());
+                    assert_eq!(song.title.as_deref(), Some("IFF scan fixture"));
+                    assert_eq!(song.sample_rate, Some(48_000));
+                    assert_eq!(song.channels, Some(1));
+                    assert_eq!(song.duration_ms, 300);
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生有標題、曲號及封面的正常 AAC"]
+    fn bounded_mp4_scan_keeps_aac_properties_without_reading_cover_or_long_comment() {
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("fixture.m4a");
+        let artwork = folder.path().join("fixture.png");
+        image::RgbImage::from_pixel(4, 4, image::Rgb([40, 80, 120])).save(&artwork).unwrap();
+        let comment = format!("comment={}", "p".repeat(8_192));
+        let mut generate = std::process::Command::new(&ffmpeg);
+        generate.args([
+            "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+            "sine=frequency=440:sample_rate=48000:duration=0.3", "-i",
+        ]).arg(&artwork).args([
+            "-map", "0:a", "-map", "1:v", "-c:a", "aac", "-c:v", "png",
+            "-disposition:v", "attached_pic", "-movflags", "+faststart",
+            "-metadata", &comment, "-metadata", "title=MP4 scan fixture", "-metadata", "track=2/7",
+        ]).arg(&path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            generate.creation_flags(0x0800_0000);
+        }
+        assert!(generate.status().unwrap().success());
+        let default_tags = lofty::read_from_path(&path).unwrap();
+        let original = default_tags.primary_tag().unwrap();
+        assert!(!original.pictures().is_empty());
+        assert_eq!(original.get_string(&lofty::ItemKey::TrackNumber), Some("2"));
+        let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        assert!(tag.pictures().is_empty());
+        assert_eq!(tag.get_string(&lofty::ItemKey::Comment), None);
+        match process_single_file(&path) {
+            ScanResult::Song(song, errors) => {
+                assert!(errors.is_empty());
+                assert_eq!(song.title.as_deref(), Some("MP4 scan fixture"));
+                assert_eq!(song.track_number, Some(2));
+                assert_eq!(song.sample_rate, Some(48_000));
+                assert_eq!(song.channels, Some(1));
+                assert!((290..=350).contains(&song.duration_ms));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    #[ignore = "需要本機 FFmpeg 產生標準 ADTS AAC 與原生 FLAC"]
+    fn bounded_scan_keeps_audio_properties_with_external_id3_prefixes() {
+        use lofty::TagExt;
+
+        let ffmpeg = crate::tools::locate("ffmpeg.exe").unwrap().0;
+        let folder = tempfile::tempdir().unwrap();
+        let mut tags = lofty::Tag::new(lofty::TagType::ID3v2);
+        assert!(tags.insert_text(lofty::ItemKey::TrackTitle, "ID3 prefix fixture".into()));
+        assert!(tags.insert_text(lofty::ItemKey::Comment, "l".repeat(8_192)));
+        let mut prefix = Vec::new();
+        tags.dump_to(&mut prefix).unwrap();
+        for (name, codec, format) in [
+            ("prefixed.aac", "aac", "adts"),
+            ("prefixed.flac", "flac", "flac"),
+        ] {
+            let path = folder.path().join(name);
+            let mut generate = std::process::Command::new(&ffmpeg);
+            generate.args([
+                "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+                "sine=frequency=440:sample_rate=48000:duration=0.3", "-c:a", codec, "-f", format,
+            ]).arg(&path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                generate.creation_flags(0x0800_0000);
+            }
+            assert!(generate.status().unwrap().success());
+            let mut file_bytes = prefix.clone();
+            file_bytes.extend_from_slice(&std::fs::read(&path).unwrap());
+            std::fs::write(&path, file_bytes).unwrap();
+
+            let tagged = native_bounded_for_scan(&path, "fixture").unwrap().unwrap();
+            let id3 = tagged.tag(lofty::TagType::ID3v2).unwrap();
+            assert_eq!(id3.get_string(&lofty::ItemKey::TrackTitle), Some("ID3 prefix fixture"));
+            assert_eq!(id3.get_string(&lofty::ItemKey::Comment), None);
+            match process_single_file(&path) {
+                ScanResult::Song(song, errors) => {
+                    assert!(errors.is_empty());
+                    assert_eq!(song.sample_rate, Some(48_000));
+                    assert_eq!(song.channels, Some(1));
+                    assert!((240..=400).contains(&song.duration_ms), "{name}: {}", song.duration_ms);
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    #[test] fn native_flac_scan_reaches_song() {
+        use super::*;
+
+        use std::path::Path;
+        use std::env;
+
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/formats/sample_44100_stereo.flac");
+        assert!(native_bounded_for_scan(&path, "fixture").unwrap().is_some());
+
+        match process_single_file(&path) {
+            ScanResult::Song(song, errors) => {
+                assert!(errors.is_empty());
+                assert_eq!(song.sample_rate, Some(44100));
+                assert_eq!(song.channels, Some(2));
+                assert_eq!(song.duration_ms, 3000);
+                assert!(song.cover_path.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

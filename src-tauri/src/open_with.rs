@@ -59,7 +59,7 @@ fn dos_path_root(p: &str) -> String {
 /// 遮蔽本機路徑中的用戶目錄與敏感資訊（SE3-4）。
 /// Windows: C:\\Users\\<user>\\... -> C:\\Users\\%USER%\\...
 /// Unix: /home/<user>/... -> /home/%USER%/...
-fn mask_local_path(path: &str) -> String {
+pub(crate) fn mask_local_path(path: &str) -> String {
     // Windows 用戶目錄
     if let Some(pos) = path.to_ascii_lowercase().find(r"\users\") {
         let after = &path[pos + 7..]; // 跳過 "\users\"
@@ -312,6 +312,17 @@ mod sanitizer_tests {
     }
 
     #[test]
+    fn test_sanitizer_cross_chunk_non_url_query_removed() {
+        let mut s = Sanitizer::new();
+        s.sanitize_chunk("file.mp3?param=");
+        s.sanitize_chunk("value\n");
+        let result = s.finish();
+        assert!(result.contains("file.mp3"), "ordinary label should be preserved: {result}");
+        assert!(!result.contains("param="), "non-url query should be removed across chunks: {result}");
+        assert!(!result.contains("value"), "query continuation should be removed: {result}");
+    }
+
+    #[test]
     fn test_sanitizer_cross_chunk_url_preserved() {
         let mut s = Sanitizer::new();
         let part1 = s.sanitize_chunk("https://host/");
@@ -319,158 +330,387 @@ mod sanitizer_tests {
         let result = s.finish();
         assert!(result.contains("https://host/path"), "URL should be preserved across chunks: {result}");
     }
+
+    /// 最小分塊不變性：以分塊大小 1 逐字元輸入，結果必須與一次全量輸入相同。
+    /// 使用安全合成字串（不含真實憑證、不含攻擊 URL）。
+    #[test]
+    fn test_sanitizer_minimal_chunk_invariance() {
+        let cases = [
+            "https://example.com/music/song.mp3",
+            "普通日誌行，含問號?但不是 URL",
+            "https://example.com/audio?token=abc&foo=bar 結束",
+            "無特殊字元的普通文字",
+        ];
+        for input in &cases {
+            // 全量一次輸入
+            let full = sanitize_log(input);
+
+            // 分塊大小 1，逐字元呼叫 sanitize_chunk
+            let mut s = Sanitizer::new();
+            for ch in input.chars() {
+                s.sanitize_chunk(&ch.to_string());
+            }
+            let chunked = s.finish();
+
+            assert_eq!(
+                full, chunked,
+                "minimal chunk invariance failed for input={input:?}: full={full:?}, chunked={chunked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_log_single_finish() {
+        // 單次 sanitize_log 可正常 finish，結果不為 panic 且長度 ≤ 1024
+        let input = "https://safe.example.com/track?token=secret";
+        let output = sanitize_log(input);
+        assert!(output.len() <= 1024);
+        assert!(!output.contains("token="));
+    }
 }
 
 
-/// 有狀態的日誌清洗器，跨讀取區塊保留 URL/查詢參數辨識狀態（SE3）
+/// 有狀態的日誌清洗器，跨讀取區塊保留 URL 辨識狀態（SE3）
 /// 調用者可在區塊之間重複使用同一個 Sanitizer 實例，避免憑證跨區塊殘留。
 pub struct Sanitizer {
     result: String,
-    in_url: bool,
-    in_query: bool,
-    in_non_url_query: bool,
+    state: State,
+    /// 已辨識的 scheme（保留原始大小寫），於 authority 提交時一併輸出
+    scheme: String,
+    /// authority 累積緩衝；遇到 `@` 後只保留 `@` 之後的 host
+    authority: String,
+    /// authority 曾出現 `@`，提交時以 `***@` 取代 userinfo
+    masked: bool,
+    /// 輸出達到上限後永久停止追加，直到 take_result 重置
+    result_truncated: bool,
+    /// Text 狀態下保留的極短 scheme 前綴（跨區塊、大小寫不敏感）
+    pending_prefix: String,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum State {
+    Text,
+    Authority,
+    Path,
+    Hidden,
+    Discard,
+}
+
+/// 單次輸出上限（bytes）
+const MAX_OUTPUT: usize = 1024;
+/// authority 累積上限（bytes）
+const MAX_AUTHORITY: usize = 1024;
+/// scheme 最長為 `https://`（8 bytes），前綴保留不需更長
+const MAX_PENDING_PREFIX: usize = 8;
+
+/// 支援的 scheme（小寫），用於跨區塊前綴匹配。
+const URL_SCHEMES: &[&str] = &["http://", "https://"];
 
 impl Sanitizer {
     pub fn new() -> Self {
         Self {
             result: String::new(),
-            in_url: false,
-            in_query: false,
-            in_non_url_query: false,
+            state: State::Text,
+            scheme: String::new(),
+            authority: String::new(),
+            masked: false,
+            result_truncated: false,
+            pending_prefix: String::new(),
         }
     }
 
-    /// 處理一個字符串區塊，返回清洗後的結果。區塊之間狀態保留。
+    /// 判斷 `s`（小寫）是否為任一 scheme 的前綴。
+    fn is_scheme_prefix(s: &str) -> bool {
+        !s.is_empty() && URL_SCHEMES.iter().any(|scheme| scheme.starts_with(s))
+    }
+
+    /// 判斷 `s`（小寫）是否正好等於某個完整 scheme。
+    fn is_complete_scheme(s: &str) -> bool {
+        URL_SCHEMES.iter().any(|scheme| *scheme == s)
+    }
+
+    /// 追加單一字元，總輸出不超過 MAX_OUTPUT。
+    /// 僅保留 baseline 可顯示字元（ASCII printable 與 tab/CR/LF）；其他字元直接忽略，
+    /// 避免輸出 lossy UTF-8 替代字元或 Unicode 控制字元。
+    /// 第一次放不下後永久停止輸出，直到 take_result 重置。
+    fn push_char_bounded(&mut self, c: char) {
+        if self.result_truncated {
+            return;
+        }
+        let baseline = c.is_ascii_graphic() || c == ' ' || c == '\t' || c == '\r' || c == '\n';
+        if !baseline {
+            return;
+        }
+        if self.result.len() + 1 <= MAX_OUTPUT {
+            self.result.push(c);
+        } else {
+            self.result_truncated = true;
+        }
+    }
+
+    /// 追加字串，逐字元受 MAX_OUTPUT 限制。
+    fn push_str_bounded(&mut self, s: &str) {
+        for c in s.chars() {
+            self.push_char_bounded(c);
+        }
+    }
+
+    /// 將待決 scheme 前綴視為一般文字輸出並清空。
+    fn flush_pending(&mut self) {
+        let pending = std::mem::take(&mut self.pending_prefix);
+        self.push_str_bounded(&pending);
+    }
+
+    /// 檢查 authority 是否為可接受的 hostname / bracket IPv6 + 可選數字 port。
+    fn is_valid_authority(authority: &str) -> bool {
+        if authority.is_empty() {
+            return false;
+        }
+
+        // bracket IPv6，例如 [::1]、[2001:db8::1]:8080
+        if let Some(rest) = authority.strip_prefix('[') {
+            let end = match rest.find(']') {
+                Some(i) => i,
+                None => return false,
+            };
+            let inner = &rest[..end];
+            if inner.parse::<std::net::Ipv6Addr>().is_err() {
+                return false;
+            }
+            let after = &rest[end + 1..];
+            if after.is_empty() {
+                return true;
+            }
+            return match after.strip_prefix(':') {
+                Some(port) => !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()),
+                None => false,
+            };
+        }
+
+        // 一般 hostname，可帶單一 :port
+        let (host, port) = match authority.rfind(':') {
+            Some(i) => {
+                let host = &authority[..i];
+                let port = &authority[i + 1..];
+                if host.contains(':') {
+                    return false;
+                }
+                (host, Some(port))
+            }
+            None => (authority, None),
+        };
+
+        if let Some(port) = port {
+            if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+
+        if host.is_empty()
+            || host.starts_with('.')
+            || host.starts_with('-')
+            || host.ends_with('-')
+            || host.contains("..")
+        {
+            return false;
+        }
+
+        host.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    }
+
+    /// 提交 authority：合法時輸出 scheme（必要時加 `***@`）與 host，否則丟棄。
+    fn commit_authority(&mut self) -> bool {
+        let authority = std::mem::take(&mut self.authority);
+        let scheme = std::mem::take(&mut self.scheme);
+        let masked = self.masked;
+        self.masked = false;
+
+        if !Self::is_valid_authority(&authority) {
+            return false;
+        }
+
+        self.push_str_bounded(&scheme);
+        if masked {
+            self.push_str_bounded("***@");
+        }
+        self.push_str_bounded(&authority);
+        true
+    }
+
+    /// Text 狀態：一般文字輸出，同時保留可能的 scheme 前綴。
+    fn handle_text(&mut self, c: char) {
+        if c.is_whitespace() {
+            self.flush_pending();
+            self.push_char_bounded(c);
+            return;
+        }
+        if c == '?' {
+            // 一般文字中的 ? 延續 baseline：視為查詢起點，隱藏至空白
+            self.flush_pending();
+            self.state = State::Hidden;
+            return;
+        }
+
+        self.pending_prefix.push(c);
+        loop {
+            let lower = self.pending_prefix.to_ascii_lowercase();
+            if Self::is_complete_scheme(&lower) {
+                self.scheme = std::mem::take(&mut self.pending_prefix);
+                self.authority.clear();
+                self.masked = false;
+                self.state = State::Authority;
+                break;
+            }
+            if Self::is_scheme_prefix(&lower) {
+                break;
+            }
+
+            // 不是 scheme 前綴：輸出第一個字元，保留剩餘可能重疊的後綴
+            let first = match self.pending_prefix.chars().next() {
+                Some(ch) => ch,
+                None => break,
+            };
+            self.pending_prefix.remove(0);
+            self.push_char_bounded(first);
+            if self.pending_prefix.is_empty() {
+                break;
+            }
+        }
+
+        // 防禦性上限；正常情況下 pending 只會是 ≤ 8 bytes 的 scheme 前綴
+        if self.pending_prefix.len() > MAX_PENDING_PREFIX {
+            self.flush_pending();
+        }
+    }
+
+    /// Authority 狀態：累積 host/userinfo，於分隔符提交。
+    fn handle_authority(&mut self, c: char) {
+        if c == '@' {
+            // 丟棄 userinfo，重新累積 `@` 之後的 host
+            self.authority.clear();
+            self.masked = true;
+            return;
+        }
+
+        if c == '/' {
+            if self.commit_authority() {
+                self.state = State::Path;
+                self.push_char_bounded('/');
+            } else {
+                self.state = State::Discard;
+            }
+            return;
+        }
+
+        if c == '?' || c == '#' {
+            if self.commit_authority() {
+                self.state = State::Hidden;
+            } else {
+                self.state = State::Discard;
+            }
+            return;
+        }
+
+        if c.is_whitespace() {
+            self.commit_authority();
+            self.state = State::Text;
+            self.push_char_bounded(c);
+            return;
+        }
+
+        if self.authority.len() + c.len_utf8() <= MAX_AUTHORITY {
+            self.authority.push(c);
+        } else {
+            // 超過上限：立即丟棄整個 URL，進入 Discard 後 `@` 不再恢復
+            self.authority.clear();
+            self.scheme.clear();
+            self.masked = false;
+            self.state = State::Discard;
+        }
+    }
+
+    /// Path 狀態：保留路徑（含 `@`），遇到 query/fragment 進入 Hidden。
+    fn handle_path(&mut self, c: char) {
+        if c == '?' || c == '#' {
+            self.state = State::Hidden;
+            return;
+        }
+        if c.is_whitespace() {
+            self.state = State::Text;
+            self.push_char_bounded(c);
+            return;
+        }
+        self.push_char_bounded(c);
+    }
+
+    /// Hidden / Discard 狀態：消耗至空白，空白輸出後回到 Text。
+    fn handle_hidden_or_discard(&mut self, c: char) {
+        if c.is_whitespace() {
+            self.state = State::Text;
+            self.push_char_bounded(c);
+        }
+    }
+
+    /// 處理一個字符串區塊；狀態跨區塊保留，回傳值固定為空字串。
     pub fn sanitize_chunk(&mut self, chunk: &str) -> String {
-        let mut out = String::with_capacity(chunk.len());
-        let mut chars = chunk.chars().peekable();
-        while let Some(c) = chars.next() {
+        for c in chunk.chars() {
             if c.is_control() && c != '\t' && c != '\n' && c != '\r' {
                 continue;
             }
-            if self.in_query {
-                if c.is_whitespace() {
-                    self.in_query = false;
-                    self.in_url = false;
-                    out.push(c);
-                }
-                continue;
-            }
-            if self.in_non_url_query {
-                if c.is_whitespace() {
-                    self.in_non_url_query = false;
-                    out.push(c);
-                }
-                continue;
-            }
-            if !self.in_url && (c == 'h' || c == 'H') {
-                let mut potential = String::new();
-                potential.push(c);
-                let mut temp_chars = chars.clone();
-                let mut https_chars = temp_chars.clone();
-                let mut https_potential = potential.clone();
-                for expected in ['t', 't', 'p', 's', ':', '/', '/'] {
-                    if let Some(&next_c) = https_chars.peek() {
-                        if next_c.to_ascii_lowercase() == expected {
-                            https_potential.push(next_c);
-                            https_chars.next();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if https_potential.to_ascii_lowercase().starts_with("https://") {
-                    self.in_url = true;
-                    out.push_str(&https_potential);
-                    chars = https_chars;
-                    continue;
-                }
-                let mut http_chars = temp_chars.clone();
-                let mut http_potential = potential.clone();
-                for expected in ['t', 't', 'p', ':', '/', '/'] {
-                    if let Some(&next_c) = http_chars.peek() {
-                        if next_c.to_ascii_lowercase() == expected {
-                            http_potential.push(next_c);
-                            http_chars.next();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if http_potential.to_ascii_lowercase().starts_with("http://") {
-                    self.in_url = true;
-                    out.push_str(&http_potential);
-                    chars = http_chars;
-                    continue;
-                }
-                // SE3-006: file:// URL 支援
-                let mut file_chars = temp_chars.clone();
-                let mut file_potential = potential.clone();
-                for expected in ['i', 'l', 'e', ':', '/', '/'] {
-                    if let Some(&next_c) = file_chars.peek() {
-                        if next_c.to_ascii_lowercase() == expected {
-                            file_potential.push(next_c);
-                            file_chars.next();
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                if file_potential.to_ascii_lowercase().starts_with("file://") {
-                    self.in_url = true;
-                    out.push_str(&file_potential);
-                    chars = file_chars;
-                    continue;
-                }
-            }
-            if self.in_url {
-                if c == '?' {
-                    self.in_query = true;
-                    continue;
-                }
-                if c == '@' {
-                    if let Some(pos) = out.rfind("://") {
-                        out.truncate(pos + 3);
-                        out.push_str("***@");
-                    } else {
-                        out.push(c);
-                    }
-                    continue;
-                }
-                if c.is_whitespace() || c.is_control() {
-                    self.in_url = false;
-                }
-            } else if c == '?' {
-                // 非 URL 環境下遇到 ?，進入查詢參數移除模式
-                self.in_non_url_query = true;
-                continue;
-            }
-            // 保留可列印字符、空格、tab、換行符（SE3-2）
-            if c.is_ascii_graphic() || c == ' ' || c == '\t' || c == '\n' || c == '\r' {
-                out.push(c);
+            match self.state {
+                State::Text => self.handle_text(c),
+                State::Authority => self.handle_authority(c),
+                State::Path => self.handle_path(c),
+                State::Hidden | State::Discard => self.handle_hidden_or_discard(c),
             }
         }
-        self.result.push_str(&out); out
+        String::new()
     }
 
-    pub fn finish(&mut self) -> String {
-        if self.result.len() > 1024 {
-            self.result.truncate(1024);
+    /// 以位元組上限截斷，並確保不切斷多位元組 UTF-8 字元。
+    fn take_result(&mut self) -> String {
+        if self.result.len() > MAX_OUTPUT {
+            let mut cut = MAX_OUTPUT;
+            while cut > 0 && !self.result.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.result.truncate(cut);
         }
+        self.result_truncated = false;
         std::mem::take(&mut self.result)
+    }
+
+    /// 結束完整輸入：提交待決文字與 authority，回傳清洗結果。
+    pub fn finish(&mut self) -> String {
+        if !self.pending_prefix.is_empty() {
+            self.flush_pending();
+        }
+        if self.state == State::Authority {
+            self.commit_authority();
+        }
+        self.state = State::Text;
+        self.scheme.clear();
+        self.authority.clear();
+        self.masked = false;
+        self.take_result()
+    }
+
+    /// 結束不完整輸入：丟棄待決 scheme 前綴與 authority，只回傳已確認輸出。
+    pub fn finish_incomplete(&mut self) -> String {
+        self.pending_prefix.clear();
+        self.authority.clear();
+        self.scheme.clear();
+        self.masked = false;
+        self.state = State::Text;
+        self.take_result()
     }
 }
 
 impl Drop for Sanitizer {
     fn drop(&mut self) {
-        let _ = self.finish();
+        // 保守清理：不信任未完成的 authority，丟棄結果
+        let _ = self.finish_incomplete();
     }
 }
 
@@ -480,7 +720,8 @@ pub trait Cancelled: Send + Sync {
 }
 
 /// 共用的 stderr 清洗執行緒生成器（SE3-4）：將子程序 stderr 讀取、清洗、記錄的重複邏輯提取為 helper。
-/// - 若提供 cancel，執行緒會在 cancel 觸發時提前退出並仍呼叫 finish()。
+/// - 若提供 cancel，執行緒會在 cancel 觸發時提前退出，並以 finish_incomplete() 丟棄未完成狀態。
+/// - stderr 讀取緩衝為 4096 bytes。
 /// - 呼叫端只需 let _handle = spawn_stderr_sanitizer(stderr, cancel.clone()); 結束時 join 即可。
 pub fn spawn_stderr_sanitizer(
     stderr: Option<ChildStderr>,
@@ -488,6 +729,7 @@ pub fn spawn_stderr_sanitizer(
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         use std::io::Read;
+        // stderr 讀取緩衝 4096 bytes（baseline；另一處 player 電台 stderr 迴圈維持原設定）
         let mut buf = vec![0u8; 4096];
         let mut sanitizer = Sanitizer::new();
         if let Some(mut stderr) = stderr {
@@ -498,6 +740,7 @@ pub fn spawn_stderr_sanitizer(
                     }
                 }
                 match stderr.read(&mut buf) {
+                    // EOF：一律走 finish_incomplete 保守清理
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk_text = String::from_utf8_lossy(&buf[..n]);
@@ -507,8 +750,8 @@ pub fn spawn_stderr_sanitizer(
                 }
             }
         }
-        // 確保所有結束路徑（cancel、EOF、Err）均呼叫 finish()
-        let cleaned = sanitizer.finish();
+        // 不完整輸入（cancel、EOF、Err）：丟棄待決前綴與 authority，只輸出已確認部分
+        let cleaned = sanitizer.finish_incomplete();
         if !cleaned.is_empty() {
             log_line_raw(&cleaned);
         }
@@ -978,5 +1221,76 @@ mod tests {
         assert_eq!(mask_ip("127.0.0.1"), "127.0.0.xxx");
         assert_eq!(mask_ip("192.168.1.100"), "192.168.1.xxx");
         assert_eq!(mask_ip("::1"), "xxx");
+    }
+
+    #[test]
+    fn test_sanitizer_every_character_split_https() {
+        let input = "https://signin.example.com/music/@artist/track?session=dummy&user=dummy";
+        let expected = "https://signin.example.com/music/@artist/track";
+        assert_eq!(sanitize_log(input), expected);
+
+        let mut splits: Vec<usize> = input.char_indices().map(|(i, _)| i).collect();
+        splits.push(input.len());
+        for split in splits {
+            let mut s = Sanitizer::new();
+            s.sanitize_chunk(&input[..split]);
+            s.sanitize_chunk(&input[split..]);
+            assert_eq!(s.finish(), expected, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn test_sanitizer_finish_vs_incomplete_hostname() {
+        let mut complete = Sanitizer::new();
+        complete.sanitize_chunk("https://signin.example.com");
+        assert_eq!(complete.finish(), "https://signin.example.com");
+
+        let mut incomplete = Sanitizer::new();
+        incomplete.sanitize_chunk("https://signin.example.com");
+        assert_eq!(incomplete.finish_incomplete(), "");
+
+        let mut trailing_dot = Sanitizer::new();
+        trailing_dot.sanitize_chunk("https://signin.example.com./music");
+        assert_eq!(
+            trailing_dot.finish(),
+            "https://signin.example.com./music"
+        );
+
+        let mut ipv6 = Sanitizer::new();
+        ipv6.sanitize_chunk("https://[::1]:8080/music");
+        assert_eq!(ipv6.finish(), "https://[::1]:8080/music");
+    }
+
+    #[test]
+    fn test_sanitizer_overlong_authority_discards() {
+        let overlong = "a".repeat(MAX_AUTHORITY + 1);
+        let input = format!("https://{overlong}@evil.example/path tail");
+        let output = sanitize_log(&input);
+        assert_eq!(output, " tail");
+        assert!(!output.contains("https://"));
+        assert!(!output.contains("***@"));
+    }
+
+    #[test]
+    fn test_sanitizer_ascii_truncation_baseline() {
+        let output = sanitize_log(&"a".repeat(2000));
+        assert_eq!(output.len(), MAX_OUTPUT);
+
+        // 非 baseline 字元直接忽略，不以 lossy 替代字元輸出
+        assert_eq!(sanitize_log(&"é".repeat(600)), "");
+
+        let mut mixed = "a".repeat(MAX_OUTPUT - 1);
+        mixed.push('é');
+        mixed.push('b');
+        assert_eq!(sanitize_log(&mixed).len(), MAX_OUTPUT);
+    }
+
+    #[test]
+    fn test_sanitizer_ordinary_text_baseline() {
+        assert_eq!(sanitize_log("hello\tworld\r\nnext"), "hello\tworld\r\nnext");
+        assert_eq!(sanitize_log("a\x00b\x01c"), "abc");
+        assert_eq!(sanitize_log("plain text without url"), "plain text without url");
+        // 非 baseline 字元不承諾顯示，於輸出時忽略
+        assert_eq!(sanitize_log("plain 文字 text"), "plain  text");
     }
 }

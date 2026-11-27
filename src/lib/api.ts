@@ -30,9 +30,10 @@ export async function invokeCmd<T = any>(cmd: string, args: Record<string, any> 
 export const playerLoad = (path: string, songId: number, token: number) => invokeCmd('player_load', { path, songId, token });
 export const playerPrepare = (path: string, songId: number, positionMs: number, token: number) =>
   invokeCmd('player_prepare', { path, songId, positionMs, token });
-export const playerSetNext = (path: string, songId: number, token: number) =>
-  invokeCmd('player_set_next', { path, songId, token });
-export const playerClearNext = () => invokeCmd('player_clear_next');
+export const playerSetNext = (path: string, songId: number, token: number, playSeq?: number) =>
+  invokeCmd('player_set_next', { path, songId, token, playSeq });
+export const playerClearNext = (noNext?: boolean, playSeq?: number) =>
+  invokeCmd('player_clear_next', { noNext, playSeq });
 // 相容模式（不帶 token，由 Rust 端補 0），新流程請改用 playerSetNext
 export const playerPreload = (path: string, songId: number) => invokeCmd('player_preload', { path, songId });
 export const playerPlay = () => invokeCmd('player_play');
